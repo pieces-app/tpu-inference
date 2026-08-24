@@ -55,13 +55,38 @@ that the heuristic is disabled.
 |---|---|
 | `d626108/gemma4_mm.py` | full patched file — byte-safe to overlay over `/workspace/vllm/vllm/model_executor/models/gemma4_mm.py` in any image with vLLM == `d626108` (e.g. as a ConfigMap `subPath` volumeMount, no image rebuild) |
 | `d626108/gemma4_mm.py.diff` | the unified diff (3 hunks; applies cleanly to neighboring vLLM commits too) |
+| `d626108/Dockerfile` | **image-proper form**: layered build `FROM vllm/vllm-tpu:nightly-20260824-b98d381-d626108` that copies the patched file over the vendored path and hard-verifies the base's `/workspace/vllm` HEAD == `d626108` (mismatch fails the build) |
+| `d626108/cloudbuild.yaml` | Cloud Build recipe (linux/amd64) publishing `us-central1-docker.pkg.dev/global-cloud-runtime/llm-serving/vllm-tpu:nightly-20260824-pieces-gemma4vision-94fd1fe` |
+
+### Image-proper build (reproducible from this directory alone)
+
+```bash
+cd patches/vllm/d626108
+gcloud builds submit --project global-cloud-runtime --config cloudbuild.yaml .
+```
+
+This is deliberately a **layered build** from the pinned official nightly,
+not a from-source rebuild: the official `docker/Dockerfile` build (vLLM TPU
+compile + tpu-inference editable install) is multi-hour and would reproduce
+bit-for-bit the layers the nightly already published. Layering keeps the
+delta auditable — one changed source file, verified against the exact vLLM
+pin at build time — and the `__pycache__` purge in the `RUN` step guarantees
+the patched source is what actually imports. Tags are immutable per fork
+commit: `<base-nightly-date>-pieces-<fix>-<short fork sha>`; any new commit
+gets a new tag.
 
 **Upstream destination:** vllm-project/vllm (`vllm/model_executor/models/gemma4_mm.py`).
 The diff is self-contained and carries no TPU-specific code — it is
 upstreamable as-is.
 
-**Live verification plan:** overlay onto
-`gcr.io/global-cloud-runtime/vllm-tpu-patched:nightly-20260824-p2` on a GKE
-Spot v6e-4 (`ct6e-standard-4t`) via ConfigMap `subPath` volumeMount over the
-in-image path — no rebuild. Results are recorded in a follow-up commit here
-and in `global-cloud-runtime/deploy/gke-tpu/README.md` (isolation matrix).
+**Live verification plan** (two proof points, GKE Spot v6e-4,
+`ct6e-standard-4t`, us-central1-b):
+1. *Overlay smoke* — the patched file ConfigMap-`subPath`-mounted over the
+   in-image path on `gcr.io/global-cloud-runtime/vllm-tpu-patched:nightly-20260824-p2`;
+2. *Image-proper* — redeploy on the Cloud-Built
+   `…/llm-serving/vllm-tpu:nightly-20260824-pieces-gemma4vision-94fd1fe`
+   (no overlay), then the full single-call scorecard + quality scoring +
+   the #1531 C=2 constrained probe.
+
+Results are recorded in a follow-up commit here and in
+`global-cloud-runtime/deploy/gke-tpu/README.md` (isolation matrix).
