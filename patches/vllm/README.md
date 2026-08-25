@@ -79,14 +79,34 @@ gets a new tag.
 The diff is self-contained and carries no TPU-specific code — it is
 upstreamable as-is.
 
-**Live verification plan** (two proof points, GKE Spot v6e-4,
-`ct6e-standard-4t`, us-central1-b):
-1. *Overlay smoke* — the patched file ConfigMap-`subPath`-mounted over the
-   in-image path on `gcr.io/global-cloud-runtime/vllm-tpu-patched:nightly-20260824-p2`;
-2. *Image-proper* — redeploy on the Cloud-Built
-   `…/llm-serving/vllm-tpu:nightly-20260824-pieces-gemma4vision-94fd1fe`
-   (no overlay), then the full single-call scorecard + quality scoring +
-   the #1531 C=2 constrained probe.
+**Live verification (2026-08-24/25, GKE v6e-4 `ct6e-standard-4t`,
+`google/gemma-4-26B-A4B-it` bf16, `MODEL_IMPL_TYPE=vllm`, TP=4,
+`max_soft_tokens` 1120, temp 0 / seed 42, schema-constrained
+visual-memory workload) — both proof points PASSED the guard:**
 
-Results are recorded in a follow-up commit here and in
-`global-cloud-runtime/deploy/gke-tpu/README.md` (isolation matrix).
+1. *Overlay smoke* (us-central1-b Spot, ConfigMap `subPath` over the
+   in-image path on `…/vllm-tpu-patched:nightly-20260824-p2`): the
+   previously-fatal image request **no longer raises**
+   `PyTorch is not linked with support for jax devices` — it proceeded
+   into the vision encoder and exposed a separate HBM-headroom OOM at
+   `--gpu-memory-utilization 0.90` (6.08 GB encoder transient vs 2.76 GB
+   free). Overlay byte-verified in-pod (vLLM HEAD `d626108`, pristine base
+   sha `e005365b…`, mounted sha `c5cd4773…`).
+2. *Image-proper* (europe-west4-a on-demand,
+   `…/llm-serving/vllm-tpu:nightly-20260824-pieces-gemma4vision-94fd1fe`,
+   no overlay, `--gpu-memory-utilization 0.58`): **vision PASS** —
+   the screenshot+schema request completes (`finish_reason=stop`), first
+   post-restart single 59.8 s, warm singles 10.97 s / 9.10 s with
+   byte-identical 1,189-token outputs; valid JSON, `schema_version='vm1'`
+   + instruction canary correct; quality harness: parse/schema 1.0,
+   21/22 deterministic checks (sole miss: resolved-absolute-date, a
+   model-quality item), ANLS 0.682, tier-2 macro-F1 0.754. Engine
+   survived everything — zero restarts.
+
+**Operational findings** (deploy-config, not code): 26B-A4B + vision on
+v6e-4 needs `--gpu-memory-utilization 0.58` (0.90 and 0.75 both OOM the
+~6.1 GB vision-encoder transient). And tpu-inference **#1531 remains** on
+this vanilla-nightly base at C≥2 concurrent constrained requests — here it
+failed CLOSED (`backend_xgrammar: Failed to advance FSM … grammar rejected
+tokens` → one HTTP 500, engine alive) — that fix (#1563) is deliberately
+NOT in this image; the lane-2 `p2` image carries it separately.
