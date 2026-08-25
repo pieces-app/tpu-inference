@@ -1,0 +1,19 @@
+# Cloud Build recipe for the image-proper form of the gemma4_mm.py fix.
+# Local machines may be arm64 Macs; Cloud Build guarantees linux/amd64.
+#
+#   cd patches/vllm/d626108
+#   gcloud builds submit --project global-cloud-runtime --config cloudbuild.yaml .
+#
+# Tag scheme: <base nightly date>-pieces-<fix>-<short fork commit>, immutable
+# per fork commit. Retag (new suffix) on any new commit — never reuse a tag.
+steps:
+- name: gcr.io/cloud-builders/docker
+  args: ['build',
+         '-t', 'us-central1-docker.pkg.dev/global-cloud-runtime/llm-serving/vllm-tpu:nightly-20260824-pieces-gemma4vision-94fd1fe',
+         '.']
+images:
+- 'us-central1-docker.pkg.dev/global-cloud-runtime/llm-serving/vllm-tpu:nightly-20260824-pieces-gemma4vision-94fd1fe'
+timeout: 3600s
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 200
