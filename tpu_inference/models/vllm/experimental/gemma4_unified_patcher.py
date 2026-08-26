@@ -35,10 +35,18 @@ real screenshot (CPU-JAX, tools/gemma4_unified_vision_diff/):
     LN2 out              max|d| 1.8           max|d| 438.4   (p95 across
     soft tokens (S7)     rel 0.31%, cos 1.0   rel 4.4%, cos 0.994  tokens!)
 
-i.e. >=5% of the image's soft tokens are effectively noise. Computing the
-LayerNorm statistics in fp32 matches the fp32 eager reference to ~1e-5
-relative. These are three norms over a ~1120-token sequence, run once per
-image — the fp32 cost is nil next to the LM forward.
+i.e. >=5% of the image's soft tokens are effectively noise.
+
+WHAT THIS PATCH ACHIEVES (measured, same harness/screenshot): computing
+the LayerNorm statistics in fp32 restores **PyTorch-eager-bf16 parity, not
+fp32 parity**. Soft-token rel-mean goes 4.4e-2 -> 3.1e-3 and cosine
+0.9944 -> 1.000000, with residual per-token max error 0.32 (p95 0.22) —
+numerically identical to running the same bf16 module under PyTorch eager,
+which is exactly the intent. (A full-fp32 embedder would reach ~1e-5
+relative, but that variant re-stated upstream's forward and crashed the
+vision path; see the SCOPE note below.) These are three norms over a
+~1120-token sequence, run once per image — the fp32 cost is nil next to
+the LM forward.
 
 SCOPE: this patch replaces ONLY the ``forward`` of the embedder's three
 ``nn.LayerNorm`` submodules. The embedder's own ``forward`` — and with it
