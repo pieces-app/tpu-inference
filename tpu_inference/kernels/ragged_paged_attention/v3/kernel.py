@@ -1998,10 +1998,13 @@ def ragged_paged_attention(
             mm_bidi_ranges=mm_bidi_ranges,
         )
     # Mixed
-    # mm_bidi_ranges is passed to the prefill/mixed kernels only: decode
-    # queries sit at the end of the sequence, past any mm block, so the
-    # blockwise overlay is a no-op there (and the decode kernel runs with
-    # use_causal_mask=False anyway).
+    # mm_bidi_ranges is passed to the prefill/mixed kernels only. A decode
+    # step has q_len == 1 at the end of the sequence, i.e. strictly past
+    # any image block, so no decode query is ever inside [start, end) and
+    # the blockwise overlay cannot change its mask. (The decode kernel also
+    # sets use_causal_mask=False, under which the overlay is not applied at
+    # all — but the position argument is the load-bearing one, since it is
+    # what makes skipping the operand correct rather than merely cheap.)
     q, kv_cache = run_rpa_kernel(
         q,
         kv_cache,

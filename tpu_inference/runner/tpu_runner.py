@@ -1019,24 +1019,86 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.uses_mrope = self.model_config.uses_mrope
         self.supports_mm_inputs = True
 
-        # PrefixLM blockwise-bidirectional attention over image soft-token
-        # blocks (Gemma-4: text_config.use_bidirectional_attention ==
-        # "vision"). When enabled, AttentionMetadata carries a per-request
-        # (start, end) token range that the RPA v3 kernel ORs into the causal
-        # mask on sliding-attention layers (HF composition:
-        # AND(sliding_window, OR(causal, blockwise))). Without this, image
-        # tokens attend causally only, which measurably destroys fine-text
-        # fidelity (misread digits/IDs) on Gemma-4 Unified vision.
-        # Kill switch: TPU_MM_BIDI_ATTENTION=0.
+        self.mm_bidi_enabled = self._init_mm_bidi()
+
+    # Architectures whose blockwise-bidirectional path has actually been
+    # validated end-to-end on TPU (character-exact fine-text retest, v6e-1).
+    # `use_bidirectional_attention == "vision"` is ALSO true for the
+    # tower-based Gemma4ForConditionalGeneration variants (31B, 26B-A4B);
+    # the mask semantics should apply there too, but they are untested on
+    # this path, so they stay OFF unless explicitly forced.
+    _MM_BIDI_VALIDATED_ARCHS = ("Gemma4UnifiedForConditionalGeneration", )
+
+    def _init_mm_bidi(self) -> bool:
+        """Decide once, at startup, whether to build mm_bidi_ranges.
+
+        PrefixLM blockwise-bidirectional attention over image soft-token
+        blocks (Gemma-4: ``text_config.use_bidirectional_attention ==
+        "vision"``). When enabled, AttentionMetadata carries a per-request
+        (start, end) token range that the RPA v3 kernel ORs into the causal
+        mask on sliding-attention layers (HF composition:
+        ``AND(sliding_window, OR(causal, blockwise))``). Without it, image
+        tokens attend causally only, which measurably destroys fine-text
+        fidelity (misread digits/IDs) on Gemma-4 Unified vision.
+
+        ALL capability gating happens here rather than in the attention
+        path: downstream code sees either a well-formed operand or None,
+        never a per-request/per-trace decision. `TPU_MM_BIDI_ATTENTION=0`
+        force-disables; `=force` enables on non-validated architectures.
+        """
         import os as _os
+
+        setting = _os.environ.get("TPU_MM_BIDI_ATTENTION", "1")
+        if setting == "0":
+            return False
+
         text_cfg = getattr(self.model_config.hf_config, "text_config", None)
-        self.mm_bidi_enabled = (
-            getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
-            and _os.environ.get("TPU_MM_BIDI_ATTENTION", "1") != "0")
-        if self.mm_bidi_enabled:
-            logger.info(
-                "mm-bidi: PrefixLM blockwise attention ranges ENABLED for "
-                "this model (use_bidirectional_attention == 'vision').")
+        if getattr(text_cfg, "use_bidirectional_attention", None) != "vision":
+            return False
+
+        def _off(reason: str) -> bool:
+            logger.warning(
+                "mm-bidi: model wants PrefixLM blockwise attention but it is "
+                "DISABLED — %s. Image tokens will attend causally only, which "
+                "degrades fine-text fidelity.", reason)
+            return False
+
+        archs = getattr(self.model_config.hf_config, "architectures", None) or []
+        if not any(a in self._MM_BIDI_VALIDATED_ARCHS for a in archs):
+            if setting != "force":
+                return _off(
+                    f"architecture(s) {list(archs)} are outside the validated "
+                    f"set {list(self._MM_BIDI_VALIDATED_ARCHS)} "
+                    "(set TPU_MM_BIDI_ATTENTION=force to enable anyway)")
+            logger.warning(
+                "mm-bidi: FORCED ON for unvalidated architecture(s) %s.",
+                list(archs))
+
+        sharding = self.vllm_config.sharding_config
+        if getattr(sharding, "prefill_cp_size", 1) > 1 or \
+                getattr(sharding, "decode_cp_size", 1) > 1:
+            return _off("context parallelism (DCP/PCP) is active and the "
+                        "blockwise mask is not implemented for it")
+
+        if envs.USE_BATCHED_RPA_KERNEL:
+            return _off("USE_BATCHED_RPA_KERNEL=1 and the batched RPA kernel "
+                        "has no blockwise-mask support")
+
+        # Chunked multimodal prefill would split an image block across
+        # scheduler steps. The kernel bounds forward KV by the block end
+        # WITHIN one call, so a split block silently degrades to causal for
+        # the earlier chunk AND writes those KV entries — the exact defect
+        # this feature fixes, with no error. Refuse rather than mislead.
+        if not getattr(self.scheduler_config, "disable_chunked_mm_input",
+                       False):
+            return _off("--disable_chunked_mm_input is not set; a chunked "
+                        "image block would silently lose the blockwise mask")
+
+        logger.info(
+            "mm-bidi: PrefixLM blockwise attention ranges ENABLED "
+            "(arch=%s, sliding layers only, "
+            "AND(sliding_window, OR(causal, blockwise))).", list(archs))
+        return True
 
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
@@ -2852,10 +2914,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         mm_bidi_ranges_cpu[req_offset + i, 0] = start
                         mm_bidi_ranges_cpu[req_offset + i, 1] = last + 1
                     elif len(ranges) > 1:
-                        logger.warning_once(
-                            "mm-bidi: request has multiple image ranges; "
-                            "falling back to causal attention for it "
-                            "(single-range kernel operand).")
+                        # KNOWN LIMITATION: the kernel operand carries one
+                        # [start, end) per request, so a multi-image (or
+                        # multi-frame video) request keeps causal-only
+                        # attention over its image blocks and will show the
+                        # same fine-text degradation this feature fixes.
+                        # Warn per request-shape, not once globally, so it
+                        # cannot hide behind an earlier single-image warning.
+                        logger.warning(
+                            "mm-bidi: request %s has %d image blocks but the "
+                            "kernel operand holds one range per request — "
+                            "falling back to CAUSAL-ONLY attention for this "
+                            "request's images (degraded fine-text fidelity).",
+                            req_id, len(ranges))
 
         # populate logits_indices
         for dp_rank in range(dp_size):

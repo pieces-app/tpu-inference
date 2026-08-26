@@ -445,19 +445,22 @@ def sharded_ragged_paged_attention(
     if mm_bidi_ranges is not None and use_hd64:
         raise NotImplementedError(
             "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
-            "on the head_dim==64 RPA kernel.")
+            "on the head_dim==64 RPA kernel. (Gemma-4's head dims are "
+            "256/512, so this indicates an unexpected model/config.)")
 
-    has_mm_bidi = mm_bidi_ranges is not None and not use_hd64
-    if has_mm_bidi and envs.USE_BATCHED_RPA_KERNEL:
-        # The experimental batched RPA kernel does not implement the
-        # PrefixLM blockwise mask; fall back to causal-only (pre-patch
-        # behavior) rather than crash.
-        logger.warning_once(
-            "mm_bidi_ranges requested but USE_BATCHED_RPA_KERNEL=1; the "
-            "batched RPA kernel has no PrefixLM blockwise support — "
-            "falling back to causal-only attention for image blocks.")
-        has_mm_bidi = False
-        mm_bidi_ranges = None
+    # These are INVARIANTS, not runtime policy: the model runner decides
+    # once at startup whether mm_bidi_ranges is built at all (see
+    # TPURunner._init_mm_bidi, which refuses DCP/PCP, the batched RPA
+    # kernel, chunked MM prefill, and unvalidated architectures). Reaching
+    # any raise below means that gate was bypassed, which would silently
+    # serve a wrong mask — fail loud instead.
+    if mm_bidi_ranges is not None and envs.USE_BATCHED_RPA_KERNEL:
+        raise NotImplementedError(
+            "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
+            "by the batched RPA kernel; TPURunner._init_mm_bidi should have "
+            "disabled it when USE_BATCHED_RPA_KERNEL=1.")
+
+    has_mm_bidi = mm_bidi_ranges is not None
     if has_mm_bidi:
         in_specs += (P(ShardingAxisName.ATTN_DATA), )  # mm_bidi_ranges
         args += (mm_bidi_ranges, )
@@ -536,12 +539,16 @@ def attention(
     # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
     shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
 
+    # Invariant (see _init_mm_bidi, which disables the feature under
+    # context parallelism): a non-None operand here would mean the mask is
+    # being dropped silently on the CP path.
     if mm_bidi_ranges is not None and (
         ('dcp' in mesh.shape and mesh.shape['dcp'] > 1)
             or ('pcp' in mesh.shape and mesh.shape['pcp'] > 1)):
         raise NotImplementedError(
             "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
-            "with DCP/PCP context parallelism.")
+            "with DCP/PCP context parallelism; TPURunner._init_mm_bidi "
+            "should have disabled it.")
     if 'dcp' in mesh.shape and mesh.shape['dcp'] > 1:
         return dcp_forward(
             mesh,

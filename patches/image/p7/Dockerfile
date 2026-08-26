@@ -15,7 +15,14 @@
 # p1/p2 build. Build:
 #   cd patches/image/p7 && ./assemble.sh && \
 #   gcloud builds submit --project global-cloud-runtime --config cloudbuild.yaml .
-FROM gcr.io/global-cloud-runtime/vllm-tpu-patched:nightly-20260824-p5
+#
+# assemble.sh copies the eight patched files out of the WORKING TREE and
+# refuses to run on a dirty tree, stamping the exact commit into
+# GIT_COMMIT so the image records what it was built from.
+# Base pinned BY DIGEST: the p5 tag lives outside this repo and is mutable,
+# so a tag-only FROM would let the base drift under a fixed recipe.
+# sha256:926f2818... == vllm-tpu-patched:nightly-20260824-p5 as of 2026-08-26.
+FROM gcr.io/global-cloud-runtime/vllm-tpu-patched@sha256:926f28185c2eb8ecce7e37003b9947f0416fd672a320d084a1a15ee1d2ae66de
 
 COPY tpu_inference/ /tmp/p7/tpu_inference/
 
@@ -45,6 +52,8 @@ RUN set -e; \
     python3 -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/workspace/tpu_inference/tpu_inference/**/*.py', recursive=True)]"; \
     python3 -c "import tpu_inference.kernels.ragged_paged_attention.v3.kernel; print('kernel module imports OK')"; \
     echo "P6 PATCHES APPLIED AND VERIFIED"
+
+COPY GIT_COMMIT /etc/pieces-tpu-inference-commit
 
 LABEL org.opencontainers.image.source="https://github.com/pieces-app/tpu-inference" \
       org.opencontainers.image.description="p5 + Gemma-4 Unified PrefixLM blockwise attention (mm_bidi_ranges) + fp32 unified vision embedder (fix/gemma4-unified-vision-fidelity)"

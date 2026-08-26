@@ -53,17 +53,28 @@ entire embedder forward (functional `F.linear` over the
 `ValueError: Size of label 'a' for operand 1 (6912) does not match
 previous terms (3840)`; re-deriving upstream's plumbing is unnecessary
 because the defect is entirely in the LayerNorm statistics.
-Reproduce with `probe_lnonly.py`-style arms (see git history of this dir).
+Reproduce with `lnonly_validation.py` (committed here; it emits exactly
+this table).
 
-Per-token error at S3 is bimodal: p50 = 3.2 but **p95 = 438** — >=5% of the
-image's soft tokens (near-flat patches: uniform background, faint fine
-text; worst token mean 0.974 / std 0.0049) are effectively noise under
-torchax bf16. Mechanism: torchax's `aten.native_layer_norm` computes
-mean/var via `jnp.mean`/`jnp.var` in the INPUT dtype (bf16), unlike PyTorch
-native eager which accumulates LayerNorm statistics in fp32; for patches
-whose std ~ the bf16 quantization step, rstd is badly wrong and LayerNorm
-amplifies by ~1/std. Fix: run the embedder in fp32
-(`gemma4_unified_patcher.py`) — matches the f32 reference to ~1e-5.
+**On the p95 == max plateaus.** The per-token max-error distribution is
+strongly bimodal, not long-tailed: a large population of near-flat patches
+all saturate to nearly the same error magnitude, so once a percentile
+crosses into that population, p95 and max coincide (bf16 LN2:
+438.39/438.39). That is a property of the failure mode — the error is set
+by how small the patch variance is, not by which patch — so a percentile
+summary understates how many tokens are affected. The p50 -> p95 spread is
+the honest signal: 3.20 -> 438.39 means the top ~5% of tokens are two
+orders of magnitude worse than the median.
+
+Mechanism, restated: torchax's `aten.native_layer_norm` computes mean/var
+via `jnp.mean`/`jnp.var` in the INPUT dtype (bf16), unlike PyTorch native
+eager which accumulates LayerNorm statistics in fp32. For patches whose std
+~ the bf16 quantization step (worst token: mean 0.974, std 0.0049), rstd is
+badly wrong and LayerNorm amplifies the error by ~1/std.
+
+The `torchax f32` column of the FIRST table is the **withdrawn** full-fp32
+variant. It is kept only because it bounds what precision alone can buy; it
+is not what ships, and it crashed the live vision path.
 
 ### LM-level A/B (12B full model, CPU f32, greedy, real screenshot)
 
@@ -88,7 +99,8 @@ Fixes in this branch:
    `mm_bidi_ranges` (PrefixLM blockwise) applied on sliding layers —
    `AND(sliding_window, OR(causal, blockwise))`, exactly HF's composition.
    Static-gated: non-bidi models compile byte-identical kernels.
-2. `gemma4_unified_patcher.py`: fp32 vision embedder under torchax.
+2. `gemma4_unified_patcher.py`: fp32 LayerNorm **statistics** in the
+   Unified vision embedder under torchax (eager-bf16 parity).
 
 ## Scripts
 
@@ -96,7 +108,13 @@ Set `GEMMA4_CKPT` (checkpoint dir with `model.safetensors`) and
 `GEMMA4_IMAGE` (test PNG). Environments: torch + transformers>=5.10 +
 torchax 0.0.13 + jax (CPU).
 
-- `frontend_diff.py` — stage-by-stage embedder diff (eager f32 vs eager
-  bf16 vs torchax bf16 vs torchax f32) + resize-method probes.
+- `frontend_diff.py` — stage-by-stage embedder diff. NOTE: as committed
+  it emits the torchax-bf16 arm against the fp32 eager reference plus the
+  resize-method probes; the torch-eager-bf16 and full-fp32-under-torchax
+  columns of the first table came from earlier variants of the same
+  harness (arms are a few lines apart — swap the dtype passed to
+  `load_weights` / wrap the module in `torchax`). Re-derive before citing
+  those two columns as reproducible.
+- `lnonly_validation.py` — the LayerNorm-only table (the arm that ships).
 - `lm_mask_ab.py` — the 4-arm mask/noise A/B on the full 12B (needs
   ~64 GB RAM, ~15 min/arm on an M4 Max).
