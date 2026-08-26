@@ -1,6 +1,4 @@
-# p7: p5 + Gemma-4 Unified vision fidelity fixes (supersedes p6, whose
-#     vision-embedder patch re-stated upstream's forward and died on an
-#     einsum shape mismatch; p7 patches ONLY the three LayerNorms) (branch
+# p8: p5 + Gemma-4 Unified vision fidelity fixes (branch
 # fix/gemma4-unified-vision-fidelity):
 #   1. mm_bidi_ranges — PrefixLM blockwise-bidirectional attention for
 #      image soft-token blocks on sliding layers (RPA v3 kernel + metadata
@@ -13,10 +11,10 @@
 # Layered FROM the p5 image (= p4 tpu-inference fixes + vllm parser
 # commits); copies whole files over the editable install, mirroring the
 # p1/p2 build. Build:
-#   cd patches/image/p7 && ./assemble.sh && \
+#   cd patches/image/p8 && ./assemble.sh && \
 #   gcloud builds submit --project global-cloud-runtime --config cloudbuild.yaml .
 #
-# assemble.sh copies the eight patched files out of the WORKING TREE and
+# assemble.sh copies the eight patched files out of git HEAD and
 # refuses to run on a dirty tree, stamping the exact commit into
 # GIT_COMMIT so the image records what it was built from.
 # Base pinned BY DIGEST: the p5 tag lives outside this repo and is mutable,
@@ -24,7 +22,7 @@
 # sha256:926f2818... == vllm-tpu-patched:nightly-20260824-p5 as of 2026-08-26.
 FROM gcr.io/global-cloud-runtime/vllm-tpu-patched@sha256:926f28185c2eb8ecce7e37003b9947f0416fd672a320d084a1a15ee1d2ae66de
 
-COPY tpu_inference/ /tmp/p7/tpu_inference/
+COPY tpu_inference/ /tmp/p8/tpu_inference/
 
 RUN set -e; \
     TI_DIR=/workspace/tpu_inference/tpu_inference; \
@@ -39,13 +37,13 @@ RUN set -e; \
       runner/tpu_runner.py \
       runner/compilation_manager.py \
     ; do \
-      cp "/tmp/p7/tpu_inference/$f" "$TI_DIR/$f"; \
+      cp "/tmp/p8/tpu_inference/$f" "$TI_DIR/$f"; \
     done; \
     rm -rf "$TI_DIR/kernels/ragged_paged_attention/v3/__pycache__" \
            "$TI_DIR/layers/common/__pycache__" \
            "$TI_DIR/layers/vllm/backends/__pycache__" \
            "$TI_DIR/models/vllm/experimental/__pycache__" \
-           "$TI_DIR/runner/__pycache__" /tmp/p7; \
+           "$TI_DIR/runner/__pycache__" /tmp/p8; \
     grep -q "mm_bidi_ranges" "$TI_DIR/kernels/ragged_paged_attention/v3/kernel.py"; \
     grep -q "mm_bidi_enabled" "$TI_DIR/runner/tpu_runner.py"; \
     grep -q "maybe_apply_gemma4_unified_patches" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
@@ -53,6 +51,7 @@ RUN set -e; \
     python3 -c "import tpu_inference.kernels.ragged_paged_attention.v3.kernel; print('kernel module imports OK')"; \
     echo "P6 PATCHES APPLIED AND VERIFIED"
 
+# Provenance: the exact fork commit assemble.sh read the sources from.
 COPY GIT_COMMIT /etc/pieces-tpu-inference-commit
 
 LABEL org.opencontainers.image.source="https://github.com/pieces-app/tpu-inference" \
