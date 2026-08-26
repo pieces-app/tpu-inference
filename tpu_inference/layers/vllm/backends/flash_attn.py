@@ -269,6 +269,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 # layer's discarded K/V and corrupt every subsequent step.
                 update_kv_cache = self.kv_sharing_target_layer_name is None
 
+                # Gemma-4 PrefixLM: image-block bidirectional attention
+                # applies to sliding-window layers only (HF composition:
+                # AND(sliding_window, OR(causal, blockwise))). Full-attention
+                # layers stay purely causal.
+                mm_bidi_ranges = (getattr(attn_metadata, "mm_bidi_ranges",
+                                          None)
+                                  if self.sliding_window is not None else
+                                  None)
+
                 new_kv_cache, outputs = _jax_attn_func(
                     kv_cache,
                     q_jax,
@@ -287,6 +296,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     v_scale,
                     self.sliding_window,
                     update_kv_cache=update_kv_cache,
+                    mm_bidi_ranges=mm_bidi_ranges,
                 )
                 # With update_kv_cache=False the kernel returns the cache
                 # unchanged; still store the returned array (kv_cache is a
@@ -369,6 +379,7 @@ def _jax_attn_func(
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     update_kv_cache: bool = True,
+    mm_bidi_ranges: jax.Array | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     q_len = q.shape[0]
     q, k, v = _prepare_qkv_layout(q, k, v, num_heads, num_kv_heads, head_size)
@@ -389,6 +400,7 @@ def _jax_attn_func(
         attn_logits_soft_cap=soft_cap,
         update_kv_cache=update_kv_cache,
         shared_attention_metadata=shared_attention_metadata,
+        mm_bidi_ranges=mm_bidi_ranges,
     )
 
     formatted_outputs = _format_attention_output(outputs, q_len, num_heads,

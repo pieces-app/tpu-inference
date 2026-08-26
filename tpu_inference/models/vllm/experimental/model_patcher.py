@@ -32,6 +32,8 @@ from tpu_inference import envs
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.experimental.gemma4_mm_patcher import \
     maybe_apply_gemma4_mm_patches
+from tpu_inference.models.vllm.experimental.gemma4_unified_patcher import \
+    maybe_apply_gemma4_unified_patches
 from tpu_inference.models.vllm.experimental.qwen3_omni_patcher import \
     maybe_apply_qwen3_omni_patches
 from tpu_inference.models.vllm.experimental.qwen3_vl_patcher import \
@@ -215,3 +217,4 @@ def apply_model_specific_patches(vllm_model) -> None:
     maybe_apply_qwen3_vl_patches(vllm_model)
     maybe_apply_qwen3_omni_patches(vllm_model)
     maybe_apply_gemma4_mm_patches(vllm_model)
+    maybe_apply_gemma4_unified_patches(vllm_model)

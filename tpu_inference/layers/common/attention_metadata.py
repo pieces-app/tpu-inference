@@ -56,6 +56,7 @@ class PCPMetadata:
         "request_distribution",
         "mamba_state_indices",
         "pcp",
+        "mm_bidi_ranges",
     ],
     meta_fields=["padded_num_reqs", "pcp_cache_pages"],
 )
@@ -93,6 +94,14 @@ class AttentionMetadata(object):
 
     # PCP gather-KV only. Number of kv pages occupied by the current request.
     pcp_cache_pages: int | None = None
+
+    # (max_num_seqs, 2) i32 — per-request PrefixLM blockwise-bidirectional
+    # token range [start, end) in absolute in-sequence positions; (0, 0)
+    # means no block. Populated only for models whose text config declares
+    # use_bidirectional_attention == "vision" (Gemma-4 image soft-token
+    # blocks); None otherwise. Consumed by the RPA v3 kernel for
+    # sliding-attention layers: AND(sliding_window, OR(causal, blockwise)).
+    mm_bidi_ranges: jax.Array | None = None
 
 
 @functools.partial(

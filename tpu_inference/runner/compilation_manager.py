@@ -443,6 +443,19 @@ class CompilationManager:
         else:
             mamba_state_indices = None
 
+        # Dummy mm_bidi_ranges: like mamba_state_indices above, the primer's
+        # metadata pytree must match the runtime shape (`_prepare_inputs`
+        # always populates the field for mm-bidi models, (0, 0) = causal),
+        # or every real step would recompile against a mismatched signature.
+        if getattr(self.runner, "mm_bidi_enabled", False):
+            mm_bidi_ranges = device_array(self.runner.mesh,
+                                          np.zeros(
+                                              (self.runner.max_num_reqs, 2),
+                                              dtype=np.int32),
+                                          sharding=metadata_attn_sharding)
+        else:
+            mm_bidi_ranges = None
+
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
             shape = (self.runner.max_num_reqs,
@@ -464,6 +477,7 @@ class CompilationManager:
                 mamba_state_indices=mamba_state_indices,
                 padded_num_reqs=num_reqs,
                 pcp=pcp,
+                mm_bidi_ranges=mm_bidi_ranges,
             )
 
             return attention_metadata_gid

@@ -75,6 +75,7 @@ def ref_ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    mm_bidi_ranges: jax.Array | None = None,  # i32[max_num_seqs, 2]
     *,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -190,6 +191,15 @@ def ref_ragged_paged_attention(
                 jnp.int32, attn.shape, 1)
             kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span >= kv_span
+            if mm_bidi_ranges is not None:
+                # PrefixLM blockwise overlay (see kernel): bidirectional
+                # attention within [start, end), OR'd with causal, then
+                # ANDed with the sliding window below.
+                blk_start = mm_bidi_ranges[i, 0]
+                blk_end = mm_bidi_ranges[i, 1]
+                in_block = ((q_span >= blk_start) & (q_span < blk_end) &
+                            (kv_span >= blk_start) & (kv_span < blk_end))
+                mask = jnp.logical_or(mask, in_block)
             if sliding_window is not None:
                 mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
             attn = jnp.where(mask, attn, mask_value)
@@ -279,6 +289,13 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
     distribution_ref = args[3]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
 
+    # mm-bidi (PrefixLM blockwise) support is static-gated: when disabled the
+    # operand list — and therefore the compiled kernel — is byte-identical to
+    # the pre-patch kernel. When enabled, an extra i32[max_num_seqs, 2]
+    # scalar-prefetch operand follows bkv_update_ids.
+    if not kwargs.pop("has_mm_bidi", False):
+        args = args[:7] + (None, ) + args[7:]
+
     @pl.loop(start_seq_idx, end_seq_idx)
     def _(seq_idx):
         return _ragged_paged_attention_kernel_loop(
@@ -299,6 +316,7 @@ def _ragged_paged_attention_kernel_loop(
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+    mm_bidi_ranges_ref,  # i32[max_num_seqs, 2] (start, end) per seq, or None (mm-bidi disabled). (0, 0) = no block.
     # Input
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -382,6 +400,15 @@ def _ragged_paged_attention_kernel_loop(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
     kv_q_gap = kv_len - q_len
+    # mm-bidi (PrefixLM blockwise) range for this sequence, in absolute
+    # in-sequence token positions. Tokens with position in [mm_start, mm_end)
+    # attend to each other bidirectionally (still ANDed with the sliding
+    # window and kv-len masks, matching HF Gemma-4:
+    # AND(sliding_window, OR(causal, blockwise))). (0, 0) disables per seq.
+    mm_bidi_start = mm_bidi_end = None
+    if mm_bidi_ranges_ref is not None and use_causal_mask:
+        mm_bidi_start = mm_bidi_ranges_ref[seq_idx, 0]
+        mm_bidi_end = mm_bidi_ranges_ref[seq_idx, 1]
     cur_seq_start_bkv_idx = 0
     next_seq_start_bkv_idx = 0
 
@@ -484,7 +511,21 @@ def _ragged_paged_attention_kernel_loop(
         mask = None
         if use_causal_mask:
             assert not skip_kv_mask
-            mask = mask_and(mask, q_span >= k_span)
+            causal_mask = q_span >= k_span
+            if mm_bidi_start is not None:
+                # PrefixLM blockwise overlay: q and kv both inside
+                # [mm_bidi_start, mm_bidi_end) attend bidirectionally.
+                # OR'd with causal, before the sliding-window AND below —
+                # matching HF Gemma-4 mask composition
+                # AND(sliding_window, OR(causal, blockwise)).
+                blk_start = mm_bidi_start.astype(int_ty)
+                blk_end = mm_bidi_end.astype(int_ty)
+                in_block = jnp.logical_and(
+                    jnp.logical_and(q_span >= blk_start, q_span < blk_end),
+                    jnp.logical_and(k_span >= blk_start, k_span < blk_end),
+                )
+                causal_mask = jnp.logical_or(causal_mask, in_block)
+            mask = mask_and(mask, causal_mask)
 
         if not skip_kv_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
@@ -943,6 +984,22 @@ def _ragged_paged_attention_kernel_loop(
             if use_causal_mask:
                 effective_kv_len = jnp.minimum(kv_len,
                                                processed_q_len + actual_bq_sz)
+                if mm_bidi_start is not None:
+                    # Queries of this bq block that fall inside the mm-bidi
+                    # range must also see KV up to mm_bidi_end (forward,
+                    # non-causal). Extend the iterated KV so those blocks are
+                    # fetched; the per-element mask keeps everything else
+                    # causal.
+                    bq_overlaps_block = jnp.logical_and(
+                        processed_q_len < mm_bidi_end,
+                        processed_q_len + actual_bq_sz > mm_bidi_start,
+                    )
+                    bidi_kv_bound = jnp.where(bq_overlaps_block, mm_bidi_end,
+                                              0)
+                    effective_kv_len = jnp.minimum(
+                        kv_len,
+                        jnp.maximum(effective_kv_len, bidi_kv_bound),
+                    )
             else:
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
@@ -1330,6 +1387,7 @@ def static_validate_inputs(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    mm_bidi_ranges: jax.Array | None = None,  # i32[max_num_seqs, 2]
     *,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -1484,6 +1542,14 @@ def static_validate_inputs(
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 
+    if mm_bidi_ranges is not None:
+        if mm_bidi_ranges.shape != (max_num_seqs, 2):
+            raise ValueError(
+                f"Expected {mm_bidi_ranges.shape=} to be ({max_num_seqs}, 2).")
+        if mm_bidi_ranges.dtype != jnp.int32:
+            raise ValueError(f"Expected {mm_bidi_ranges.dtype=} to be int32.")
+        if not use_causal_mask:
+            raise ValueError("mm_bidi_ranges requires use_causal_mask=True.")
     # No constraints for the following inputs.
     del sm_scale
     del mask_value
@@ -1596,6 +1662,8 @@ def ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
+    mm_bidi_ranges: jax.Array
+    | None = None,  # i32[max_num_seqs, 2] (start, end) PrefixLM blockwise range per seq; (0, 0) = none
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
@@ -1689,6 +1757,7 @@ def ragged_paged_attention(
         page_indices,
         cu_q_lens,
         distribution,
+        mm_bidi_ranges,
         use_causal_mask=use_causal_mask,
         skip_kv_mask=skip_kv_mask,
         sm_scale=sm_scale,
@@ -1744,6 +1813,7 @@ def ragged_paged_attention(
         bkv_csz,
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
+        mm_bidi_ranges=None,
     ):
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1805,13 +1875,18 @@ def ragged_paged_attention(
             init_bo_ids,
             init_bkv_update_ids,
         )
+        if mm_bidi_ranges is not None:
+            scalar_prefetches += (mm_bidi_ranges, )
 
         scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
+        if mm_bidi_ranges is not None:
+            scope_name += "-mmbidi"
         kernel = pl.pallas_call(
             functools.partial(
                 _ragged_paged_attention_kernel,
+                has_mm_bidi=mm_bidi_ranges is not None,
                 use_causal_mask=use_causal_mask,
                 update_kv_cache=update_kv_cache,
                 skip_kv_mask=skip_kv_mask,
@@ -1858,8 +1933,10 @@ def ragged_paged_attention(
                                      dtype=kv_cache.dtype),
             ],
             input_output_aliases={
-                7: 0,
-                9: 1
+                # q and kv_cache follow the scalar prefetch operands, so
+                # their operand indices shift when mm_bidi_ranges is present.
+                len(scalar_prefetches): 0,
+                len(scalar_prefetches) + 2: 1,
             },
             name=scope_name,
         )
@@ -1918,14 +1995,20 @@ def ragged_paged_attention(
             **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
+            mm_bidi_ranges=mm_bidi_ranges,
         )
     # Mixed
+    # mm_bidi_ranges is passed to the prefill/mixed kernels only: decode
+    # queries sit at the end of the sequence, past any mm block, so the
+    # blockwise overlay is a no-op there (and the decode kernel runs with
+    # use_causal_mask=False anyway).
     q, kv_cache = run_rpa_kernel(
         q,
         kv_cache,
         **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
         static_q_len=None,
         case=RpaCase.MIXED,
+        mm_bidi_ranges=mm_bidi_ranges,
     )
 
     return (
