@@ -32,6 +32,29 @@ the vLLM `gemma4_unified` implementation under torchax (no JAX-native impl).
 | S5 pos_norm | rel 4.1e-3 | rel 5.5e-2 | rel 9.5e-6 |
 | S7 soft tokens | rel 3.1e-3, cos 1.0000 | rel 4.4e-2, cos 0.9944 | rel 6.9e-6, cos 1.0000 |
 
+### The shipped fix is LayerNorm-only (narrower than "embedder in fp32")
+
+Patching just the three `nn.LayerNorm` submodules to compute their
+statistics in fp32 — leaving upstream's embedder `forward`, its
+`ColumnParallelLinear` call, and every dtype bridge untouched — recovers
+the whole gap and lands exactly on the torch-eager-bf16 numbers:
+
+| stage (per-token max err) | torchax bf16 | torchax bf16 + fp32 LN stats |
+|---|---|---|
+| LN2 p50 / p95 / max | 3.20 / **438.39** / 438.39 | 1.20 / **1.20** / 1.80 |
+| soft tokens p50 / p95 / max | 0.194 / **14.29** / 15.12 | 0.126 / **0.22** / 0.32 |
+| soft tokens rel-mean, cosine | 4.4e-2, 0.9944 | 3.1e-3, **1.000000** |
+
+The right-hand column is numerically identical to the torch-eager bf16
+column of the table above — i.e. the patch makes torchax bf16 behave like
+PyTorch eager bf16, no more and no less. An earlier revision re-stated the
+entire embedder forward (functional `F.linear` over the
+`ColumnParallelLinear` weight) and died in the live vision path with
+`ValueError: Size of label 'a' for operand 1 (6912) does not match
+previous terms (3840)`; re-deriving upstream's plumbing is unnecessary
+because the defect is entirely in the LayerNorm statistics.
+Reproduce with `probe_lnonly.py`-style arms (see git history of this dir).
+
 Per-token error at S3 is bimodal: p50 = 3.2 but **p95 = 438** — >=5% of the
 image's soft tokens (near-flat patches: uniform background, faint fine
 text; worst token mean 0.974 / std 0.0049) are effectively noise under
