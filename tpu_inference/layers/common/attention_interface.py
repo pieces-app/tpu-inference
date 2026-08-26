@@ -388,6 +388,7 @@ def sharded_ragged_paged_attention(
     update_kv_cache: bool = True,
     use_causal_mask: bool = True,
     attn_logits_soft_cap: float | None = None,
+    mm_bidi_ranges: jax.Array | None = None,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -441,7 +442,31 @@ def sharded_ragged_paged_attention(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
+    if mm_bidi_ranges is not None and use_hd64:
+        raise NotImplementedError(
+            "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
+            "on the head_dim==64 RPA kernel.")
+
+    has_mm_bidi = mm_bidi_ranges is not None and not use_hd64
+    if has_mm_bidi and envs.USE_BATCHED_RPA_KERNEL:
+        # The experimental batched RPA kernel does not implement the
+        # PrefixLM blockwise mask; fall back to causal-only (pre-patch
+        # behavior) rather than crash.
+        logger.warning_once(
+            "mm_bidi_ranges requested but USE_BATCHED_RPA_KERNEL=1; the "
+            "batched RPA kernel has no PrefixLM blockwise support — "
+            "falling back to causal-only attention for image blocks.")
+        has_mm_bidi = False
+        mm_bidi_ranges = None
+    if has_mm_bidi:
+        in_specs += (P(ShardingAxisName.ATTN_DATA), )  # mm_bidi_ranges
+        args += (mm_bidi_ranges, )
+
     def _ragged_paged_attention(*args):
+        if has_mm_bidi:
+            *args, mm_ranges = args
+        else:
+            mm_ranges = None
         kwargs = dict(
             sm_scale=sm_scale,
             sliding_window=attention_chunk_size,
@@ -456,6 +481,8 @@ def sharded_ragged_paged_attention(
         if not use_hd64:
             kwargs["update_kv_cache"] = update_kv_cache
             kwargs["use_causal_mask"] = use_causal_mask
+            if mm_ranges is not None:
+                kwargs["mm_bidi_ranges"] = mm_ranges
         return func(*args, **kwargs)
 
     return jax.shard_map(
@@ -485,6 +512,7 @@ def attention(
     use_causal_mask: bool = True,
     shared_attention_metadata: SharedAttentionMetadata | None = None,
     attn_logits_soft_cap: float | None = None,
+    mm_bidi_ranges: jax.Array | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -508,6 +536,12 @@ def attention(
     # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
     shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
 
+    if mm_bidi_ranges is not None and (
+        ('dcp' in mesh.shape and mesh.shape['dcp'] > 1)
+            or ('pcp' in mesh.shape and mesh.shape['pcp'] > 1)):
+        raise NotImplementedError(
+            "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
+            "with DCP/PCP context parallelism.")
     if 'dcp' in mesh.shape and mesh.shape['dcp'] > 1:
         return dcp_forward(
             mesh,
@@ -559,6 +593,7 @@ def attention(
         update_kv_cache=update_kv_cache,
         use_causal_mask=use_causal_mask,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        mm_bidi_ranges=mm_bidi_ranges,
     )
 
     return kv_cache, output

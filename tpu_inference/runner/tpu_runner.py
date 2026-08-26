@@ -1019,6 +1019,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.uses_mrope = self.model_config.uses_mrope
         self.supports_mm_inputs = True
 
+        # PrefixLM blockwise-bidirectional attention over image soft-token
+        # blocks (Gemma-4: text_config.use_bidirectional_attention ==
+        # "vision"). When enabled, AttentionMetadata carries a per-request
+        # (start, end) token range that the RPA v3 kernel ORs into the causal
+        # mask on sliding-attention layers (HF composition:
+        # AND(sliding_window, OR(causal, blockwise))). Without this, image
+        # tokens attend causally only, which measurably destroys fine-text
+        # fidelity (misread digits/IDs) on Gemma-4 Unified vision.
+        # Kill switch: TPU_MM_BIDI_ATTENTION=0.
+        import os as _os
+        text_cfg = getattr(self.model_config.hf_config, "text_config", None)
+        self.mm_bidi_enabled = (
+            getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
+            and _os.environ.get("TPU_MM_BIDI_ATTENTION", "1") != "0")
+        if self.mm_bidi_enabled:
+            logger.info(
+                "mm-bidi: PrefixLM blockwise attention ranges ENABLED for "
+                "this model (use_bidirectional_attention == 'vision').")
+
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         if self.speculative_config:
@@ -2802,6 +2821,42 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 num_scheduled_tokens_per_req)
             seq_lens_cpu[_num_reqs:] = 0
 
+        # PrefixLM blockwise-bidirectional ranges (Gemma-4 image blocks):
+        # same row layout as seq_lens (dp_rank * max_num_reqs_per_dp_rank + i).
+        # (0, 0) = no block for that request. Mirrors the GPU runner's
+        # mm_req_doc_ranges (extract_embeds_range), limited to one contiguous
+        # range per request (the practical Gemma-4 single-image case); other
+        # shapes fall back to causal for that request.
+        mm_bidi_ranges_cpu = None
+        if self.mm_bidi_enabled:
+            mm_bidi_ranges_cpu = np.zeros((self.max_num_reqs, 2),
+                                          dtype=np.int32)
+            for dp_rank in range(dp_size):
+                req_offset = dp_rank * max_num_reqs_per_dp_rank
+                for i, req_id in enumerate(req_ids_dp[dp_rank]):
+                    req_state = self.requests.get(req_id)
+                    feats = getattr(req_state, "mm_features", None) or []
+                    ranges: list[tuple[int, int]] = []
+                    for feat in feats:
+                        if getattr(feat, "modality", None) == "audio":
+                            continue
+                        pos_info = feat.mm_position
+                        if hasattr(pos_info, "extract_embeds_range"):
+                            ranges.extend(pos_info.extract_embeds_range())
+                        else:
+                            ranges.append((pos_info.offset,
+                                           pos_info.offset +
+                                           pos_info.length - 1))
+                    if len(ranges) == 1:
+                        start, last = ranges[0]
+                        mm_bidi_ranges_cpu[req_offset + i, 0] = start
+                        mm_bidi_ranges_cpu[req_offset + i, 1] = last + 1
+                    elif len(ranges) > 1:
+                        logger.warning_once(
+                            "mm-bidi: request has multiple image ranges; "
+                            "falling back to causal attention for it "
+                            "(single-range kernel operand).")
+
         # populate logits_indices
         for dp_rank in range(dp_size):
             req_offset = dp_rank * padded_num_reqs_per_dp_rank
@@ -3045,6 +3100,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.mesh, (request_distribution, metadata_blob),
                 sharding=metadata_attn_sharding)
 
+        mm_bidi_ranges = None
+        if mm_bidi_ranges_cpu is not None:
+            mm_bidi_ranges = device_array(self.mesh,
+                                          mm_bidi_ranges_cpu,
+                                          sharding=metadata_attn_sharding)
+
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
         input_ids = metadata["input_ids"]
@@ -3069,6 +3130,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mamba_state_indices=mamba_state_indices,
                 padded_num_reqs=attn_padded_num_reqs,
                 pcp=pcp_metadata,
+                mm_bidi_ranges=mm_bidi_ranges,
             )
 
             return attention_metadata_gid
