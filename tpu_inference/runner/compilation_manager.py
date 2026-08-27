@@ -1907,7 +1907,14 @@ class CompilationManager:
                 "Structured decoding precompilation skipped since structured decoding is not supported with DP."
             )
             return
-        for num_reqs in self.runner.num_reqs_paddings:
+        # The kernel runs on the sampled logits, whose leading dim is a
+        # num_reqs bucket without speculative decoding and a num_logits
+        # bucket (1 + num_draft_tokens rows per request) with it; mirror
+        # _precompile_sampling's leading_shape choice.
+        leading_shape = (self.runner.num_reqs_paddings
+                         if not self.runner.speculative_config else
+                         self.runner.num_logits_paddings)
+        for num_reqs in leading_shape:
             dummy_logits = self._create_dummy_tensor(
                 (num_reqs, self.runner.vocab_size), jnp.bfloat16)
             dummy_require_struct_decoding = self.runner.require_structured_out_cpu[:

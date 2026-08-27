@@ -1220,13 +1220,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             self.num_logits_paddings = None
 
-        # tensors for structured decoding
+        # tensors for structured decoding. One row per logits row: without
+        # speculative decoding that is one per request; with it the logits
+        # carry (1 + num_draft_tokens) rows per request, padded per DP rank
+        # to a num_logits_paddings bucket, so size by the largest bucket.
+        if self.speculative_config:
+            max_grammar_rows = self.num_logits_paddings[-1] * self.dp_size
+        else:
+            max_grammar_rows = self.max_num_reqs
         self.grammar_bitmask_cpu = np.zeros(
-            (self.max_num_reqs, cdiv(self.vocab_size, 32)),
+            (max_grammar_rows, cdiv(self.vocab_size, 32)),
             dtype=np.int32,
         )
         self.require_structured_out_cpu = np.zeros(
-            (self.max_num_reqs, 1),
+            (max_grammar_rows, 1),
             dtype=np.bool_,
         )
         self.structured_decode_arange = np.arange(0, 32, dtype=np.int32)
@@ -1469,7 +1476,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 (
                     require_struct_decoding, grammar_bitmask_padded, arange
                 ) = self.structured_decoding_manager.prepare_structured_decoding_input(
-                    logits, grammar_output)
+                    logits,
+                    grammar_output,
+                    scheduler_output=scheduler_output,
+                    req_ids_dp=req_ids_dp)
                 logits = self.structured_decoding_manager.structured_decode_fn(
                     require_struct_decoding,
                     grammar_bitmask_padded,

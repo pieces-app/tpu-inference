@@ -171,11 +171,19 @@ class TestStructuredDecodingManager:
             logits_shape = (num_reqs, self.runner.vocab_size)
             mock_logits_device = jnp.ones(logits_shape, dtype=jnp.bfloat16)
 
+            # No drafts scheduled this step: every request owns exactly one
+            # bitmask row and one logits row (the K=0 layout). The (1+K)
+            # layout is covered by test_guided_bitmask_specdecode_rows.py.
+            mock_vllm_scheduler_output = MagicMock()
+            mock_vllm_scheduler_output.scheduled_spec_decode_tokens = {}
+
             # 2. ===== Test prepare_structured_decoding_input =====
             (
                 require_struct_decoding, grammar_bitmask, arange
             ) = self.runner.structured_decoding_manager.prepare_structured_decoding_input(
-                mock_logits_device, mock_scheduler_output)
+                mock_logits_device,
+                mock_scheduler_output,
+                scheduler_output=mock_vllm_scheduler_output)
 
             # Assertions for prepare_structured_decoding_input
             # require_structured_out_cpu should be [True, False, True]
