@@ -108,14 +108,33 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
     ) -> Optional[Union[vllm_linear.LinearMethodBase, QuantizeMethodBase]]:
         match layer:
             case vllm_linear.LinearBase():
-                linear_config = self.get_linear_config(layer)
                 if is_layer_skipped(
                         prefix=prefix,
                         ignored_layers=self.ignored_layers,
                         fused_mapping=self.packed_modules_mapping,
                 ):
-                    return VllmUnquantizedLinearMethod(linear_config)
-                return VllmFp8LinearMethod(self, linear_config)
+                    return VllmUnquantizedLinearMethod(
+                        self.get_linear_config(layer))
+                if not self.is_checkpoint_fp8_serialized:
+                    # Fail closed. Upstream vLLM routes non-fp8-serialized
+                    # checkpoints to Fp8PerTensorOnlineLinearMethod, but that
+                    # method depends on ops.scaled_fp8_quant (a CUDA custom op
+                    # that is only a dummy op schema on TPU), so this override
+                    # never wired it. Dispatching the offline
+                    # VllmFp8LinearMethod here instead would register
+                    # weight_scale as torch.empty(), which a bf16 checkpoint
+                    # (no scale tensors) can never fill: the loader casts
+                    # bf16 -> e4m3 unscaled and the model serves garbage from
+                    # uninitialized scale memory behind a healthy /health.
+                    raise NotImplementedError(
+                        "--quantization fp8 requires an fp8-serialized "
+                        "checkpoint on this platform: on-the-fly dense fp8 "
+                        "quantization is not implemented on the TPU torchax "
+                        "path (weight scales would be served uninitialized). "
+                        "Use an fp8-serialized checkpoint (hf quant_config "
+                        "with an 'fp8' quant_method), or weight-only INT4 "
+                        "(W4A16/wNa16) via --quantization compressed-tensors.")
+                return VllmFp8LinearMethod(self, self.get_linear_config(layer))
             case RoutedExperts():
                 if is_layer_skipped(
                         prefix=prefix,
