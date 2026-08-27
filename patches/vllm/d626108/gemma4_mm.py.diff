@@ -1,10 +1,9 @@
 --- a/vllm/model_executor/models/gemma4_mm.py	(vllm-project/vllm @ d626108b1841888ec90aced33367149a6bbc7e4b)
-+++ b/vllm/model_executor/models/gemma4_mm.py	(patched: guard torch.accelerator.get_memory_info for non-PyTorch accelerator platforms)
-@@ -1258,6 +1258,32 @@
-         # plus the matmul output that live alongside it at peak.
++++ b/vllm/model_executor/models/gemma4_mm.py	(patched: [1] guard torch.accelerator.get_memory_info on non-PyTorch platforms; [2] no module-state caching in compute_logits — trace-bound tensor reuse kills the engine under jax.jit re-trace)
+@@ -1259,6 +1259,32 @@
          cost = patches_per_item * 4 * position_embedding_size * 8
          return max(1, budget // cost) if cost > 0 else 1
-+
+ 
 +    @staticmethod
 +    def _accelerator_memory_info() -> tuple[int, int]:
 +        """Free/total accelerator memory in bytes, or ``(0, 0)`` if unknown.
@@ -30,9 +29,10 @@
 +                "in chunks of 1 (memory-based chunk sizing disabled)."
 +            )
 +            return (0, 0)
- 
++
      # ------------------------------------------------------------------ #
      # Image processing
+     # ------------------------------------------------------------------ #
 @@ -1342,7 +1368,7 @@
              if self._enable_mm_lora:
                  max_batch_size = len(items)
@@ -51,3 +51,38 @@
          max_batch_size = min(
              total_frames,
              self._encoder_chunk(
+@@ -2102,19 +2128,21 @@
+     ) -> torch.Tensor | None:
+         logits = self.language_model.compute_logits(hidden_states)
+         if logits is not None and self._suppress_token_ids:
+-            # Cache a per-device index tensor for the (static) suppressed-token
+-            # set and use `index_fill_`, so neither the Python-list indices nor
+-            # the scalar fill value take a host roundtrip per call.
+-            cache = getattr(self, "_suppress_token_ids_cache", None)
+-            if cache is None:
+-                cache = {}
+-                self._suppress_token_ids_cache = cache
+-            suppress_idx = cache.get(logits.device)
+-            if suppress_idx is None:
+-                suppress_idx = async_tensor_h2d(
+-                    self._suppress_token_ids, dtype=torch.long, device=logits.device
+-                )
+-                cache[logits.device] = suppress_idx
++            # Build the index tensor fresh on every call — never stash it in
++            # module state. On vLLM's TPU backend this method executes inside
++            # jax.jit via torchax: a tensor created during one trace and cached
++            # on the module is trace-bound, and any later batch shape outside
++            # the precompiled set re-traces and reuses the stale value, killing
++            # the engine (observed as a hard concurrency ceiling: C<=8 fine,
++            # C=12 dead in seconds, vision and audio alike — they share this
++            # LM head). Upstream's per-device cache is sound on eager CUDA
++            # only. Under jit the h2d below is constant-folded into the
++            # compiled graph (the token list is static), so recreation is free
++            # after compile; on eager CUDA it costs one async int64[n] copy
++            # per step for an n of ~2.
++            suppress_idx = async_tensor_h2d(
++                self._suppress_token_ids, dtype=torch.long, device=logits.device
++            )
+             logits.index_fill_(1, suppress_idx, -float("inf"))
+         return logits
+ 

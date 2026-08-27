@@ -110,3 +110,39 @@ this vanilla-nightly base at C≥2 concurrent constrained requests — here it
 failed CLOSED (`backend_xgrammar: Failed to advance FSM … grammar rejected
 tokens` → one HTTP 500, engine alive) — that fix (#1563) is deliberately
 NOT in this image; the lane-2 `p2` image carries it separately.
+
+## d626108 — gemma4_mm.py fix 2: jit-safe suppress-tokens in `compute_logits` (the C≤8 ceiling)
+
+Upstream `compute_logits` caches the suppressed-token index tensor
+(`generation_config.suppress_tokens` → `int32[2]` for gemma-4) in **module
+state**, keyed by device — a sound eager-CUDA optimization that is fatal on
+vLLM's TPU backend, where the model body runs inside `jax.jit` via torchax:
+the first trace stores a trace-bound tensor, and the poisoning happens
+**during warmup itself**: the AOT `.lower()` at the second batch bucket
+silently reuses the tracer cached by the first, producing a poisoned
+lowering. The engine then dies with `UnexpectedTracerError` →
+`EngineDeadError` on the FIRST batch that pads to that bucket — being
+"inside the precompiled set" does not protect a shape. C≤8 stays safe only
+because MIN_NUM_SEQS=8 pads every small batch to the one un-poisoned first
+shape. (Mechanism reproduced on CPU jax 0.11.1; see
+`tests/models/test_suppress_tokens_jit_safety.py`.)
+
+Observed live (2026-08-26, v6e-1, gemma-4-12B): C=4 and C=8 clean, **C=12
+dead in seconds**, identically for vision and audio requests (they share the
+LM head). No config workaround exists — generation-config overrides do not
+reach this code path. NOTE: this fix removes the kill; it does not by itself
+lift the throughput ceiling — with `max-num-seqs=8` the runner's only batch
+bucket is [8] and C=12 clients simply queue. Lifting the ceiling requires
+this image PLUS `max-num-seqs>8` PLUS a C=12 validation run, which has not
+yet been performed on p9.
+
+Fix: rebuild the index tensor on every call. Under `jax.jit` the token list
+is static, so the tensor constant-folds into the compiled graph (free after
+compile); on eager CUDA it costs one async `int64[2]` H2D per step. The
+image build now hard-fails if `_suppress_token_ids_cache` reappears in the
+vendored file (upstream bump guard). Ships in `p9`
+(`patches/image/p9/`), which also bakes pinned audio runtime deps
+(librosa/soundfile/audioread, with a build-time assertion that they do not
+rewrite the validated numpy/scipy) — their absence from the official image
+was the observed blocker on the 12B audio path (audio revalidation on p9
+still pending).

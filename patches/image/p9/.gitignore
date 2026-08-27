@@ -1,0 +1,3 @@
+# assemble.sh outputs — build context, never source of truth
+gemma4_mm.py
+GIT_COMMIT
