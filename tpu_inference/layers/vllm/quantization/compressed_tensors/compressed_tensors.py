@@ -134,6 +134,18 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 "None for NVFP4A16",
             )
 
+        # Weight-only int4 group quantization (W4A16, pack-quantized), e.g.
+        # gemma-4 *-qat-w4a16-ct and RedHatAI *-INT4 checkpoints. MUST be
+        # checked before _is_dynamic_token_w8a8: that upstream helper
+        # dereferences input_quant.num_bits and raises AttributeError for
+        # weight-only configs (input_activations null) — the exact
+        # CT-W4A16-fails-at-load mechanism (measured 2026-08-27, v6e-1).
+        if is_wNa16_group(weight_quant, input_quant,
+                          getattr(self, "quant_format", None)):
+            return VllmCompressedTensorsWNA16(
+                weight_quant=weight_quant,
+                linear_config=linear_config,
+            )
         if self._is_fp8_w8a8(weight_quant, input_quant):
             is_static_input_scheme = input_quant and not input_quant.dynamic
             return VllmCompressedTensorsW8A8Fp8(
@@ -146,14 +158,6 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 strategy=weight_quant.strategy,
                 is_static_input_scheme=False,
                 input_symmetric=input_quant.symmetric,
-                linear_config=linear_config,
-            )
-        # Weight-only int4 group quantization (W4A16, pack-quantized), e.g.
-        # gemma-4 *-qat-w4a16-ct and RedHatAI *-INT4 checkpoints.
-        if is_wNa16_group(weight_quant, input_quant,
-                          getattr(self, "quant_format", None)):
-            return VllmCompressedTensorsWNA16(
-                weight_quant=weight_quant,
                 linear_config=linear_config,
             )
         raise NotImplementedError(
