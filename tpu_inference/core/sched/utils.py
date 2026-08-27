@@ -116,3 +116,63 @@ def patch_vllm_scheduler_for_continue_decode():
         AsyncScheduler._continue_decode_patched = True
 
     Scheduler._continue_decode_patched = True
+
+
+def _keep_mm_data(mm_features, num_computed_tokens, uses_mrope=False):
+    """Preemption-safe replacement for vLLM's ``strip_covered_mm_data``:
+    keep every multimodal payload. Signature-compatible with the original
+    (vllm/multimodal/utils.py) so call sites need no change."""
+    return mm_features
+
+
+def patch_vllm_mm_data_strip_for_preemption() -> bool:
+    """Neutralize vLLM's prefix-cache mm-payload strip; it kills the engine
+    on resume of a KV-preempted multimodal request.
+
+    vLLM #52041 ("Skip broadcasting mm tensor data to workers for
+    prefix-cache-covered items") makes ``NewRequestData.from_request``
+    (vllm/v1/core/sched/output.py) null out ``mm_feature.data`` for any
+    multimodal item whose placeholder span is fully covered by
+    ``num_computed_tokens`` at FIRST scheduling — on the assumption that "no
+    encoder run can be scheduled for them". That assumption breaks under
+    preemption:
+
+      1. Request admitted with a prefix-cache hit covering its image span
+         (duplicate image: an identical earlier request cached those
+         blocks). The worker's CachedRequestState stores the STRIPPED
+         mm_features (data=None) for the request's whole lifetime — resume
+         goes through CachedRequestData, which carries no mm payloads.
+      2. KV pressure preempts the request: blocks freed,
+         num_computed_tokens=0, per-request encoder cache freed
+         (Scheduler._preempt_request).
+      3. On resume the covering blocks have been evicted, so the scheduler
+         legitimately re-schedules the encoder input
+         (_try_schedule_encoder_inputs) — but the worker no longer has the
+         pixels: execute_mm_encoder hits ``None.keys()``/``None.items()``
+         inside vllm.multimodal.utils and the EngineCore dies.
+
+    Observed live 2026-08-27 on v6e-1 gemma-4-12B (p9 image, vLLM d626108b)
+    at 93-97% KV usage: C=12 with duplicate images and C=16 with 32 jobs
+    over 23 unique images both killed the engine this way.
+
+    The strip is purely a serialization/memory optimization: on the TPU
+    single-host deployment the executor is uniproc (objects pass by
+    reference), so keeping the payload costs nothing; on multihost it
+    restores the pre-#52041 broadcast, trading a little bandwidth for not
+    dying. Rebinds the name in BOTH modules: the sched.output binding is the
+    one ``from_request`` resolves at call time; the multimodal.utils
+    binding covers any module imported later.
+
+    Idempotent. Returns True if the patch is active, False if the function
+    no longer exists in vLLM (upstream rename/removal — log and re-verify
+    the preemption path against that vLLM before trusting C>12 multimodal).
+    """
+    import vllm.multimodal.utils as mm_utils
+    import vllm.v1.core.sched.output as sched_output
+
+    patched = False
+    for mod in (sched_output, mm_utils):
+        if hasattr(mod, "strip_covered_mm_data"):
+            mod.strip_covered_mm_data = _keep_mm_data
+            patched = True
+    return patched

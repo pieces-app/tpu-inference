@@ -124,6 +124,30 @@ class MultiModalManager:
             for mm_input_id in encoder_input_ids:
                 mm_feature = req_state.mm_features[mm_input_id]
                 mm_hash = mm_feature.identifier
+                if mm_feature.data is None:
+                    # The payload was stripped from the wire copy (vLLM
+                    # #52041 strips items whose placeholder span was
+                    # prefix-cache-covered at first scheduling). Reaching
+                    # here means the scheduler re-scheduled this encoder
+                    # input anyway — the KV-preemption resume path. Without
+                    # this guard the None dies deep in vLLM's
+                    # group_and_batch_mm_kwargs (None.keys()/None.items())
+                    # and takes the whole EngineCore with it.
+                    if mm_hash in self.runner.encoder_cache:
+                        # Output already available (e.g. a concurrent
+                        # duplicate item computed it); nothing to encode.
+                        continue
+                    raise RuntimeError(
+                        f"Multimodal payload missing for request {req_id} "
+                        f"encoder input {mm_input_id} (mm_hash {mm_hash}): "
+                        "the item's data was stripped as prefix-cache-"
+                        "covered at admission, but its encoder run was "
+                        "re-scheduled — a KV-preempted request resumed "
+                        "after its cached blocks were evicted. The "
+                        "strip_covered_mm_data neutralization in "
+                        "tpu_inference.core.sched.utils should make this "
+                        "unreachable; if you see this, that patch is not "
+                        "active for this vLLM version.")
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
 
