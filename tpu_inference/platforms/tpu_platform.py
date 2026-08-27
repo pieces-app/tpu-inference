@@ -452,6 +452,31 @@ class TpuPlatform(Platform):
             update_vllm_config_for_dp_scheduler
         update_vllm_config_for_dp_scheduler(vllm_config)
 
+        # Keep multimodal payloads on the worker across preemption: vLLM's
+        # prefix-cache mm-data strip (#52041) leaves the worker without the
+        # pixels when a KV-preempted request resumes and its encoder input is
+        # legitimately re-scheduled -> None.keys()/None.items() engine kill
+        # (observed live 2026-08-27, v6e-1 gemma-4-12B, 93-97% KV usage).
+        # Unconditional: for text-only models the strip is a no-op either way.
+        # Runs here so it executes in the EngineCore process too (its
+        # handshake re-runs VllmConfig.__post_init__ before the Scheduler is
+        # built). See patch_vllm_mm_data_strip_for_preemption for the full
+        # mechanism.
+        from tpu_inference.core.sched.utils import \
+            patch_vllm_mm_data_strip_for_preemption
+        if patch_vllm_mm_data_strip_for_preemption():
+            logger.info_once(
+                "[tpu_platform] vLLM strip_covered_mm_data neutralized: mm "
+                "payloads are kept on the worker so KV-preempted multimodal "
+                "requests can re-run their encoder on resume.")
+        else:
+            logger.warning(
+                "[tpu_platform] strip_covered_mm_data not found in vLLM; the "
+                "mm preemption-resume guard did not patch anything. If this "
+                "vLLM still strips prefix-cache-covered mm payloads under a "
+                "new name, resumed multimodal requests can kill the engine — "
+                "re-verify before running >12-concurrency multimodal.")
+
         if enable_continue_decode:
             if parallel_config.pipeline_parallel_size > 1:
                 raise ValueError(
