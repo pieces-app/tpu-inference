@@ -117,12 +117,35 @@ def _random_case(rng, allow_spec=True):
     return batch, struct_ids, spec_tokens, grammar_bitmask, needed, padded
 
 
+
+def _nondegenerate_case(rng, **kw):
+    """Draw a case that actually exercises the mapping.
+
+    The generator can legitimately draw a batch with no structured requests
+    and no ghosts. Skipping those seeds looked harmless and was not: a skip
+    asserts nothing, so the suite could not tell "this seed had nothing to
+    test" apart from "the generator stopped producing structured requests at
+    all". Under the second, every seed would skip and the run would still
+    report green -- the exact shape of failure these tests exist to catch.
+
+    Redrawing keeps every seed meaningful and stays deterministic, since the
+    draws come from the same seeded rng. The bound is not a formality: if it
+    is ever hit, the generator is broken, and that fails loudly instead of
+    quietly reporting a pass.
+    """
+    for _ in range(100):
+        case = _random_case(rng, **kw)
+        if case[1]:  # struct_ids
+            return case
+    raise AssertionError(
+        "100 consecutive draws produced no structured requests -- "
+        "_random_case is broken, not merely unlucky")
+
+
 @pytest.mark.parametrize("seed", range(300))
 def test_matches_upstream_apply_grammar_bitmask(seed):
     rng = random.Random(seed)
-    batch, struct_ids, spec_tokens, gb, needed, padded = _random_case(rng)
-    if not struct_ids:
-        pytest.skip("no structured requests drawn")
+    batch, struct_ids, spec_tokens, gb, needed, padded = _nondegenerate_case(rng)
 
     oracle, out_indices = upstream_rows(batch, struct_ids, spec_tokens, gb,
                                         padded)
@@ -148,10 +171,8 @@ def test_matches_upstream_apply_grammar_bitmask(seed):
 @pytest.mark.parametrize("seed", range(100))
 def test_k0_is_byte_identical_to_pre_fix_algorithm(seed):
     rng = random.Random(1_000 + seed)
-    batch, struct_ids, _, gb, needed, padded = _random_case(rng,
-                                                            allow_spec=False)
-    if not struct_ids:
-        pytest.skip("no structured requests drawn")
+    batch, struct_ids, _, gb, needed, padded = _nondegenerate_case(
+        rng, allow_spec=False)
     assert needed == len(batch)
     old_bitmask, old_require = old_tpu_rows(batch, struct_ids, gb, padded)
 
