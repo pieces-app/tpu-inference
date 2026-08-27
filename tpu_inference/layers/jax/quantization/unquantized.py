@@ -208,6 +208,29 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase, FusedMoEMethodBase):
         Args:
             layer: The layer to process.
         """
+        # FAIL CLOSED on backends with no staged-weight consumption path.
+        # Fused Gemma4 checkpoints stage weights on host unconditionally
+        # (models/jax/gemma4.py), but only the GMM_EP/GMM_TP branch below
+        # reads the staging — FUSED_MOE reads .value directly, and
+        # DENSE_MAT/MEGABLX_GMM hit no processing branch at all. Without
+        # this guard those backends load cleanly and serve the params'
+        # uniform-random INIT values: silent garbage, every health gate
+        # green. (Found in review of the #2568 carry; inherited upstream.)
+        staged = [
+            name for name in ("kernel_gating_EDF", "kernel_up_proj_EDF",
+                              "kernel_down_proj_EFD")
+            if hasattr(layer, name)
+            and _param_is_staged_on_host(getattr(layer, name))
+        ]
+        if staged and layer.moe_backend not in (MoEBackend.GMM_EP,
+                                                MoEBackend.GMM_TP):
+            raise RuntimeError(
+                f"MoE weights {staged} are staged on host, but backend "
+                f"{layer.moe_backend} has no staged-weight consumption "
+                "path — proceeding would serve uniform-random init values. "
+                "Use GMM_EP/GMM_TP (the default for this model class), or "
+                "extend staging support to this backend.")
+
         if layer.moe_backend == MoEBackend.FUSED_MOE:
             # TODO(#3041): Remove once we remove JaxMoe from code base.
             edf_sharding = getattr(layer, 'edf_sharding', ())
