@@ -45,8 +45,12 @@ RUN set -e; \
         exit 1; \
     fi; \
     python3 -c "import ast; ast.parse(open('vllm/model_executor/models/gemma4_mm.py').read())"; \
+    # Pins match the DEPLOYED p9's resolved set (build log 2026-08-27 16:22Z,
+    # image built from b8e79925 with the then-unpinned install) — the versions
+    # the hardware validation sweep is exercising. Bump ONLY alongside fresh
+    # validation evidence.
     python3 -c "import numpy, scipy; open('/tmp/numstack','w').write(numpy.__version__+' '+scipy.__version__)"; \
-    pip install --no-cache-dir librosa==0.11.0 soundfile==0.13.1 audioread==3.0.1; \
+    pip install --no-cache-dir librosa==1.0.0 soundfile==0.14.0 audioread==3.1.0; \
     python3 -c "import numpy, scipy; pre=open('/tmp/numstack').read().split(); cur=[numpy.__version__, scipy.__version__]; assert cur==pre, f'FATAL: audio deps rewrote the validated numeric stack: {pre} -> {cur}'"; \
     python3 -c "import librosa, soundfile, audioread; print('audio deps OK')"; \
     echo "P9 PATCHES APPLIED AND VERIFIED"
