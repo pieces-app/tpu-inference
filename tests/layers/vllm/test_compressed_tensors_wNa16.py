@@ -32,8 +32,7 @@ import numpy as np
 import pytest
 import torch
 import torchax
-from compressed_tensors.compressors.quantized_compressors.pack_quantized import (
-    pack_to_int32, unpack_from_int32)
+from compressed_tensors.compressors import pack_to_int32, unpack_from_int32
 from compressed_tensors.quantization import QuantizationArgs
 from compressed_tensors.quantization.lifecycle.forward import dequantize
 from jax.sharding import PartitionSpec
