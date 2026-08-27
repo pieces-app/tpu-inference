@@ -45,7 +45,9 @@ RUN set -e; \
         exit 1; \
     fi; \
     python3 -c "import ast; ast.parse(open('vllm/model_executor/models/gemma4_mm.py').read())"; \
-    pip install --no-cache-dir librosa soundfile audioread; \
+    python3 -c "import numpy, scipy; open('/tmp/numstack','w').write(numpy.__version__+' '+scipy.__version__)"; \
+    pip install --no-cache-dir librosa==0.11.0 soundfile==0.13.1 audioread==3.0.1; \
+    python3 -c "import numpy, scipy; pre=open('/tmp/numstack').read().split(); cur=[numpy.__version__, scipy.__version__]; assert cur==pre, f'FATAL: audio deps rewrote the validated numeric stack: {pre} -> {cur}'"; \
     python3 -c "import librosa, soundfile, audioread; print('audio deps OK')"; \
     echo "P9 PATCHES APPLIED AND VERIFIED"
 
@@ -53,4 +55,4 @@ RUN set -e; \
 COPY GIT_COMMIT /etc/pieces-tpu-inference-commit
 
 LABEL org.opencontainers.image.source="https://github.com/pieces-app/tpu-inference" \
-      org.opencontainers.image.description="p8 + gemma4_mm compute_logits jit-safe suppress-tokens (lifts the C<=8 ceiling) + librosa/soundfile/audioread (fix/gemma4-c12-suppress-tokens)"
+      org.opencontainers.image.description="p8 + gemma4_mm compute_logits jit-safe suppress-tokens (module-state tracer-cache fix; C>8 needs max-num-seqs>8 + validation) + pinned librosa/soundfile/audioread (fix/gemma4-c12-suppress-tokens)"

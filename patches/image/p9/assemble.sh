@@ -8,9 +8,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=../../..
 
-if ! git -C "$ROOT" diff --quiet HEAD -- patches/vllm; then
-  echo "FATAL: patches/vllm/ has uncommitted changes; commit them first so" >&2
-  echo "       the image's recorded commit actually describes its contents." >&2
+if ! git -C "$ROOT" diff --quiet HEAD -- patches/vllm patches/image/p9; then
+  echo "FATAL: patches/vllm/ or patches/image/p9/ has uncommitted changes;" >&2
+  echo "       commit them first so the image's recorded commit actually" >&2
+  echo "       describes its contents (the p6 recipe had this hole)." >&2
   exit 1
 fi
 COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
