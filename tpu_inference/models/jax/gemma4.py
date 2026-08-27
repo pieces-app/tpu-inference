@@ -37,8 +37,6 @@ from tpu_inference.layers.jax.linear import (JaxEinsum, JaxLinear, JaxLmHead,
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
-from tpu_inference.layers.jax.quantization.unquantized import \
-    MOE_WEIGHTS_STAGED_ON_HOST
 from tpu_inference.layers.jax.rope_interface import (apply_rope,
                                                      normalize_rope_scaling)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -213,6 +211,14 @@ class Gemma4MoE(JaxRoutedExperts):
             for n, _ in weight_list)
 
         if is_fused:
+            # Lazy import: pulling layers.jax.quantization.unquantized at
+            # module scope makes tpu_inference.layers.vllm.quantization.
+            # unquantized partially-initialized during import of this module
+            # (circular import -> _release_cpu_storage ImportError). Same
+            # lazy-import remedy this fork already applies in
+            # layers/vllm/process_weights/cleanup_sharding.py.
+            from tpu_inference.layers.jax.quantization.unquantized import \
+                MOE_WEIGHTS_STAGED_ON_HOST
 
             def stage_weight_for_processing(param: nnx.Param, tensor,
                                             param_name: str) -> None:
