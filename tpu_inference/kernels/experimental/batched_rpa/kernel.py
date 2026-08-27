@@ -527,7 +527,12 @@ def rpa_kernel(
             for h, s in zip(flat_hbm, flat_smem):
                 if h.memory_space == pltpu.HBM:
                     read_size = (h.shape[0] // cfgs.max_steps_ub) * safe_steps
-                    read_size = utils.align_to(read_size, 1024)
+                    # The 1024-word alignment is a DMA-efficiency choice
+                    # only; clamp to the buffer size so a schedule with few
+                    # steps and/or lanes can never DMA past the end of the
+                    # HBM schedule or the SMEM scratch.
+                    read_size = jnp.minimum(utils.align_to(read_size, 1024),
+                                            h.shape[0])
 
                     copy = pltpu.make_async_copy(
                         h.at[pl.ds(0, read_size)],

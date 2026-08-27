@@ -38,6 +38,9 @@ from tpu_inference.kernels.experimental.batched_rpa import (configs, kernel,
                                                             schedule, utils)
 from tpu_inference.kernels.experimental.batched_rpa.tuned_params import \
     get_tuned_params
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def prepare_inputs(
@@ -270,6 +273,25 @@ def ragged_paged_attention(
             concatenated along num kv heads dim.
     """
 
+    # Captured verbatim before any defaulting below, so that an SMEM-budget
+    # fallback forwards exactly what the caller passed and stays
+    # byte-identical with the USE_BATCHED_RPA_KERNEL=0 (v3 kernel) path.
+    v3_fallback_kwargs = dict(
+        use_causal_mask=use_causal_mask,
+        update_kv_cache=update_kv_cache,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        out_dtype=out_dtype,
+        mask_value=mask_value,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+        debug_mode=debug_mode,
+    )
+
     if kv_layout is None:
         if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
             kv_layout = configs.KVLayout.SEQ_ALONG_LANE
@@ -323,6 +345,62 @@ def ragged_paged_attention(
         scale_v=v_scale,
         kv_layout=kv_layout,
     )
+
+    # SMEM-budget gate (trace time, config-free): the schedule scratch of
+    # both the rpa_metadata_schedule kernel and the main attention kernel
+    # must hold at least num_lanes steps per batch lane. Configs with a
+    # small page size and a large auto-tuned bkv_sz (e.g. max-model-len >
+    # 8192 forces page_size 16 on the serving path) can exceed the 1MiB
+    # per-core SMEM, which used to surface as a deterministic XLA
+    # RESOURCE_EXHAUSTED compile error. Detect it here and fall back to the
+    # non-batched v3 RPA kernel, whose KV-cache layout is identical to the
+    # HEAD_ALONG_SUBLANE layout used by this kernel.
+    over_budget = []
+    for mode, blocks_override, case in (
+        (configs.RpaCase.DECODE, decode_block_sizes, "decode"),
+        (configs.RpaCase.MIXED, prefill_block_sizes, "prefill"),
+    ):
+        blocks = blocks_override or get_tuned_params(
+            model_cfgs, serve_cfgs, case=case,
+            vmem_limit_bytes=vmem_limit_bytes)
+        mode_cfgs = configs.RpaConfigs(
+            block=blocks,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            vmem_limit_bytes=vmem_limit_bytes,
+            mode=mode,
+        )
+        if not mode_cfgs.fits_smem_budget:
+            over_budget.append(mode_cfgs.smem_budget_summary())
+
+    if over_budget:
+        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            # The SEQ_ALONG_LANE KV-cache layout differs from the v3
+            # kernel's, so a per-call fallback is impossible.
+            raise configs.SmemBudgetExceededError(
+                "Batched RPA kernel schedule does not fit in SMEM at this "
+                f"config: {'; '.join(over_budget)}. The SEQ_ALONG_LANE "
+                "KV-cache layout cannot fall back to the non-batched RPA "
+                "kernel; set USE_BATCHED_RPA_SEQ_ON_LANE=0 or "
+                "USE_BATCHED_RPA_KERNEL=0, or increase the KV-cache page "
+                "size.")
+        logger.warning(
+            "Batched RPA kernel schedule does not fit in SMEM at this "
+            "config; falling back to the non-batched v3 RPA kernel for "
+            "this call. Details: %s", "; ".join(over_budget))
+        from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
+            ragged_paged_attention as _rpa_v3
+        return _rpa_v3(
+            queries,
+            keys,
+            values,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            **v3_fallback_kwargs,
+        )
 
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
