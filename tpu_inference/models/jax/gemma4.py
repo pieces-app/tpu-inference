@@ -46,7 +46,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
     JaxAutoWeightsLoader, LoadableWithIterator, StandardWeightLoader,
-    load_nnx_param_from_reshaped_torch)
+    jax_array_from_reshaped_torch, load_nnx_param_from_reshaped_torch)
 
 logger = init_logger(__name__)
 
@@ -199,6 +199,11 @@ class Gemma4MoE(JaxRoutedExperts):
 
         See https://github.com/vllm-project/vllm/blob/979f5511d78b317760d45df9290233c27793a0af/vllm/model_executor/models/gemma4.py#L1640-L1694
         """
+        # PORTED from upstream PR #2568 (hashkanna, "Reduce Gemma4 MoE
+        # load-time HBM peak"). The PR predates upstream's per-expert weight
+        # format support, so a straight cherry-pick would REGRESS that path.
+        # Port: use the PR's off-TPU staging for the FUSED format (where the
+        # load-time HBM spike occurs) and keep the per-expert path unchanged.
         weight_list = list(weights)
 
         is_fused = any(
@@ -206,18 +211,45 @@ class Gemma4MoE(JaxRoutedExperts):
             for n, _ in weight_list)
 
         if is_fused:
-            synthesized = []
+            # Lazy import: pulling layers.jax.quantization.unquantized at
+            # module scope makes tpu_inference.layers.vllm.quantization.
+            # unquantized partially-initialized during import of this module
+            # (circular import -> _release_cpu_storage ImportError). Same
+            # lazy-import remedy this fork already applies in
+            # layers/vllm/process_weights/cleanup_sharding.py.
+            from tpu_inference.layers.jax.quantization.unquantized import \
+                MOE_WEIGHTS_STAGED_ON_HOST
+
+            def stage_weight_for_processing(param: nnx.Param, tensor,
+                                            param_name: str) -> None:
+                # Keep the fused expert tensors off TPU until GMM
+                # post-processing can produce the final sharded layout.
+                jax_weight = jax_array_from_reshaped_torch(tensor)
+                expected_shape = (param.value.shape[0], param.value.shape[2],
+                                  param.value.shape[1])
+                if tuple(jax_weight.shape) != expected_shape:
+                    raise ValueError(
+                        "Unexpected Gemma4 MoE weight shape for "
+                        f"{param_name}: {jax_weight.shape}; expected "
+                        f"{expected_shape}")
+                param.set_metadata("_weights_to_load", [jax_weight])
+                param.set_metadata(MOE_WEIGHTS_STAGED_ON_HOST, True)
+
+            loaded = set()
             for name, tensor in weight_list:
                 if name.endswith("down_proj"):
-                    for i, shard in enumerate(tensor):
-                        synthesized.append((f"{i}.down_proj.weight", shard))
+                    stage_weight_for_processing(self.kernel_down_proj_EFD,
+                                                tensor, name)
+                    loaded.add("kernel_down_proj_EFD")
                 elif name.endswith("gate_up_proj"):
                     F = tensor.shape[1] // 2
-                    for i, shard in enumerate(tensor[:, :F, :]):
-                        synthesized.append((f"{i}.gate_proj.weight", shard))
-                    for i, shard in enumerate(tensor[:, F:, :]):
-                        synthesized.append((f"{i}.up_proj.weight", shard))
-            return super().load_weights(synthesized)
+                    stage_weight_for_processing(self.kernel_gating_EDF,
+                                                tensor[:, :F, :], name)
+                    stage_weight_for_processing(self.kernel_up_proj_EDF,
+                                                tensor[:, F:, :], name)
+                    loaded.add("kernel_up_proj_EDF")
+                    loaded.add("kernel_gating_EDF")
+            return loaded
 
         # Per-expert format: strip the "experts." prefix added during routing so
         # downstream loaders see bare "N.proj.param" names as they expect.
