@@ -2128,19 +2128,21 @@ class Gemma4ForConditionalGeneration(
     ) -> torch.Tensor | None:
         logits = self.language_model.compute_logits(hidden_states)
         if logits is not None and self._suppress_token_ids:
-            # Cache a per-device index tensor for the (static) suppressed-token
-            # set and use `index_fill_`, so neither the Python-list indices nor
-            # the scalar fill value take a host roundtrip per call.
-            cache = getattr(self, "_suppress_token_ids_cache", None)
-            if cache is None:
-                cache = {}
-                self._suppress_token_ids_cache = cache
-            suppress_idx = cache.get(logits.device)
-            if suppress_idx is None:
-                suppress_idx = async_tensor_h2d(
-                    self._suppress_token_ids, dtype=torch.long, device=logits.device
-                )
-                cache[logits.device] = suppress_idx
+            # Build the index tensor fresh on every call — never stash it in
+            # module state. On vLLM's TPU backend this method executes inside
+            # jax.jit via torchax: a tensor created during one trace and cached
+            # on the module is trace-bound, and any later batch shape outside
+            # the precompiled set re-traces and reuses the stale value, killing
+            # the engine (observed as a hard concurrency ceiling: C<=8 fine,
+            # C=12 dead in seconds, vision and audio alike — they share this
+            # LM head). Upstream's per-device cache is sound on eager CUDA
+            # only. Under jit the h2d below is constant-folded into the
+            # compiled graph (the token list is static), so recreation is free
+            # after compile; on eager CUDA it costs one async int64[n] copy
+            # per step for an n of ~2.
+            suppress_idx = async_tensor_h2d(
+                self._suppress_token_ids, dtype=torch.long, device=logits.device
+            )
             logits.index_fill_(1, suppress_idx, -float("inf"))
         return logits
 

@@ -110,3 +110,26 @@ this vanilla-nightly base at C≥2 concurrent constrained requests — here it
 failed CLOSED (`backend_xgrammar: Failed to advance FSM … grammar rejected
 tokens` → one HTTP 500, engine alive) — that fix (#1563) is deliberately
 NOT in this image; the lane-2 `p2` image carries it separately.
+
+## d626108 — gemma4_mm.py fix 2: jit-safe suppress-tokens in `compute_logits` (the C≤8 ceiling)
+
+Upstream `compute_logits` caches the suppressed-token index tensor
+(`generation_config.suppress_tokens` → `int32[2]` for gemma-4) in **module
+state**, keyed by device — a sound eager-CUDA optimization that is fatal on
+vLLM's TPU backend, where the model body runs inside `jax.jit` via torchax:
+the first trace stores a trace-bound tensor; any batch shape outside the
+precompiled set re-traces and reuses the stale value → `EngineDeadError`.
+
+Observed live (2026-08-26, v6e-1, gemma-4-12B): C=4 and C=8 clean, **C=12
+dead in seconds**, identically for vision and audio requests (they share the
+LM head). No config workaround exists — generation-config overrides do not
+reach this code path.
+
+Fix: rebuild the index tensor on every call. Under `jax.jit` the token list
+is static, so the tensor constant-folds into the compiled graph (free after
+compile); on eager CUDA it costs one async `int64[2]` H2D per step. The
+image build now hard-fails if `_suppress_token_ids_cache` reappears in the
+vendored file (upstream bump guard). Ships in `p9`
+(`patches/image/p9/`), which also bakes the `vllm[audio]` runtime deps
+(librosa/soundfile/audioread) — their absence from the official image was
+the only blocker on the validated 12B audio path.
