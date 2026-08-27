@@ -41,6 +41,8 @@ from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compresse
     VllmCompressedTensorsW8A8Fp8
 from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import \
     VllmCompressedTensorsW8A8Int8
+from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    VllmCompressedTensorsWNA16, is_wNa16_group)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedConfig
@@ -144,6 +146,14 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 strategy=weight_quant.strategy,
                 is_static_input_scheme=False,
                 input_symmetric=input_quant.symmetric,
+                linear_config=linear_config,
+            )
+        # Weight-only int4 group quantization (W4A16, pack-quantized), e.g.
+        # gemma-4 *-qat-w4a16-ct and RedHatAI *-INT4 checkpoints.
+        if is_wNa16_group(weight_quant, input_quant,
+                          getattr(self, "quant_format", None)):
+            return VllmCompressedTensorsWNA16(
+                weight_quant=weight_quant,
                 linear_config=linear_config,
             )
         raise NotImplementedError(
