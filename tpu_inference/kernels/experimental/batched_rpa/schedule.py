@@ -596,7 +596,11 @@ def rpa_metadata_schedule_kernel(
         write_size = h.shape[0]
         if write_size > 1:
             write_size = (write_size // cfgs.max_steps_ub) * safe_max_steps
-            write_size = utils.align_to(write_size, 1024)
+            # The 1024-word alignment is a DMA-efficiency choice only; clamp
+            # to the buffer size so a schedule with few steps and/or lanes
+            # can never DMA past the end of the SMEM scratch or HBM output.
+            write_size = jnp.minimum(utils.align_to(write_size, 1024),
+                                     h.shape[0])
 
         copy = pltpu.make_async_copy(
             s.at[pl.ds(0, write_size)],

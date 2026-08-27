@@ -23,6 +23,16 @@ from jax.experimental.pallas import tpu as pltpu
 from tpu_inference.kernels.experimental.batched_rpa import utils
 
 
+class SmemBudgetExceededError(ValueError):
+    """The RPA schedule cannot be hosted in per-core SMEM at this config.
+
+    Raised at trace time so callers get an actionable error (or can select
+    the non-batched RPA kernel) instead of a deterministic XLA
+    RESOURCE_EXHAUSTED compile error ("Ran out of memory in memory space
+    smem") from the rpa_metadata_schedule / main RPA pallas_call.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
     """Tuning parameters for the RPA kernel."""
@@ -175,24 +185,33 @@ class RpaConfigs:
 
     # Define derived values.
 
-    @property
-    def max_steps_ub(self) -> int:
-        """Get maximum upper bound of kernel steps based on SMEM limit."""
+    # SMEM sizing -----------------------------------------------------------
+    #
+    # The schedule produced by schedule.py is staged in SMEM twice: once as
+    # scratch of the rpa_metadata_schedule kernel, and once inside the main
+    # attention kernel (which additionally prefetches page_indices into
+    # SMEM). Both allocations are sized by max_steps_ub, so max_steps_ub
+    # must never round the step count ABOVE what the SMEM budget can hold.
 
-        fixed_bytes = 0
-        fixed_bytes += self.serve.num_seqs  # kv_lens
-        fixed_bytes += self.serve.num_seqs + 1  # cu_q_lens
-        fixed_bytes += (self.serve.num_seqs * self.serve.pages_per_seq
+    @property
+    def smem_fixed_bytes(self) -> int:
+        """SMEM bytes used regardless of the number of schedule steps."""
+
+        fixed_words = 0
+        fixed_words += self.serve.num_seqs  # kv_lens
+        fixed_words += self.serve.num_seqs + 1  # cu_q_lens
+        fixed_words += (self.serve.num_seqs * self.serve.pages_per_seq
                         )  # page_indices
-        fixed_bytes += 3  # distribution
-        fixed_bytes += self.block.batch_size  # lane_lengths
-        fixed_bytes += 1  # actual_steps
+        fixed_words += 3  # distribution
+        fixed_words += self.block.batch_size  # lane_lengths
+        fixed_words += 1  # actual_steps
 
         word_size_bytes = 4
-        fixed_bytes *= word_size_bytes
+        return fixed_words * word_size_bytes
 
-        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
-        available_bytes = smem_limit_bytes - fixed_bytes
+    @property
+    def smem_bytes_per_step(self) -> int:
+        """SMEM bytes one schedule step occupies across all batch lanes."""
 
         # Per step per batch item:
         # s_idx, q_idx, k_idx, is_last_k, do_writeback: 5 * 4 = 20
@@ -201,13 +220,73 @@ class RpaConfigs:
         # dma_kv_new: bkv_p_new * self.dma_kv_new_size * 4
         bytes_per_step = (28 + 12 * self.bkv_p_cache +
                           4 * self.dma_kv_new_size * self.bkv_p_new)
-        bytes_per_step *= self.block.batch_size
+        return bytes_per_step * self.block.batch_size
 
-        max_steps_ub = available_bytes // bytes_per_step
+    @property
+    def smem_steps_fit(self) -> int:
+        """Exact number of schedule steps the SMEM budget can host."""
+
+        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+        available_bytes = smem_limit_bytes - self.smem_fixed_bytes
+        if available_bytes <= 0:
+            return 0
+        return available_bytes // self.smem_bytes_per_step
+
+    @property
+    def fits_smem_budget(self) -> bool:
+        """Whether the batched RPA kernel can compile at this config.
+
+        The schedule step capacity is kept a multiple of num_lanes (as the
+        original sizing intended), so at least num_lanes steps must fit.
+        Callers should check this and select the non-batched RPA kernel
+        when False; building the batched kernel anyway raises
+        SmemBudgetExceededError from max_steps_ub.
+        """
 
         num_lanes = pltpu.get_tpu_info().num_lanes
-        max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
-        return max_steps_ub
+        return self.smem_steps_fit >= num_lanes
+
+    def smem_budget_summary(self) -> str:
+        """Human-readable sizing summary for logs and errors."""
+
+        smem_capacity = pltpu.get_tpu_info().smem_capacity_bytes
+        return (f"mode={self.mode}, batch_size={self.block.batch_size}, "
+                f"bkv_sz={self.block.bkv_sz}, "
+                f"page_size={self.serve.page_size}, "
+                f"bkv_p_cache={self.bkv_p_cache}, bkv_p_new={self.bkv_p_new}, "
+                f"smem_bytes_per_step={self.smem_bytes_per_step}, "
+                f"smem_fixed_bytes={self.smem_fixed_bytes}, "
+                f"smem_capacity_bytes={smem_capacity}, "
+                f"steps_fit={self.smem_steps_fit}, "
+                f"steps_required={pltpu.get_tpu_info().num_lanes}")
+
+    @property
+    def max_steps_ub(self) -> int:
+        """Get maximum upper bound of kernel steps based on SMEM limit.
+
+        Historical note: this used to be computed as
+        `max(1, steps_fit // num_lanes) * num_lanes`, which rounds UP to
+        num_lanes steps whenever fewer than num_lanes steps actually fit —
+        over-allocating the SMEM schedule scratch by up to num_lanes /
+        steps_fit and producing a deterministic XLA compile error ("Ran out
+        of memory in memory space smem") in rpa_metadata_schedule. Observed
+        live with gemma-4-26B-A4B on v6e (TP=8, max-model-len 16384 ->
+        page_size 16, 16 seqs): steps_fit was 105, rounded up to 128, and
+        the dma_kv_new scratch alone became s32[163840] (640KiB), for 1.10M
+        total of the 1.00M SMEM budget. Now the step count only ever rounds
+        DOWN; configs where fewer than num_lanes steps fit must not build
+        this kernel at all (see fits_smem_budget).
+        """
+
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        steps_fit = self.smem_steps_fit
+        if steps_fit < num_lanes:
+            raise SmemBudgetExceededError(
+                "Batched RPA kernel schedule does not fit in SMEM at this "
+                f"config ({self.smem_budget_summary()}). Use the "
+                "non-batched RPA kernel (USE_BATCHED_RPA_KERNEL=0), or "
+                "increase the KV-cache page size.")
+        return (steps_fit // num_lanes) * num_lanes
 
     @property
     def bkv_p(self) -> int:
