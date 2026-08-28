@@ -146,6 +146,18 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 weight_quant=weight_quant,
                 linear_config=linear_config,
             )
+        if input_quant is None:
+            # Weight-only config that is NOT 4-bit/group/pack-quantized
+            # (channelwise, 2/3/5/6/7/8-bit, or a non-pack format). Every
+            # remaining predicate below models an activation-quantized
+            # scheme, and upstream's _is_dynamic_token_w8a8 dereferences
+            # input_quant.num_bits -- a bare AttributeError, the exact
+            # misleading-crash mechanism documented above for W4A16.
+            # Refuse with the real reason instead.
+            raise NotImplementedError(
+                "Weight-only compressed-tensors scheme for layer "
+                f"{layer_name} is not supported on this path (only 4-bit, "
+                f"group-strategy, pack-quantized W4A16 is): {weight_quant}")
         if self._is_fp8_w8a8(weight_quant, input_quant):
             is_static_input_scheme = input_quant and not input_quant.dynamic
             return VllmCompressedTensorsW8A8Fp8(

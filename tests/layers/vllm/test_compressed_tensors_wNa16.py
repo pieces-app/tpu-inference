@@ -438,3 +438,81 @@ def test_merged_column_parallel_linear(model, bias, fuse_matmuls):
 
     ref_output, layer_output = return_ref_and_layer_output(linear_layer)
     torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_weight_only_non_wNa16_fails_closed_with_clear_error(model):
+    """A weight-only config that is NOT 4-bit/group/pack-quantized
+    (channelwise, 2/3/5/6/7/8-bit, non-pack formats) must refuse with a
+    clear NotImplementedError -- not die in _is_dynamic_token_w8a8's
+    input_quant.num_bits dereference (bare AttributeError), which is the
+    misleading-crash mechanism this scheme's own docstring documents.
+    Modeled by forcing is_wNa16_group to reject the real W4A16 config."""
+    mesh = test_utils.get_spmd_mesh(1)
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = torch.bfloat16
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        with patch(
+                "tpu_inference.layers.vllm.quantization.compressed_tensors"
+                ".compressed_tensors.is_wNa16_group",
+                return_value=False), \
+             pytest.raises(NotImplementedError, match="Weight-only"):
+            RowParallelLinear(
+                input_size=1024,
+                output_size=2048,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                return_bias=False,
+                quant_config=quant_config,
+            )
+
+
+def test_w4a16_moe_dispatch_fails_closed():
+    """get_moe_method must not silently route a weight-only int4 (W4A16)
+    checkpoint's RoutedExperts through the activation-quantizing W4A8
+    method: linears would run true W4A16 while experts run numerics the
+    export was never calibrated for. Fail-closed, like the fp8
+    non-serialized guard one dispatch table over."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from tpu_inference.layers.vllm.quantization.compressed_tensors \
+        .compressed_tensors_moe.compressed_tensors_moe import \
+        VllmCompressedTensorsMoEMethod
+
+    weight_quant = QuantizationArgs(num_bits=4,
+                                    type="int",
+                                    strategy="group",
+                                    group_size=128,
+                                    symmetric=True)
+    quant_config = MagicMock()
+    quant_config.get_scheme_dict.return_value = {
+        "weights": weight_quant,
+        "input_activations": None,
+    }
+    quant_config._is_fp8_w8a8.return_value = False
+    layer = MagicMock(spec=RoutedExperts)
+
+    with pytest.raises(NotImplementedError, match="W4A16"):
+        VllmCompressedTensorsMoEMethod.get_moe_method(
+            quant_config, layer, "model.layers.0.mlp.experts")
+
+    # Positive control: a genuine w4a8 config (input activations quantized)
+    # still reaches the W4A8 method through the same dispatch.
+    quant_config.get_scheme_dict.return_value = {
+        "weights": weight_quant,
+        "input_activations": MagicMock(num_bits=8),
+    }
+    with patch(
+            "tpu_inference.layers.vllm.quantization.compressed_tensors"
+            ".compressed_tensors_moe.compressed_tensors_moe_w4a8"
+            ".VllmCompressedTensorsW4A8MoEMethod") as ctor:
+        VllmCompressedTensorsMoEMethod.get_moe_method(
+            quant_config, layer, "model.layers.0.mlp.experts")
+        ctor.assert_called_once()

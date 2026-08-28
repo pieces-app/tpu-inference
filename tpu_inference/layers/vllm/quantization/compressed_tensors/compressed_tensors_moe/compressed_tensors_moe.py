@@ -66,6 +66,20 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
                 weight_quant, input_quant, layer.moe_config, quant_config.mesh)
         # Uses fp8 or int8 activations depending on the TPU generation.
         elif weight_quant.num_bits == 4:
+            # FAIL CLOSED on weight-only int4 (W4A16: input_activations
+            # null). The method below QUANTIZES ACTIVATIONS (W4A8): routing
+            # a W4A16 checkpoint's experts through it silently runs numerics
+            # the export was never calibrated for, while the same
+            # checkpoint's Linears (get_scheme) get true W4A16. This is the
+            # silent-misinterpretation class the fp8 non-serialized guard
+            # exists to prevent, one dispatch table over. If W4A16 MoE is
+            # ever wanted, implement it deliberately -- do not relax this
+            # into the catch-all.
+            if input_quant is None:
+                raise NotImplementedError(
+                    "W4A16 (weight-only int4) is not implemented for "
+                    f"FusedMoE/RoutedExperts (layer {layer_name}); refusing "
+                    "to run experts as activation-quantized W4A8.")
             from .compressed_tensors_moe_w4a8 import \
                 VllmCompressedTensorsW4A8MoEMethod
             return VllmCompressedTensorsW4A8MoEMethod(weight_quant,
