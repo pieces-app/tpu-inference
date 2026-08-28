@@ -56,6 +56,7 @@ import numpy as np
 import pytest
 import torch
 import torchax
+from compressed_tensors import CompressionFormat
 from compressed_tensors.compressors import pack_to_int32, unpack_from_int32
 from compressed_tensors.quantization import QuantizationArgs
 from compressed_tensors.quantization.lifecycle.forward import dequantize
@@ -83,8 +84,8 @@ from tests.layers.common import utils as test_utils
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
 from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors import \
     VllmCompressedTensorsConfig
-from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import \
-    VllmCompressedTensorsWNA16
+from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    VllmCompressedTensorsWNA16, is_wNa16_group)
 from tpu_inference.layers.vllm.quantization.configs import \
     VllmQuantLinearConfig
 
@@ -540,9 +541,15 @@ def test_column_parallel_linear(model, bias, num_devices, enable_sp):
 
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("fuse_matmuls", [False, True])
+@pytest.mark.parametrize("num_devices", [1, 4], ids=["tp1", "tp4"])
 @pytest.mark.parametrize("model", MODELS)
-def test_qkv_parallel_linear(model, bias, fuse_matmuls):
-    mesh = test_utils.get_spmd_mesh(1)
+def test_qkv_parallel_linear(model, bias, fuse_matmuls, num_devices):
+    """TP>1 + fuse_matmuls=True is the only path that exercises the
+    n_shards>1 fused-tensor reorder (reorder_concatenated_tensor_for_
+    sharding at load, undone by slice_sharded_tensor_for_concatenation at
+    forward). At TP=1 the reorder is the identity, so single-device runs
+    cannot see a reorder/slice mismatch."""
+    mesh = require_devices(num_devices)
     dtype = torch.bfloat16
 
     engine_args = EngineArgs(
@@ -574,9 +581,12 @@ def test_qkv_parallel_linear(model, bias, fuse_matmuls):
 
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("fuse_matmuls", [False, True])
+@pytest.mark.parametrize("num_devices", [1, 4], ids=["tp1", "tp4"])
 @pytest.mark.parametrize("model", MODELS)
-def test_merged_column_parallel_linear(model, bias, fuse_matmuls):
-    mesh = test_utils.get_spmd_mesh(1)
+def test_merged_column_parallel_linear(model, bias, fuse_matmuls,
+                                       num_devices):
+    """See test_qkv_parallel_linear: TP>1 makes the fused reorder real."""
+    mesh = require_devices(num_devices)
     dtype = torch.bfloat16
 
     engine_args = EngineArgs(
@@ -604,48 +614,24 @@ def test_merged_column_parallel_linear(model, bias, fuse_matmuls):
     torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
 
 
-@pytest.mark.parametrize("model", MODELS)
-def test_stored_weights_dequant_bit_exact_per_group(model):
-    """Push a group-structured weight through the REAL load path
-    (create_weights -> weight_packed/weight_scale -> process_weights_after_
-    loading), then dequantize the STORED int4 weights with the STORED
-    scales in the production layout and require exact equality with
-    q * bf16(scale), group by group.
+def _stored_dequant_bit_exact(layer) -> torch.Tensor:
+    """Load a group-structured weight into ``layer`` (already created with
+    the WNA16 scheme), run process_weights_after_loading, and require the
+    STORED int4 weights x STORED scales to reproduce q * bf16(scale)
+    EXACTLY, group by group, in the production layout.
 
-    With the group-distinct fixture, a scale tensor offset by any number
-    of groups is a >= 2x error on most groups here. The old uniform
-    fixture kept exactly that bug inside the layer tests' 5% tolerance."""
-    mesh = require_devices(1)
-    dtype = torch.bfloat16
-    out_features, in_features = 512, 1024
-
-    engine_args = EngineArgs(
-        model=model,
-        max_model_len=64,
-        max_num_batched_tokens=64,
-        max_num_seqs=4,
-    )
-    vllm_config = engine_args.create_engine_config()
-    vllm_config.model_config.dtype = dtype
-    quant_config = get_tpu_quantization_config(vllm_config, mesh)
-    with set_current_vllm_config(vllm_config):
-        layer = RowParallelLinear(
-            input_size=in_features,
-            output_size=out_features,
-            bias=False,
-            params_dtype=dtype,
-            return_bias=False,
-            quant_config=quant_config,
-        )
-
+    Returns the bf16 dequantized reference weight ``[out, in]`` so callers
+    can also check the forward."""
     scheme = layer.scheme
     assert isinstance(scheme, VllmCompressedTensorsWNA16)
+    dtype = torch.bfloat16
+    in_features, out_features = layer.input_size, layer.output_size
     group_size = scheme.group_size
     n_groups = in_features // group_size
 
     weight = make_group_structured_weight(out_features, in_features,
                                           group_size)
-    _, weight_q_t, weight_scale_t, _ = quantize_weights(
+    weight_ref_t, weight_q_t, weight_scale_t, _ = quantize_weights(
         weight.T, scalar_types.int4, group_size=group_size)
     assert int(weight_q_t.min()) < 0 < int(weight_q_t.max())
     assert_group_scales_distinct(weight_scale_t)
@@ -688,6 +674,120 @@ def test_stored_weights_dequant_bit_exact_per_group(model):
         err_msg="stored int4 weights + stored scales no longer reproduce "
         "the per-group reference dequantization — group indexing or layout "
         "broke in the load path")
+    return weight_ref_t.T
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_stored_weights_dequant_bit_exact_per_group(model):
+    """Push a group-structured weight through the REAL load path
+    (create_weights -> weight_packed/weight_scale -> process_weights_after_
+    loading), then dequantize the STORED int4 weights with the STORED
+    scales in the production layout and require exact equality with
+    q * bf16(scale), group by group.
+
+    With the group-distinct fixture, a scale tensor offset by any number
+    of groups is a >= 2x error on most groups here. The old uniform
+    fixture kept exactly that bug inside the layer tests' 5% tolerance."""
+    mesh = require_devices(1)
+    dtype = torch.bfloat16
+    out_features, in_features = 512, 1024
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = dtype
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        layer = RowParallelLinear(
+            input_size=in_features,
+            output_size=out_features,
+            bias=False,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+
+    _stored_dequant_bit_exact(layer)
+
+
+
+
+def _rebuild_layer_with_group_size(layer, group_size: int):
+    """Swap the checkpoint-derived scheme (group 64 for the test model) for
+    a directly constructed WNA16 scheme with ``group_size`` and re-create
+    the on-disk-format parameters, keeping the layer's linear_config."""
+    old_scheme = layer.scheme
+    assert isinstance(old_scheme, VllmCompressedTensorsWNA16)
+    weight_quant = QuantizationArgs(
+        num_bits=4,
+        type="int",
+        symmetric=True,
+        strategy="group",
+        group_size=group_size,
+    )
+    scheme = VllmCompressedTensorsWNA16(
+        weight_quant=weight_quant, linear_config=old_scheme.linear_config)
+    for name in ("weight_packed", "weight_scale", "weight_shape"):
+        if hasattr(layer, name):
+            delattr(layer, name)
+    scheme.create_weights(
+        layer,
+        output_size=layer.output_size,
+        input_size=layer.input_size,
+        output_partition_sizes=[layer.output_size],
+        input_size_per_partition=layer.input_size,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *args, **kwargs: None,
+    )
+    layer.scheme = scheme
+    return scheme
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("model", MODELS)
+def test_layer_path_other_group_sizes(model, group_size):
+    """The layer tests above all inherit the test checkpoint's group size
+    (64). The scheme's real targets differ: Google's gemma-4 QAT wNa16
+    exports are group 32 and RedHatAI's GPTQ exports are group 128 — run
+    the full layer path (create_weights -> load -> process -> forward,
+    plus the stored-dequant bit-exact check) at both."""
+    mesh = require_devices(1)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = dtype
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        layer = RowParallelLinear(
+            input_size=1024,
+            output_size=512,
+            bias=False,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+
+    scheme = _rebuild_layer_with_group_size(layer, group_size)
+    assert scheme.group_size == group_size
+
+    weight_ref = _stored_dequant_bit_exact(layer)
+
+    x = torch.rand(8, layer.input_size, dtype=dtype) / 10
+    ref = ref_w4a16(x, weight_ref, None)
+    with torchax.default_env():
+        out = layer(torch_view(t2j(x, use_dlpack=False)))
+        out = j2t(out.to(torch.float32)).to(dtype)
+    torch.testing.assert_close(out, ref, rtol=0.05, atol=0.05)
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -804,6 +904,58 @@ def test_forward_two_shapes_one_process(model):
                     f"forward at batch={b} diverged from its reference "
                     f"after another shape was traced in the same process "
                     f"(trace-cached state reuse): {m}"))
+
+
+def _weight_args(**overrides):
+    base = dict(num_bits=4,
+                type="int",
+                symmetric=True,
+                strategy="group",
+                group_size=64)
+    base.update(overrides)
+    return QuantizationArgs(**base)
+
+
+def test_is_wNa16_group_predicate_screens_configs():
+    """The dispatch predicate must accept exactly the weight-only int4
+    group pack-quantized shape and screen out the config families that the
+    scheme cannot serve, so they reach get_scheme's fail-closed
+    NotImplementedError instead of crashing somewhere misleading."""
+    pack = CompressionFormat.pack_quantized.value
+    ok = _weight_args()
+    assert is_wNa16_group(ok, None, pack)
+
+    # Screened here (fall through to the explicit weight-only refusal):
+    assert not is_wNa16_group(
+        _weight_args(strategy="channel", group_size=None), None,
+        pack)  # channelwise int4
+    assert not is_wNa16_group(_weight_args(num_bits=8), None, pack)  # w8
+    assert not is_wNa16_group(ok, None, "int-quantized")  # non-pack format
+    assert not is_wNa16_group(ok, None, None)  # missing format
+    assert not is_wNa16_group(None, None, pack)  # no weight quant at all
+    assert not is_wNa16_group(ok, _weight_args(num_bits=8),
+                              pack)  # activation quant present -> not wNa16
+
+    # NOT screened here: these are wNa16-shaped, so they reach the scheme
+    # constructor, which must refuse them itself (next test).
+    assert is_wNa16_group(_weight_args(symmetric=False), None, pack)
+    assert is_wNa16_group(_weight_args(actorder="group"), None, pack)
+
+
+def test_scheme_ctor_fails_closed_on_unsupported_configs():
+    """Every unsupported config family must die in the constructor with a
+    clear NotImplementedError naming the limitation — never load weights
+    and produce garbage, never crash later in an unrelated dereference."""
+    cases = [
+        (_weight_args(symmetric=False), "symmetric"),
+        (_weight_args(actorder="group"), "actorder"),
+        (_weight_args(num_bits=8), "num_bits"),
+        (_weight_args(strategy="channel", group_size=None), "group strategy"),
+    ]
+    for weight_quant, match in cases:
+        with pytest.raises(NotImplementedError, match=match):
+            VllmCompressedTensorsWNA16(weight_quant=weight_quant,
+                                       linear_config=MagicMock())
 
 
 @pytest.mark.parametrize("model", MODELS)
