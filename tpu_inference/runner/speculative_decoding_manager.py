@@ -103,7 +103,15 @@ class SpeculativeDecodingManager:
             self._draft_token_ids = [tokens[:num_spec] for tokens in proposed]
         elif self.runner.speculative_config.use_eagle(
         ) or self.runner.speculative_config.method == "dflash":
-            assert input_ids is not None
+            if input_ids is None:
+                # Guard against regressions of the mm+spec-decode engine death
+                # (assert tpu_runner.py:2116, measured 2026-08-27): the drafter
+                # consumes raw token ids; the multimodal path must not null
+                # input_ids (see model_input_ids in _execute_model).
+                raise RuntimeError(
+                    "eagle/mtp/dflash drafters require raw token ids; the "
+                    "multimodal path must not null input_ids -- see "
+                    "model_input_ids in _execute_model.")
             if self.runner.speculative_config.method == "dflash":
                 self._draft_token_ids = self.propose_dflash_draft_token_ids(
                     spec_decode_metadata,

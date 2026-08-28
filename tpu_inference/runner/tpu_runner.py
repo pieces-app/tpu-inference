@@ -1714,7 +1714,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Later, the multi-modality model will take the embedding as the input.
         # For text-only model, this does nothing. It will input the input_ids and
         # leave the embedding job inside the forward pass
-        input_ids, inputs_embeds = self._get_input_ids_embeds(
+        #
+        # NOTE: mm models feed embeds to the forward pass (model_input_ids is
+        # None there), but the raw token ids stay live: spec decode extracts
+        # scheduled draft ids from them (_extract_draft_token_ids) and the
+        # drafter (eagle3/mtp/dflash) consumes them in prepare_inputs.
+        # Rebinding to `input_ids` here used to null the buffer and kill the
+        # engine on mm+spec-decode steps (assert at tpu_runner.py:2116 in the
+        # deployed wheel, measured 2026-08-27).
+        model_input_ids, inputs_embeds = self._get_input_ids_embeds(
             input_ids, mm_embeds, is_mm_embed)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
@@ -1739,7 +1747,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                  expert_indices) = self.model_fn(
                      self.state_leaves,
                      self.kv_caches,
-                     input_ids,
+                     model_input_ids,
                      attn_metadata,
                      inputs_embeds,
                      input_positions,
@@ -2123,7 +2131,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             target_logits = self._select_from_array_fn(
                 logits, spec_decode_metadata.target_logits_indices, self.mesh,
                 self.vllm_config.sharding_config.prefill_cp_size)
-            assert input_ids is not None
+            if input_ids is None:
+                # Guard against regressions of the mm+spec-decode engine death
+                # (assert tpu_runner.py:2116, measured 2026-08-27): spec decode
+                # requires the raw token ids; the multimodal path must not null
+                # input_ids (see model_input_ids in _execute_model).
+                raise RuntimeError(
+                    "spec decode requires raw token ids to score scheduled "
+                    "draft tokens; the multimodal path must not null "
+                    "input_ids -- see model_input_ids in _execute_model.")
             draft_token_ids = self._extract_draft_token_ids(
                 input_ids, spec_decode_metadata.final_logits_indices,
                 spec_decode_metadata.target_logits_indices)
