@@ -137,11 +137,30 @@ class TestTpuPlatform:
 
     def test_validate_request_random_seed(self):
         from vllm.sampling_params import SamplingParams, SamplingType
+
+        from tpu_inference.platforms.tpu_platform import \
+            TpuRequestValidationError
         params = MagicMock(spec=SamplingParams)
         params.sampling_type = SamplingType.RANDOM_SEED
-        with pytest.raises(ValueError,
-                           match="JAX does not support per-request seed"):
+        params.seed = 1234
+        # Still a ValueError (old contract), but it must ALSO be the vLLM
+        # client-error type: AsyncLLM.generate() wraps anything that is not a
+        # VLLMClientError in a message-less EngineGenerateError, which the
+        # OpenAI frontend renders as HTTP 500 with an EMPTY error message
+        # (fleet incident 2026-08-27).
+        with pytest.raises(ValueError, match="seed") as exc_info:
             TpuPlatform.validate_request(MagicMock(), params)
+        err = exc_info.value
+        assert isinstance(err, TpuRequestValidationError)
+        assert err.parameter == "seed"
+        assert err.value == 1234
+        assert str(err), "rejection must never surface an empty message"
+        try:
+            from vllm.exceptions import VLLMClientError
+        except ImportError:
+            pass  # pre-hierarchy vLLM pin: ValueError fallback is correct
+        else:
+            assert isinstance(err, VLLMClientError)
 
     def test_validate_request_valid(self):
         from vllm.sampling_params import SamplingParams, SamplingType
