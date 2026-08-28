@@ -24,12 +24,18 @@ and RedHatAI's ``*-INT4`` GPTQ exports (group 128, actorder "static" — no
 checkpoints; only ``actorder: group`` serializes g_idx and is rejected below).
 
 Storage layout after load: weights stay PACKED as ``jnp.int4`` ``[in, out]``
-plus bf16 group scales ``[in // group_size, out]``. Dequantization to bf16
-happens per-forward inside ``sharded_quantized_matmul``'s XLA path (the 2D
-scale triggers blockwise weight dequant and disables activation
-quantization), mirroring the AWQ scheme's dequant-then-einsum approach. The
-memory win (int4-resident weights -> larger KV arena) is the point; there is
-no per-request speedup.
+plus bf16 group scales ``[in // group_size, out]``. By default,
+dequantization to bf16 happens per-forward inside
+``sharded_quantized_matmul``'s XLA path (the 2D scale triggers blockwise
+weight dequant and disables activation quantization), mirroring the AWQ
+scheme's dequant-then-einsum approach. With
+``ENABLE_QUANTIZED_MATMUL_KERNEL=1`` the scale is instead formatted to 4D,
+which routes the matmul to the tokamax ``gmm_v2`` fused kernel: weights
+stay int4-packed in HBM and are dequantized tile-wise in VMEM
+(``maybe_quantize_lhs=False`` keeps activations bf16 — W4A16 semantics
+either way). The memory win (int4-resident weights -> larger KV arena)
+holds on both routes; the kernel route removes the per-forward bf16 weight
+materialization that made the XLA route memory-bound.
 """
 
 from typing import Callable, Optional
@@ -228,11 +234,15 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
             weight = (uint_weight - 8).astype(jnp.int4)
             weight = jnp.transpose(weight)  # -> [in, out]
 
-            # -> [in // group_size, out]. The 2D scale steers
-            # sharded_quantized_matmul into its blockwise weight-dequant XLA
-            # path with activation quantization disabled (W4A16 semantics),
-            # so enable_kernel stays False below: the gmm kernel path would
-            # quantize activations.
+            # -> [in // group_size, out]. With enable_kernel False the 2D
+            # scale steers sharded_quantized_matmul into its blockwise
+            # weight-dequant XLA path (materializes a bf16 weight copy per
+            # forward). With ENABLE_QUANTIZED_MATMUL_KERNEL=1 the scale is
+            # reformatted to 4D (format_linear_scale), which routes to the
+            # tokamax gmm_v2 fused kernel: weights stay int4-packed in HBM
+            # and are dequantized tile-wise in VMEM. Activation quantization
+            # stays off on both routes (apply passes maybe_quantize_x=False,
+            # i.e. gmm_v2 maybe_quantize_lhs=False) — W4A16 semantics.
             weight_scale = jnp.transpose(weight_scale)
 
             return process_linear_weights(
@@ -245,7 +255,8 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
                 fused=self.linear_config.fuse_matmuls,
                 output_sizes=self.linear_config.output_sizes,
                 reorder_size=self.linear_config.n_shards,
-                enable_kernel=False,
+                enable_kernel=self.linear_config.
+                enable_quantized_matmul_kernel,
             )
 
         weights = process_wNa16_linear_weights(uint_weight, weight_scale, bias)

@@ -1042,3 +1042,151 @@ def test_w4a16_moe_dispatch_fails_closed():
         VllmCompressedTensorsMoEMethod.get_moe_method(
             quant_config, layer, "model.layers.0.mlp.experts")
         ctor.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# gmm_v2 fused-kernel routing (ENABLE_QUANTIZED_MATMUL_KERNEL gate)
+# ---------------------------------------------------------------------------
+
+
+def _spy_gmm_v2(calls: list):
+    """Jax-traceable stand-in for tokamax ``gmm_v2`` with the contract the
+    linear wrapper relies on: int4 rhs ``[1, k, n]``, 4D rhs_scale
+    ``[1, num_blocks, 1, n]``, blockwise dequant in lhs dtype, matmul with
+    f32 accumulation. Records the static call facts the route assertions
+    need (at trace time, inside shard_map). CPU tests cannot execute the
+    real Mosaic kernel; real-kernel numerics are validated on TPU hardware
+    (temp-0 canary vs the XLA path)."""
+
+    def fake_gmm_v2(*, lhs, rhs, group_sizes, rhs_scale, rhs_bias,
+                    group_offset, zero_initialize, preferred_element_type,
+                    maybe_quantize_lhs):
+        calls.append({
+            "maybe_quantize_lhs": maybe_quantize_lhs,
+            "lhs_dtype": lhs.dtype,
+            "rhs_dtype": rhs.dtype,
+            "scale_shape": tuple(rhs_scale.shape),
+        })
+        w = rhs[0]  # [k, n] int4, per shard
+        scale = rhs_scale[0]  # [num_blocks, 1, n]
+        k, n = w.shape
+        num_blocks = scale.shape[0]
+        group = k // num_blocks
+        w_deq = (w.reshape(num_blocks, group, n).astype(lhs.dtype) *
+                 scale.astype(lhs.dtype)).reshape(k, n)
+        return jax.lax.dot_general(
+            lhs,
+            w_deq,
+            dimension_numbers=(((1, ), (0, )), ((), ())),
+            preferred_element_type=jnp.float32).astype(preferred_element_type)
+
+    return fake_gmm_v2
+
+
+def _stored_scales(layer) -> list:
+    stored = layer.weight_scale
+    return list(stored) if isinstance(stored, torch.nn.ParameterList) else [
+        stored
+    ]
+
+
+@pytest.mark.parametrize("model", MODELS)
+def test_kernel_route_not_taken_by_default(model, monkeypatch):
+    """Without ENABLE_QUANTIZED_MATMUL_KERNEL the scheme must keep its
+    original XLA dequant route: 2D stored scales, gmm_v2 never invoked.
+    Guards the env-gating of the c1 change (default behavior unchanged)."""
+    monkeypatch.delenv("ENABLE_QUANTIZED_MATMUL_KERNEL", raising=False)
+    mesh = require_devices(1)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = dtype
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        linear_layer = ColumnParallelLinear(
+            input_size=1024,
+            output_size=2048,
+            bias=False,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+
+    calls = []
+    monkeypatch.setattr("tpu_inference.layers.common.linear.gmm_v2",
+                        _spy_gmm_v2(calls))
+
+    ref_output, layer_output = return_ref_and_layer_output(linear_layer)
+    torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+    assert calls == [], (
+        "gmm_v2 must not be reached when the env gate is unset")
+    for s in _stored_scales(linear_layer):
+        assert torchax.interop.jax_view(s).ndim == 2, (
+            "default route must keep the 2D blockwise scale that steers "
+            "sharded_quantized_matmul onto its XLA path")
+
+
+@pytest.mark.parametrize("layer_cls",
+                         [ColumnParallelLinear, RowParallelLinear],
+                         ids=["column", "row"])
+@pytest.mark.parametrize("num_devices", [1, 4], ids=["tp1", "tp4"])
+@pytest.mark.parametrize("model", MODELS)
+def test_gmm_v2_kernel_route_env_gated(model, num_devices, layer_cls,
+                                       monkeypatch):
+    """ENABLE_QUANTIZED_MATMUL_KERNEL=1 must steer wNa16 onto the fused
+    gmm_v2 route with W4A16 semantics intact: 4D stored scale, int4 rhs
+    (weights stay packed), lhs bf16 and NEVER quantized
+    (maybe_quantize_lhs=False), and layer numerics unchanged vs the
+    dequantized reference."""
+    monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
+    mesh = require_devices(num_devices)
+    dtype = torch.bfloat16
+
+    engine_args = EngineArgs(
+        model=model,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        max_num_seqs=4,
+    )
+    vllm_config = engine_args.create_engine_config()
+    vllm_config.model_config.dtype = dtype
+    quant_config = get_tpu_quantization_config(vllm_config, mesh)
+    with set_current_vllm_config(vllm_config):
+        linear_layer = layer_cls(
+            input_size=1024,
+            output_size=2048,
+            bias=False,
+            params_dtype=dtype,
+            return_bias=False,
+            quant_config=quant_config,
+        )
+
+    calls = []
+    monkeypatch.setattr("tpu_inference.layers.common.linear.gmm_v2",
+                        _spy_gmm_v2(calls))
+
+    ref_output, layer_output = return_ref_and_layer_output(linear_layer)
+    torch.testing.assert_close(ref_output, layer_output, rtol=0.05, atol=0.05)
+
+    assert calls, "env gate set but the gmm_v2 kernel route was not taken"
+    for call in calls:
+        # W4A16: activations must never be quantized on the kernel route.
+        assert call["maybe_quantize_lhs"] is False
+        assert call["lhs_dtype"] == jnp.bfloat16
+        # Weights must reach the kernel still int4-packed (the memory win).
+        assert call["rhs_dtype"] == jnp.int4
+        # tokamax contract: rhs_scale [size_group=1, num_blocks, 1, n].
+        assert len(call["scale_shape"]) == 4
+        assert call["scale_shape"][0] == 1 and call["scale_shape"][2] == 1
+
+    for s in _stored_scales(linear_layer):
+        assert torchax.interop.jax_view(s).ndim == 4, (
+            "kernel route requires the 4D scale emitted by "
+            "format_linear_scale")
