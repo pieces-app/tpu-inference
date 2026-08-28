@@ -53,11 +53,38 @@ def xla_quantized_matmul(
         block_size_in = in_features // in_blocks
         block_size_out = out_features // out_blocks
 
-        w_q_reshaped = w_q.reshape(in_blocks, block_size_in, out_blocks,
-                                   block_size_out)
-        w_q = (w_q_reshaped.astype(jnp.float32) *
-               w_scale[:, jnp.newaxis, :, jnp.newaxis]).reshape(
-                   in_features, out_features).astype(x.dtype)
+        if w_scale.dtype == x.dtype:
+            # Dequantize directly in the activation dtype (w4tax fix a').
+            # Quantized values (int4/int8/fp8: <= 8 significant bits) are
+            # exact in bf16 and their product with a bf16 scale has <= 16
+            # significant bits, so exactly one rounding to bf16 happens in
+            # either formulation: bit-identical to the f32 route below
+            # (asserted in quantized_matmul_kernel_test). The f32 route made
+            # XLA:TPU materialize an f32 broadcast of the scale at full
+            # weight size in HBM every forward (450 MiB per 12B gate_up,
+            # ~8 B/param of extra traffic per decode step; HLO evidence in
+            # BENCH_RESULTS.md "W4A16 decode-speed tax").
+            if out_blocks == out_features:
+                # Per-output-channel group scales (the wNa16 layout): drop
+                # the degenerate trailing block dim entirely.
+                w_q = (w_q.reshape(in_blocks, block_size_in,
+                                   out_features).astype(x.dtype) *
+                       w_scale[:, jnp.newaxis, :]).reshape(
+                           in_features, out_features)
+            else:
+                w_q = (w_q.reshape(in_blocks, block_size_in, out_blocks,
+                                   block_size_out).astype(x.dtype) *
+                       w_scale[:, jnp.newaxis, :, jnp.newaxis]).reshape(
+                           in_features, out_features)
+        else:
+            # Scale dtype differs from the activation dtype (e.g. f32
+            # scales): keep the f32 product so the scale is not rounded
+            # before the multiply.
+            w_q_reshaped = w_q.reshape(in_blocks, block_size_in, out_blocks,
+                                       block_size_out)
+            w_q = (w_q_reshaped.astype(jnp.float32) *
+                   w_scale[:, jnp.newaxis, :, jnp.newaxis]).reshape(
+                       in_features, out_features).astype(x.dtype)
 
         # in this case, we don't want to quantize the activations
         quantize_activation = False
