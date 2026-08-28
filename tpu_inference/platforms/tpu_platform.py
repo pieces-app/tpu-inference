@@ -541,7 +541,13 @@ class TpuPlatform(Platform):
                 "sampler does not honor per-request seeds")
         else:
             cls._per_request_seed_unsupported_reason = None
-        cls._install_early_seed_gate()
+        # NOTE: an earlier draft installed an additional pre-render seed gate
+        # here (to reject seeded mm requests BEFORE the P0 cache registers
+        # their hashes). That layer is not in this change -- the call was
+        # removed in review because its definition never landed and a
+        # dangling call is an AttributeError on every boot. The P0-poisoning
+        # window is documented in validate_request below and closes with the
+        # vLLM-fork P0-invalidation fix.
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
