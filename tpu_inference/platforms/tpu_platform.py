@@ -182,11 +182,6 @@ class TpuPlatform(Platform):
         "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
-    # Why per-request seeding is unavailable on the current engine config, or
-    # None when it is supported. check_and_update_config() derives it; the
-    # request gates (validate_sampling_params / validate_request) read it.
-    _per_request_seed_unsupported_reason: Optional[str] = None
-
     def set_device(self, device: torch.device) -> None:
         # No-op on TPU since JAX/libtpu handles device management internally.
         pass
@@ -530,17 +525,6 @@ class TpuPlatform(Platform):
                 patch_vllm_scheduler_for_continue_decode
             patch_vllm_scheduler_for_continue_decode()
 
-        # Per-request seed support: the JAX sampler honors seeds via a
-        # per-row PRNG key derived from (seed, draw index). The rejection
-        # sampler used under speculative decoding still draws from the
-        # global stream, so seeded requests would silently not be
-        # reproducible there -- gate them with a typed 400 instead.
-        if vllm_config.speculative_config is not None:
-            cls._per_request_seed_unsupported_reason = (
-                "speculative decoding is enabled and the TPU rejection "
-                "sampler does not honor per-request seeds")
-        else:
-            cls._per_request_seed_unsupported_reason = None
         # NOTE: an earlier draft installed an additional pre-render seed gate
         # here (to reject seeded mm requests BEFORE the P0 cache registers
         # their hashes). That layer is not in this change -- the call was
