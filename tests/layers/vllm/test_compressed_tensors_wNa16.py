@@ -505,6 +505,14 @@ def test_w4a16_moe_dispatch_fails_closed():
 
     # Positive control: a genuine w4a8 config (input activations quantized)
     # still reaches the W4A8 method through the same dispatch.
+    #
+    # moe_config has to be set explicitly. MagicMock(spec=RoutedExperts) takes
+    # its allowed attributes from dir(RoutedExperts), and moe_config is assigned
+    # in __init__ rather than declared on the class, so a spec'd mock raises
+    # AttributeError on the dispatch's `layer.moe_config` read. The guard above
+    # returns before that line, which is why only the positive control reached
+    # it -- the negative case would pass either way.
+    layer.moe_config = MagicMock()
     quant_config.get_scheme_dict.return_value = {
         "weights": weight_quant,
         "input_activations": MagicMock(num_bits=8),
