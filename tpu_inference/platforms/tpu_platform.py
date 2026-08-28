@@ -131,6 +131,41 @@ else:
 
 logger = init_logger(__name__)
 
+try:
+    from vllm.exceptions import VLLMValidationError as _VllmValidationError
+except ImportError:  # pragma: no cover - vLLM pins predating vllm.exceptions
+    _VllmValidationError = None
+
+if _VllmValidationError is not None:
+
+    class TpuRequestValidationError(_VllmValidationError, ValueError):
+        """Client-side (HTTP 400) rejection of a request this backend cannot serve.
+
+        Derives from vllm.exceptions.VLLMValidationError so the AsyncLLM
+        boundary re-raises it untouched and the OpenAI frontend maps it to a
+        400 BadRequestError carrying the message and offending parameter
+        (vllm/entrypoints/serve/exception_handling/error_response.py). Also
+        derives from ValueError so callers written against the old
+        "raises ValueError" contract keep working.
+        """
+else:  # pragma: no cover - vLLM pins predating vllm.exceptions
+
+    class TpuRequestValidationError(ValueError):  # type: ignore[no-redef]
+        """Fallback for vLLM pins without the client-error hierarchy."""
+
+        def __init__(self, message, *, parameter=None, value=None):
+            super().__init__(message)
+            self.parameter = parameter
+            self.value = value
+
+
+_SEED_UNSUPPORTED_MSG = (
+    "Per-request `seed` is not supported on the TPU JAX sampler yet: "
+    "sampling draws from a single engine-level PRNG stream "
+    "(jax.random.key(model_config.seed), split once per step), so there is "
+    "no per-request generator to seed. Remove `seed` from the request; for "
+    "reproducible outputs use temperature=0 (greedy) instead.")
+
 
 class TpuPlatform(Platform):
     _enum = PlatformEnum.TPU
@@ -146,6 +181,11 @@ class TpuPlatform(Platform):
         "compressed-tensors", "auto_awq", "fp8", "gpt_oss_mxfp4",
         "modelopt_fp4", "deepseek_v4_fp8"
     ]
+
+    # Why per-request seeding is unavailable on the current engine config, or
+    # None when it is supported. check_and_update_config() derives it; the
+    # request gates (validate_sampling_params / validate_request) read it.
+    _per_request_seed_unsupported_reason: Optional[str] = None
 
     def set_device(self, device: torch.device) -> None:
         # No-op on TPU since JAX/libtpu handles device management internally.
@@ -490,6 +530,19 @@ class TpuPlatform(Platform):
                 patch_vllm_scheduler_for_continue_decode
             patch_vllm_scheduler_for_continue_decode()
 
+        # Per-request seed support: the JAX sampler honors seeds via a
+        # per-row PRNG key derived from (seed, draw index). The rejection
+        # sampler used under speculative decoding still draws from the
+        # global stream, so seeded requests would silently not be
+        # reproducible there -- gate them with a typed 400 instead.
+        if vllm_config.speculative_config is not None:
+            cls._per_request_seed_unsupported_reason = (
+                "speculative decoding is enabled and the TPU rejection "
+                "sampler does not honor per-request seeds")
+        else:
+            cls._per_request_seed_unsupported_reason = None
+        cls._install_early_seed_gate()
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         # TODO: TPU still sets block_size in check_and_update_config.
@@ -525,12 +578,34 @@ class TpuPlatform(Platform):
         processed_inputs: ProcessorInputs,
         params: Union["SamplingParams", PoolingParams],
     ) -> None:
-        """Raises if this request is unsupported on this platform"""
+        """Raises if this request is unsupported on this platform.
+
+        Anything raised here must be a vLLM CLIENT error
+        (vllm.exceptions.VLLMClientError): vLLM's AsyncLLM.generate() re-raises
+        only VLLMClientError to the API layer and wraps every other exception
+        in a message-less EngineGenerateError (vllm/v1/engine/async_llm.py),
+        which the OpenAI frontend then renders as HTTP 500 with an EMPTY error
+        message. A plain ValueError here therefore surfaced as an unactionable
+        empty 500 on every TPU lane (observed fleet-wide 2026-08-27).
+
+        Ordering caveat (vLLM-side, tracked separately): at our vLLM pin this
+        hook runs AFTER multimodal preprocessing has registered the request's
+        mm items in the frontend (P0) processor cache (renderer:
+        vllm/renderers/base.py; call site:
+        vllm/v1/engine/input_processor.py `process_inputs`). A rejection here
+        never reaches the engine core, so the P0 shadow keeps entries the P1
+        receiver cache never saw, and LATER image requests reusing those items
+        fail with "P0/P1 cache drift" until the caches are purged. Rejections
+        of multimodal requests should be treated as a last resort until the
+        P0-invalidation fix lands in the vLLM fork.
+        """
         from vllm.sampling_params import SamplingParams, SamplingType
 
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
-                raise ValueError("JAX does not support per-request seed.")
+                raise TpuRequestValidationError(_SEED_UNSUPPORTED_MSG,
+                                                parameter="seed",
+                                                value=params.seed)
 
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,
