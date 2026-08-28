@@ -123,6 +123,57 @@ class TestSpeculativeDecodingManager:
                 MagicMock(), MagicMock(), MagicMock(), MagicMock(), [], None,
                 MagicMock(), False, None)
 
+    def test_propose_draft_token_ids_gets_raw_ids(self):
+        """The eagle/mtp drafter path must receive the raw token id array:
+        the multimodal path used to null input_ids and kill the engine
+        (assert tpu_runner.py:2116, measured 2026-08-27)."""
+        self.runner.drafter = MagicMock(spec=Eagle3Proposer)
+        self.runner.speculative_config.method = "eagle3"
+        raw_input_ids = jax.numpy.arange(8, dtype=jax.numpy.int32)
+
+        with patch.object(self.runner.speculative_decoding_manager,
+                          'propose_eagle3_draft_token_ids',
+                          return_value=[[10, 11]]) as mock_propose_eagle:
+            mock_spec_decode_metadata = MagicMock()
+            mock_spec_decode_metadata.req_indices_dp = {0: [0, 1]}
+            self.runner.speculative_decoding_manager.propose_draft_token_ids(
+                sampled_output=MagicMock(),
+                logits_indices_selector=MagicMock(),
+                last_sampled_token_id=MagicMock(),
+                num_rejected_tokens=MagicMock(),
+                discard_sampled_tokens_req_indices=[],
+                aux_hidden_states=None,
+                attn_metadata=MagicMock(),
+                async_scheduling=False,
+                spec_decode_metadata=mock_spec_decode_metadata,
+                input_ids=raw_input_ids,
+            )
+
+            mock_propose_eagle.assert_called_once()
+            # input_ids is the 8th positional argument of the proposal call.
+            assert mock_propose_eagle.call_args[0][7] is raw_input_ids
+
+    def test_propose_draft_token_ids_null_input_ids_diagnosed(self):
+        """A regression that nulls input_ids (the mm path bug) must die with
+        an explicit RuntimeError diagnosis, not a bare assert."""
+        self.runner.drafter = MagicMock(spec=Eagle3Proposer)
+        self.runner.speculative_config.method = "eagle3"
+
+        with pytest.raises(RuntimeError,
+                           match="multimodal path must not null"):
+            self.runner.speculative_decoding_manager.propose_draft_token_ids(
+                sampled_output=MagicMock(),
+                logits_indices_selector=MagicMock(),
+                last_sampled_token_id=MagicMock(),
+                num_rejected_tokens=MagicMock(),
+                discard_sampled_tokens_req_indices=[],
+                aux_hidden_states=None,
+                attn_metadata=MagicMock(),
+                async_scheduling=False,
+                spec_decode_metadata=MagicMock(),
+                input_ids=None,
+            )
+
     def test_take_draft_token_ids(self):
         """Tests the take_draft_token_ids method for speculative decoding."""
         # Case 1: No draft tokens are available.
