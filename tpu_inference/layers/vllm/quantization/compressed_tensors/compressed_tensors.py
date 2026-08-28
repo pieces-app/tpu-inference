@@ -41,6 +41,8 @@ from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compresse
     VllmCompressedTensorsW8A8Fp8
 from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import \
     VllmCompressedTensorsW8A8Int8
+from tpu_inference.layers.vllm.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    VllmCompressedTensorsWNA16, is_wNa16_group)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.layers.vllm.quantization.unquantized import \
     VllmUnquantizedConfig
@@ -132,6 +134,30 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 "None for NVFP4A16",
             )
 
+        # Weight-only int4 group quantization (W4A16, pack-quantized), e.g.
+        # gemma-4 *-qat-w4a16-ct and RedHatAI *-INT4 checkpoints. MUST be
+        # checked before _is_dynamic_token_w8a8: that upstream helper
+        # dereferences input_quant.num_bits and raises AttributeError for
+        # weight-only configs (input_activations null) — the exact
+        # CT-W4A16-fails-at-load mechanism (measured 2026-08-27, v6e-1).
+        if is_wNa16_group(weight_quant, input_quant,
+                          getattr(self, "quant_format", None)):
+            return VllmCompressedTensorsWNA16(
+                weight_quant=weight_quant,
+                linear_config=linear_config,
+            )
+        if input_quant is None:
+            # Weight-only config that is NOT 4-bit/group/pack-quantized
+            # (channelwise, 2/3/5/6/7/8-bit, or a non-pack format). Every
+            # remaining predicate below models an activation-quantized
+            # scheme, and upstream's _is_dynamic_token_w8a8 dereferences
+            # input_quant.num_bits -- a bare AttributeError, the exact
+            # misleading-crash mechanism documented above for W4A16.
+            # Refuse with the real reason instead.
+            raise NotImplementedError(
+                "Weight-only compressed-tensors scheme for layer "
+                f"{layer_name} is not supported on this path (only 4-bit, "
+                f"group-strategy, pack-quantized W4A16 is): {weight_quant}")
         if self._is_fp8_w8a8(weight_quant, input_quant):
             is_static_input_scheme = input_quant and not input_quant.dynamic
             return VllmCompressedTensorsW8A8Fp8(
