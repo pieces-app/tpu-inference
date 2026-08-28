@@ -16,7 +16,22 @@ import os
 import unittest
 from dataclasses import dataclass, field
 
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+# Merge, never clobber. This used to be a bare assignment, which destroyed
+# whatever XLA_FLAGS the environment had already set -- including a
+# device-count the gate chose deliberately, and any unrelated flag. In a shared
+# pytest process the surviving value depended on import order.
+#
+# `if not in` rather than prepend, matching tests/layers/vllm/
+# test_compressed_tensors_wNa16.py: if the environment already chose a device
+# count, respect it. Two conflicting --xla_force_host_platform_device_count
+# flags in one string is undefined, and a test that needs more devices than the
+# environment granted should SKIP VISIBLY rather than silently disagree with
+# the count everything else is using.
+if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (
+        os.environ.get("XLA_FLAGS", "")
+        + " --xla_force_host_platform_device_count=8"
+    ).strip()
 
 import jax
 import jax.numpy as jnp
