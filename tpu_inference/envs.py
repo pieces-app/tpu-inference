@@ -30,10 +30,6 @@ if TYPE_CHECKING:
     RAY_USAGE_STATS_ENABLED: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
-    # Opt-in: on-the-fly per-output-channel fp8 (e4m3) for a bf16 dense
-    # checkpoint. Default False keeps get_quant_method fail-closed; enable
-    # only for the OD-TPU quality panel (issue #158).
-    VLLM_FP8_ONLINE_DENSE: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
