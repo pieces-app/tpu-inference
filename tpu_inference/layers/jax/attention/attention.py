@@ -256,9 +256,37 @@ class Attention(nnx.Module):
             P(ShardingAxisName.ATTN_DATA),  # distribution
         )
 
+        # Gemma-4 blockwise-bidirectional image attention. The runner builds
+        # md.mm_bidi_ranges (i32[max_num_seqs, 2]) only when TPURunner._init_mm_bidi
+        # enabled it; the torchax path forwards it (flash_attn.py) and the v3
+        # RPA kernel consumes it, but this flax_nnx path historically dropped
+        # it, so tower models (31B / 26B-A4B) served a causal-only mask under
+        # TPU_MM_BIDI_ATTENTION=force. Thread it as an extra replicated operand
+        # exactly as layers/common/attention_interface.py does. When it is None
+        # (text-only, or the feature disabled at startup) nothing changes.
+        has_mm_bidi = md.mm_bidi_ranges is not None
+        if has_mm_bidi and envs.USE_BATCHED_RPA_KERNEL:
+            # Invariant, not runtime policy: _init_mm_bidi refuses to build the
+            # ranges under the batched RPA kernel, so reaching here means that
+            # gate was bypassed. Fail loud rather than serve a wrong mask.
+            raise NotImplementedError(
+                "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
+                "by the batched RPA kernel; TPURunner._init_mm_bidi should have "
+                "disabled it when USE_BATCHED_RPA_KERNEL=1.")
+        if has_mm_bidi:
+            in_specs = in_specs + (P(ShardingAxisName.ATTN_DATA), )  # mm_bidi_ranges
+
         out_specs = (self.attn_o_tnh, kv_cache_spec)
 
         def _ragged_paged_attention(*args):
+            # mm_bidi_ranges rides as the last operand when present (so it is
+            # sharded/replicated by the shard_map like every other array),
+            # then peeled back off here and forwarded to the kernel as a
+            # keyword, exactly as layers/common/attention_interface.py does.
+            if has_mm_bidi:
+                *args, mm_ranges = args
+            else:
+                mm_ranges = None
             # Optional operator block-size overrides, read at the call site
             # (outside the kernel, so the kernel stays self-contained) and
             # forwarded only when set. Each env var is a comma-separated 4-tuple
@@ -266,6 +294,8 @@ class Attention(nnx.Module):
             # omitted entirely, so the stock call is unchanged and no v3-only
             # kwarg is passed to a kernel that doesn't accept it.
             block_size_kwargs = _rpa_block_size_kwargs()
+            if mm_ranges is not None:
+                block_size_kwargs["mm_bidi_ranges"] = mm_ranges
             return ragged_paged_attention(
                 *args,
                 sm_scale=q_TNH.shape[-1]**-0.5,
@@ -283,13 +313,15 @@ class Attention(nnx.Module):
                 out_specs=out_specs,
                 check_vma=False,
             ))(
-                q_TNH,
-                k_SKH,
-                v_SKH,
-                kv_cache,
-                md.seq_lens,
-                md.block_tables,
-                md.query_start_loc,
-                md.request_distribution,
+                *(
+                    q_TNH,
+                    k_SKH,
+                    v_SKH,
+                    kv_cache,
+                    md.seq_lens,
+                    md.block_tables,
+                    md.query_start_loc,
+                    md.request_distribution,
+                ) + ((md.mm_bidi_ranges, ) if has_mm_bidi else ())
             )
         return kv_cache, output_TNH
