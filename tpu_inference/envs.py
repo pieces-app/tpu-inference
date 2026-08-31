@@ -295,6 +295,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "shm", ["shm"]),
     "ENABLE_QUANTIZED_MATMUL_KERNEL":
     env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
+    "VLLM_FP8_ONLINE_DENSE":
+    env_bool("VLLM_FP8_ONLINE_DENSE", default=False),
     # Specify block quantization size
     "REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if
