@@ -46,6 +46,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_quantized_moe_weights, shard_moe_weights)
 from tpu_inference.layers.common.quant_methods import FP8
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
+from tpu_inference.layers.common.quantization.online_fp8_requant import (
+    online_fp8_requant_per_channel)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
@@ -116,6 +118,23 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
                     return VllmUnquantizedLinearMethod(
                         self.get_linear_config(layer))
                 if not self.is_checkpoint_fp8_serialized:
+                    if envs.VLLM_FP8_ONLINE_DENSE:
+                        # OPT-IN, issue #158. Dense on-the-fly fp8 for a bf16
+                        # checkpoint: create_weights registers a plain bf16
+                        # weight (NO empty scale -- that was the garbage trap),
+                        # process_weights_after_loading requants to e4m3 with a
+                        # per-output-channel scale = amax/448. UNPROVEN on
+                        # hardware; gated behind this flag pending the OD-TPU
+                        # quality panel, so the fail-closed default below is
+                        # untouched for everyone who does not opt in.
+                        logger.warning_once(
+                            "VLLM_FP8_ONLINE_DENSE=1: serving dense on-the-fly "
+                            "fp8 (e4m3, per-output-channel) from a "
+                            "non-serialized checkpoint. Opt-in and not yet "
+                            "hardware-qualified (issue #158); quality is gated "
+                            "on the OD-TPU panel, not on a healthy /health.")
+                        return VllmFp8OnlineLinearMethod(
+                            self, self.get_linear_config(layer))
                     # Fail closed. Upstream vLLM routes non-fp8-serialized
                     # checkpoints to Fp8PerTensorOnlineLinearMethod, but that
                     # method depends on ops.scaled_fp8_quant (a CUDA custom op
@@ -374,6 +393,97 @@ class VllmFp8LinearMethod(
                                         bias_jax,
                                         mesh=self.linear_config.mesh)
             return torch_view(out)
+
+
+class VllmFp8OnlineLinearMethod(VllmFp8LinearMethod):
+    """Dense on-the-fly fp8 for a bf16 checkpoint (OPT-IN, issue #158).
+
+    Reached ONLY when envs.VLLM_FP8_ONLINE_DENSE is set; the default dispatch
+    for a non-serialized checkpoint stays the fail-closed NotImplementedError.
+    create_weights registers a plain bf16 weight (like the unquantized method)
+    so the loader fills it -- crucially NO torch.empty() weight_scale is
+    created, which is the uninitialized-scale garbage the fail-closed guard
+    exists to prevent. process_weights_after_loading then requants to e4m3 with
+    a per-output-channel scale and hands off to the SAME
+    process_linear_weights / shard_linear_weights / apply path the offline fp8
+    method uses (this class inherits apply from VllmFp8LinearMethod).
+    """
+
+    if "VllmFp8OnlineLinearMethod" not in vllm_linear.WEIGHT_LOADER_V2_SUPPORTED:
+        vllm_linear.WEIGHT_LOADER_V2_SUPPORTED.append(
+            "VllmFp8OnlineLinearMethod")
+
+    def create_weights(self, layer, input_size_per_partition,
+                       output_partition_sizes, input_size, output_size,
+                       params_dtype, **extra_weight_attrs):
+        # A bf16 checkpoint has no scale tensors. Register a plain bf16 weight
+        # exactly as the unquantized method does; we requant after loading.
+        vllm_linear.UnquantizedLinearMethod.create_weights(
+            self, layer, input_size_per_partition, output_partition_sizes,
+            input_size, output_size, params_dtype, **extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer):
+        if not hasattr(layer, "weight") or not _tensor_is_in_cpu(layer.weight):
+            return
+        assert isinstance(layer, vllm_linear.LinearBase)
+
+        loading_sharding = NamedSharding(
+            self.linear_config.mesh,
+            PartitionSpec(*self.linear_config.weight_sharding[::-1]),
+        )
+        weight = _load_weight_for_layer(layer, "weight", loading_sharding)
+        weight = jnp.transpose(weight)  # -> [out, in]
+        delattr(layer, "weight")
+
+        # The online step: requant the bf16 weight to e4m3 + per-out-channel
+        # scale, in place of loading a pre-serialized (weight, weight_scale).
+        weight, weight_scale = online_fp8_requant_per_channel(weight)
+
+        if layer.bias is not None and not layer.skip_bias_add:
+            if layer.return_bias:
+                logger.warning_once("Bias might return incorrect value.")
+            bias = _load_weight_for_layer(
+                layer, "bias",
+                NamedSharding(self.linear_config.mesh,
+                              self.linear_config.bias_sharding))
+            delattr(layer, "bias")
+        else:
+            bias = None
+
+        # Same downstream handling as the offline non-block fp8 path.
+        weights = process_linear_weights(
+            LinearWeights(
+                weight=weight,
+                weight_scale=weight_scale,
+                zero_point=None,
+                bias=bias,
+            ),
+            fused=self.linear_config.fuse_matmuls,
+            output_sizes=tuple(self.linear_config.output_sizes),
+            reorder_size=self.linear_config.n_shards,
+            per_tensor=False,
+        )
+        has_bias = bias is not None
+        weights = torch_view(
+            shard_linear_weights(
+                weights,
+                mesh=self.linear_config.mesh,
+                weight_p_spec=self.linear_config.weight_sharding,
+                bias_p_spec=self.linear_config.bias_sharding,
+                per_tensor=False,
+            ))
+        if self.linear_config.fuse_matmuls:
+            layer.weight = Parameter(weights.weight, requires_grad=False)
+            layer.weight_scale = Parameter(weights.weight_scale,
+                                           requires_grad=False)
+            if has_bias:
+                layer.bias = Parameter(weights.bias, requires_grad=False)
+        else:
+            layer.weight = to_parameter_list(weights.weight)
+            layer.weight_scale = to_parameter_list(weights.weight_scale)
+            if has_bias:
+                layer.bias = to_parameter_list(weights.bias)
+
 
 
 class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
