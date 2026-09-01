@@ -218,5 +218,16 @@ class QuantLinearConfig(CommonQuantLinearConfig):
         # At TP=1 the stale value is accidentally correct, which is why the
         # single-chip arms never surfaced this. The 4- and 8-chip fp8
         # comparisons are exactly where it would have.
+        # Index [1] is NOT safe here. In the batch_features branch above,
+        # weight_sharding comes from the param's metadata and can be an EMPTY
+        # PartitionSpec (a 3-D batched einsum whose metadata carries no
+        # out_sharding, e.g. DeepSeek-V3 MLA) -- [1] then raises IndexError at
+        # MODEL CONSTRUCTION, turning a quantization detail into a boot
+        # failure. Fall back to out_features_sharding, which is what "the TP
+        # axis of the OUTPUT" means and which both branches always define.
+        _out_axis = (self.weight_sharding[1]
+                     if len(self.weight_sharding) > 1 else
+                     (self.out_features_sharding[0]
+                      if self.out_features_sharding else None))
         self.n_shards = get_mesh_shape_product(
-            jax.sharding.get_abstract_mesh(), self.weight_sharding[1])
+            jax.sharding.get_abstract_mesh(), _out_axis)
