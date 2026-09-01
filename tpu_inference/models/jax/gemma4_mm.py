@@ -28,6 +28,7 @@ from vllm.model_executor.models.gemma4_mm import \
     Gemma4ForConditionalGeneration as PtGemma4MM
 from vllm.model_executor.models.utils import WeightsMapper
 
+from tpu_inference import envs
 from tpu_inference.layers.common.attention_interface import \
     sharded_flash_attention
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -717,6 +718,36 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
             },
             orig_to_new_suffix={".linear.weight": ".weight"},
         )
+        # AUDIO: this implementation has no audio tower, so those weights are
+        # skipped. That is CORRECT for a checkpoint that has none -- the
+        # 26B-A4B declares `audio_config: null` and ships zero audio tensors --
+        # and SILENTLY WRONG for one that does.
+        #
+        # google/gemma-4-E4B-it declares `audio_config: gemma4_audio` and
+        # carries a real encoder: 752 tensors (model.audio_tower.layers x744,
+        # subsample_conv_projection x5, output_proj x2, embed_audio x1).
+        # Skipping them unconditionally means the model LOADS CLEAN, serves
+        # text and vision correctly, and mishandles audio with no error, no
+        # warning and no failed gate -- the checkpoint's entire audio
+        # capability discarded by a static list.
+        #
+        # So refuse when the config CLAIMS audio and this class cannot serve
+        # it. The escape hatch exists because text+vision on an audio-capable
+        # checkpoint is a legitimate thing to want, but it must be SAID rather
+        # than defaulted into.
+        audio_cfg = getattr(self.vllm_config.model_config.hf_config,
+                            "audio_config", None)
+        if audio_cfg is not None and not envs.ALLOW_AUDIO_WEIGHT_SKIP:
+            raise ValueError(
+                "this checkpoint declares audio_config "
+                f"({getattr(audio_cfg, 'model_type', audio_cfg)}) but "
+                f"{type(self).__name__} has no audio tower, so every "
+                "audio_tower/embed_audio weight would be silently dropped and "
+                "the model would serve WRONG audio with no error. Refusing. "
+                "Set ALLOW_AUDIO_WEIGHT_SKIP=1 to serve text+vision only from "
+                "this checkpoint, or use a path that implements the tower "
+                "(today: the vLLM/torchax fallback).")
+
         loader = JaxAutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head"]
