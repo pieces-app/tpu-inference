@@ -190,6 +190,14 @@ class TpuPlatform(Platform):
         # Engine workers must inherit the online-fp8 opt-in, or the flag set
         # on the pod is invisible where get_tpu_quantization_config runs.
         "VLLM_FP8_ONLINE_DENSE",
+        # ...and the DTYPE that opt-in emits. Only consumed by the Ray
+        # executor (ray_distributed_executor.py), so a single-host TP=1/TP=4
+        # pod inherits it regardless -- but on a multi-host Ray run the
+        # workers would fall back to the e4m3fn default while the lane label
+        # still said int8. Three arms would then serve identically under
+        # three different names, which is the false-PASS shape already in
+        # runs/ (see evals #29).
+        "TPU_ONLINE_QUANT_DTYPE",
         "PHASED_PROFILING_DIR",
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
