@@ -251,14 +251,36 @@ def quantize_tensor(
     dtype_max = float(dtype_info.max)
     dtype_min = float(dtype_info.min)
 
-    abs_max = jnp.max(jnp.abs(tensor), axis=axis, keepdims=True)
+    # The reduction and the scale are computed in FLOAT32, not in the tensor's
+    # own dtype. A bf16 checkpoint reduced in bf16 gives a bf16-rounded amax
+    # and a bf16-rounded quotient, and casting to f32 afterwards (below) cannot
+    # recover what those roundings already discarded.
+    #
+    # MEASURED on a [4096,1024] bf16 weight, against the sibling path that
+    # already casts first (online_fp8_requant_per_channel):
+    #
+    #   dtype     scale rel-diff   recon err bf16-reduce   f32-reduce
+    #   e4m3fn        0.22%              0.19484            0.18115
+    #   int8          0.28%              0.04591            0.02826
+    #
+    # The cost lands ~8x harder on int8: its finer resolution makes a fixed
+    # relative scale error a much larger share of the total error. So the
+    # bf16 reduction did not merely add noise, it SYSTEMATICALLY understated
+    # int8 relative to fp8 -- which is exactly the comparison the dtype matrix
+    # (evals #34) exists to make. Two quantization paths disagreeing by more
+    # than the effect under test is a broken instrument.
+    tensor_f32 = tensor.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(tensor_f32), axis=axis, keepdims=True)
     scale = abs_max / dtype_max
 
     # If scale=0, scale_inv=1/scale=1/0=NaN. Since NaN will cause numeric error
     # during inference, we convert them to inf.
     scale_inv = jnp.nan_to_num(1 / scale, jnp.inf)
 
-    tensor_q = jnp.clip(tensor * scale_inv, dtype_min, dtype_max)
+    tensor_q = jnp.clip(tensor_f32 * scale_inv, dtype_min, dtype_max)
+    if jnp.issubdtype(dtype, jnp.integer):
+        # Integers truncate on cast; round to nearest instead (~0.5 LSB).
+        tensor_q = jnp.round(tensor_q)
     tensor_q = tensor_q.reshape(orig_shape)
     tensor_q = tensor_q.astype(dtype)
 
