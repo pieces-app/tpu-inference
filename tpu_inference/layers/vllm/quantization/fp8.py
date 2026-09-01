@@ -119,7 +119,19 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
                         self.get_linear_config(layer))
                 if not self.is_checkpoint_fp8_serialized:
                     if (envs.VLLM_FP8_ONLINE_DENSE
-                            and _is_online_fp8_eligible(prefix)):
+                            and not _is_online_fp8_eligible(prefix)):
+                        # Excluded layer (mm/vision/audio projection, router)
+                        # under an ACTIVE online-fp8 run: serve it bf16.
+                        # It must NOT fall through to the fail-closed raise
+                        # below -- that refusal exists for "you asked for fp8
+                        # and we have no way to give it", not for "we
+                        # deliberately keep this layer in bf16". Measured
+                        # 2026-09-01: falling through turned an
+                        # inference-time crash into an ENGINE-INIT crash,
+                        # which is strictly worse.
+                        return VllmUnquantizedLinearMethod(
+                            self.get_linear_config(layer))
+                    if envs.VLLM_FP8_ONLINE_DENSE:
                         # OPT-IN, issue #158. Dense on-the-fly fp8 for a bf16
                         # checkpoint: create_weights registers a plain bf16
                         # weight (NO empty scale -- that was the garbage trap),
