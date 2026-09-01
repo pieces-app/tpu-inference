@@ -187,3 +187,50 @@ def test_env_var_is_inherited_by_engine_workers():
                 "enough (the dispatch runs in the worker)")
             return
     raise AssertionError("additional_env_vars not found")
+
+
+# ------------------------------------------------ import-time definition order
+def test_no_class_is_defined_before_its_base_in_the_same_module():
+    """Python evaluates base classes AT DEFINITION TIME.
+
+    This test exists because M1's first cut placed Fp8OnlineConfig(Fp8Config)
+    ABOVE class Fp8Config -> NameError at import. compressed_tensors.py
+    imports this module, so EVERY flax lane failed to boot (caught on real
+    hardware 2026-09-01, after a green CPU gate: the other tests read source
+    with AST and never import, so an import-time error is invisible to them).
+    A source-reading suite needs at least one order/importability guard.
+    """
+    tree = ast.parse(FP8.read_text())
+    order = {n.name: i for i, n in enumerate(tree.body)
+             if isinstance(n, ast.ClassDef)}
+    violations = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            name = base.id if isinstance(base, ast.Name) else None
+            if name in order and order[name] > order[node.name]:
+                violations.append(f"{node.name} defined before its base {name}")
+    assert not violations, (
+        "class(es) defined before their base -> NameError at import: "
+        + "; ".join(violations))
+
+
+def test_module_body_has_no_forward_references_to_later_definitions():
+    """Same failure family, wider net: any module-level `class X(Y)` whose Y
+    is defined later in the file, and any module-level call to a function
+    defined later, is an import-time bomb the AST tests would otherwise miss."""
+    tree = ast.parse(FP8.read_text())
+    defined_at = {}
+    for i, node in enumerate(tree.body):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
+            defined_at[node.name] = i
+    problems = []
+    for i, node in enumerate(tree.body):
+        if isinstance(node, ast.Assign):  # module-level constant built from a call
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                        and defined_at.get(sub.func.id, -1) > i):
+                    problems.append(f"module-level call to {sub.func.id} "
+                                    f"before its definition")
+    assert not problems, "; ".join(problems)
