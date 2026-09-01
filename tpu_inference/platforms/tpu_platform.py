@@ -187,6 +187,9 @@ class TpuPlatform(Platform):
         pass
 
     additional_env_vars: list[str] = [
+        # Engine workers must inherit the online-fp8 opt-in, or the flag set
+        # on the pod is invisible where get_tpu_quantization_config runs.
+        "VLLM_FP8_ONLINE_DENSE",
         "PHASED_PROFILING_DIR",
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
