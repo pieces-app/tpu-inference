@@ -46,6 +46,27 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
     quant_config = method_to_config[model_config.quantization]
     hg_quant_config = getattr(model_config.hf_config, "quantization_config",
                               {})
+
+    # Online dense fp8 for a checkpoint that carries NO quantization_config
+    # (issue #158 Option B). Without this branch Fp8Config(...) reaches
+    # get_from_keys(["quant_method"]) on an empty dict and dies with a
+    # KeyError -- an accidental fail-closed that made the flax fp8 arm
+    # unbootable. Engagement requires BOTH --quantization fp8 (which put us
+    # in this function) and the explicit opt-in env; otherwise refuse
+    # cleanly, mirroring the torchax lane's NotImplementedError.
+    if model_config.quantization == FP8 and not hg_quant_config:
+        from tpu_inference import envs
+        if envs.VLLM_FP8_ONLINE_DENSE:
+            from tpu_inference.layers.jax.quantization.fp8 import \
+                Fp8OnlineConfig
+            return Fp8OnlineConfig()
+        raise NotImplementedError(
+            "--quantization fp8 was requested for a checkpoint with no "
+            "quantization_config (a bf16 checkpoint). Serving it as fp8 "
+            "requires on-the-fly requantization: set "
+            "VLLM_FP8_ONLINE_DENSE=1 to opt in. Refusing by default -- an "
+            "unrequested silent requant is a quality change nobody asked "
+            "for.")
     # There are some cases to be supported in the future:
     # 1) Some vision model keep quantization config under text_config
     # 2) overriding through `--hf_overrides`
