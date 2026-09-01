@@ -184,7 +184,24 @@ def sharded_quantized_matmul(x: jax.Array,
     # NOTE (jacobplatin/kyuyeunk) there have been numeric issues (concerning) NaNs
     # with the kernel and thus we disable it for now.
     in_axis, out_axis = weight_spec
-    x_sharding = P(ShardingAxisName.ATTN_DATA, in_axis)
+    # x may carry extra LEADING batch dims (the vision projection arrives at
+    # rank 3). A length-2 PartitionSpec is padded by JAX with None on the
+    # TRAILING axes, so at rank 3 the TP axis would bind to axis 1 -- the TOKEN
+    # axis -- and the out-feature axis would be declared replicated. shard_map
+    # then assembles each shard's block along tokens and returns a
+    # REAL-LOOKING, FINITE, WRONG tensor: (1, T*tp, N/tp) instead of (1, T, N).
+    #
+    # No exception, correct magnitudes, and CORRECT at tp=1 -- so every
+    # single-chip arm and every CPU test passes. Found by adversarial review
+    # 2026-09-01, reproduced at tp=2 and tp=4 on CPU with 4 forced devices.
+    #
+    # sharded_matmul (just above) has always padded correctly; this function
+    # never did. It was UNREACHABLE before the rank-generic dimension_numbers
+    # change earlier today -- dot_general raised first -- so making the matmul
+    # rank-generic converted a loud crash into a silent wrong answer. That is
+    # strictly worse, and is why this padding ships with it.
+    batch_dims = (None, ) * (x.ndim - 2)
+    x_sharding = P(ShardingAxisName.ATTN_DATA, *batch_dims, in_axis)
     enable_quantized_matmul_kernel = w_s is not None and (len(
         w_s.shape) == 3 or len(w_s.shape) == 4)
     if enable_quantized_matmul_kernel:
@@ -203,7 +220,7 @@ def sharded_quantized_matmul(x: jax.Array,
         else:
             # 1D (channelwise) case
             scale_sharding = P(out_axis, )
-    out_sharding = P(ShardingAxisName.ATTN_DATA, out_axis)
+    out_sharding = P(ShardingAxisName.ATTN_DATA, *batch_dims, out_axis)
 
     x = jax.lax.with_sharding_constraint(
         x,

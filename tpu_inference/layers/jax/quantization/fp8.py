@@ -144,7 +144,16 @@ class Fp8TensorwiseLinearMethod(QuantizeMethodBase,
         # flatten `out` is already 2-D, so the restore returned
         # [N, out] regardless of the caller's rank. Live in the
         # 26B/31B flax lanes at B>1 and invisible to any B=1 test.
-        leading = x.shape[:-1]
+        # NOT x.shape[:-1]: the flatten below removes ONE axis per CONTRACTING
+        # axis, and a kernel can have several. Gemma-4's o_proj is
+        # JaxEinsum("TNH,NHD->TD") with in_features == (num_heads, head_dim),
+        # so x is [T, N, H] and TWO axes are consumed. Capturing only
+        # x.shape[:-1] there restores [T, N, D] from a [T, D] result and raises
+        # "cannot reshape array of shape (1024, 3840) into (1024, 16, 3840)" on
+        # the FIRST forward -- which the pre-change code did not do.
+        # Found by adversarial review 2026-09-01; affects every o_proj in the
+        # tree (gemma4, gemma4_mtp, qwen2, qwen3, qwen3_dflash, gemma4_mm).
+        leading = x.shape[:-len(self.linear_config.in_features)]
         if len(x.shape) > 2:
             x = x.reshape(-1, self.in_features)
         out = self._apply_fused(x,
@@ -402,7 +411,16 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
         # flatten `out` is already 2-D, so the restore returned
         # [N, out] regardless of the caller's rank. Live in the
         # 26B/31B flax lanes at B>1 and invisible to any B=1 test.
-        leading = x.shape[:-1]
+        # NOT x.shape[:-1]: the flatten below removes ONE axis per CONTRACTING
+        # axis, and a kernel can have several. Gemma-4's o_proj is
+        # JaxEinsum("TNH,NHD->TD") with in_features == (num_heads, head_dim),
+        # so x is [T, N, H] and TWO axes are consumed. Capturing only
+        # x.shape[:-1] there restores [T, N, D] from a [T, D] result and raises
+        # "cannot reshape array of shape (1024, 3840) into (1024, 16, 3840)" on
+        # the FIRST forward -- which the pre-change code did not do.
+        # Found by adversarial review 2026-09-01; affects every o_proj in the
+        # tree (gemma4, gemma4_mtp, qwen2, qwen3, qwen3_dflash, gemma4_mm).
+        leading = x.shape[:-len(self.linear_config.in_features)]
         if len(x.shape) > 2:
             x = x.reshape(-1, self.in_features)
         out = self._apply_fused(x, weight, scale, bias=bias)
