@@ -2,10 +2,11 @@
 
 Loads the leaf module `layers/common/quantization/online_fp8_requant.py` BY
 FILE PATH so it runs on a CPU-only jax install without importing the
-tpu_inference package (which pulls vllm/torchax). Asserts the per-output-
-channel scale is amax/448 within ~1 ULP and the dequant round-trip is within
-e4m3 tolerance. `pytest tests/layers/vllm/test_fp8_online_requant.py`
-(needs jax; skips without it).
+tpu_inference package (which pulls vllm/torchax). Asserts the post-transpose
+[in, out] per-output-channel scale is amax/448 within ~1 ULP and the dequant
+round-trip is within e4m3 tolerance.
+`pytest tests/layers/vllm/test_fp8_online_requant.py` (needs jax; skips
+without it).
 
 Negative control (watched via fork_gate / by perturbing E4M3_MAX): a wrong
 divisor makes the scale assertion fail.
@@ -33,9 +34,9 @@ def _load_leaf():
 def test_scale_is_amax_over_448_per_channel():
     m = _load_leaf()
     key = jax.random.PRNGKey(0)
-    w = (jax.random.normal(key, (64, 128)) * 3.0).astype(jnp.bfloat16)
+    w = (jax.random.normal(key, (128, 64)) * 3.0).astype(jnp.bfloat16)
     _, scale = m.online_fp8_requant_per_channel(w)
-    amax = jnp.max(jnp.abs(w.astype(jnp.float32)), axis=-1)
+    amax = jnp.max(jnp.abs(w.astype(jnp.float32)), axis=0)
     assert scale.shape == (64, )
     assert float(jnp.max(jnp.abs(scale - amax / 448.0))) < 1e-4
 
@@ -43,9 +44,9 @@ def test_scale_is_amax_over_448_per_channel():
 def test_round_trip_within_e4m3_tolerance():
     m = _load_leaf()
     key = jax.random.PRNGKey(1)
-    w = (jax.random.normal(key, (32, 256)) * 5.0).astype(jnp.bfloat16)
+    w = (jax.random.normal(key, (256, 32)) * 5.0).astype(jnp.bfloat16)
     w_fp8, scale = m.online_fp8_requant_per_channel(w)
-    rt = w_fp8.astype(jnp.float32) * scale[:, None]
+    rt = w_fp8.astype(jnp.float32) * scale[None, :]
     ref = w.astype(jnp.float32)
     rel = jnp.max(jnp.abs(rt - ref) / (jnp.abs(ref) + 1e-6))
     # e4m3 has ~3 mantissa bits; per-channel max-scaled round-trip stays well

@@ -61,6 +61,7 @@ def test_boolean_env_vars(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_XLA_CHECK_RECOMPILATION", "0")
     monkeypatch.setenv("NEW_MODEL_DESIGN", "0")
     monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "0")
+    monkeypatch.setenv("VLLM_FP8_ONLINE_DENSE", "0")
     monkeypatch.setenv("USE_MOE_EP_KERNEL", "0")
     monkeypatch.setenv("LAYOUT_Q_PROJ_AS_NDH", "0")
     monkeypatch.setenv("USE_BATCHED_RPA_KERNEL", "0")
@@ -101,6 +102,11 @@ def test_boolean_env_vars(monkeypatch: pytest.MonkeyPatch):
     assert envs.ENABLE_QUANTIZED_MATMUL_KERNEL is False
     monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")
     assert envs.ENABLE_QUANTIZED_MATMUL_KERNEL is True
+
+    # Test VLLM_FP8_ONLINE_DENSE (default False)
+    assert envs.VLLM_FP8_ONLINE_DENSE is False
+    monkeypatch.setenv("VLLM_FP8_ONLINE_DENSE", "1")
+    assert envs.VLLM_FP8_ONLINE_DENSE is True
 
     # Test LAYOUT_Q_PROJ_AS_NDH (default False)
     assert envs.LAYOUT_Q_PROJ_AS_NDH is False
