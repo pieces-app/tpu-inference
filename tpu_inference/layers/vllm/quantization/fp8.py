@@ -118,8 +118,10 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
                     return VllmUnquantizedLinearMethod(
                         self.get_linear_config(layer))
                 if not self.is_checkpoint_fp8_serialized:
-                    if (envs.VLLM_FP8_ONLINE_DENSE
-                            and _is_online_fp8_eligible(prefix)):
+                    if envs.VLLM_FP8_ONLINE_DENSE:
+                        if not _is_online_fp8_eligible(prefix):
+                            return VllmUnquantizedLinearMethod(
+                                self.get_linear_config(layer))
                         # OPT-IN, issue #158. Dense on-the-fly fp8 for a bf16
                         # checkpoint: create_weights registers a plain bf16
                         # weight (NO empty scale -- that was the garbage trap),

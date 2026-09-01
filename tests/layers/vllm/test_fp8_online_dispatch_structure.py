@@ -55,6 +55,12 @@ def _online_return_in(stmt):
                for n in ast.walk(stmt))
 
 
+def _unquantized_return_in(stmt):
+    return any(isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
+               and getattr(n.value.func, "id", None)
+               == "VllmUnquantizedLinearMethod" for n in ast.walk(stmt))
+
+
 def _fail_closed_raise(fn):
     for node in ast.walk(fn):
         if (isinstance(node, ast.If) and isinstance(node.test, ast.UnaryOp)
@@ -89,3 +95,17 @@ def test_fail_closed_default_preserved_and_after_optin():
                for b in cls.bases), "must inherit VllmFp8LinearMethod (apply)"
     assert not any(isinstance(n, ast.FunctionDef) and n.name == "apply"
                    for n in cls.body), "must inherit apply, not override it"
+
+
+def test_online_dispatch_skips_ineligible_layers_unquantized():
+    fn = _get_quant_method_fn()
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.If) and isinstance(node.test, ast.UnaryOp)
+                and isinstance(node.test.op, ast.Not)
+                and isinstance(node.test.operand, ast.Call)
+                and getattr(node.test.operand.func, "id", None)
+                == "_is_online_fp8_eligible"):
+            assert _unquantized_return_in(node), (
+                "ineligible online-fp8 layers must return unquantized")
+            return
+    raise AssertionError("online dispatch does not check layer eligibility")
