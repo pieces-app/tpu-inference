@@ -14,8 +14,6 @@
 
 import functools
 import math
-import os
-import re
 from functools import partial
 from typing import Iterable, Optional, Sequence
 
@@ -33,6 +31,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_quantized_moe_weights)
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.quantization import quantize_tensor
+from tpu_inference.layers.common.quantization.online_fp8_requant import (
+    ONLINE_QUANT_DTYPE_ENV, online_quant_dtype)
 from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
@@ -845,69 +845,11 @@ class Fp8Config(QuantizationConfig):
         return None
 
 
-# The dtypes the online (bf16-checkpoint) requant path can target. All of
-# them flow through the SAME `quantize_tensor`, which derives its scale as
-# `amax / jnp.finfo(dtype).max` (or iinfo for integers) -- so adding a dtype
-# here is numerically complete, not a partial wiring.
-_ONLINE_QUANT_DTYPES = {
-    "float8_e4m3fn": jnp.float8_e4m3fn,
-    "float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
-    "float8_e5m2": jnp.float8_e5m2,
-    "int8": jnp.int8,
-}
-
-ONLINE_QUANT_DTYPE_ENV = "TPU_ONLINE_QUANT_DTYPE"
-
-
-def _online_fp8_dtype():
-    """Which quantized dtype the online requant path emits.
-
-    Defaults to `float8_e4m3fn` -- the historical behaviour -- so this is a
-    benchmark LEVER, not a silent change to a path that has never served a
-    token. Set TPU_ONLINE_QUANT_DTYPE to one of _ONLINE_QUANT_DTYPES to pick
-    another, or to "auto" to follow what this TPU generation ingests
-    natively.
-
-    "auto" exists because jax/_src/tpu_info.py gates its native-matmul dtype
-    table on `generation < 7`: pre-gen-7 lists (F8E5M2, F8E4M3B11FNUZ),
-    gen-7+ lists (F8E5M2, F8E4M3FN). So on a v6e the DEFAULT e4m3fn is the
-    one fp8 type the hardware must cast. Whether that cast costs anything
-    measurable is exactly what the A/B is for -- on v6e fp8 is a bandwidth
-    play regardless, since Google's own table gives v6e fp8 918 TFLOPs =
-    its bf16 918, while int8 is ~2x. See
-    docs/fp8-all-modalities-design-2026-09-01.md.
-    """
-    want = os.environ.get(ONLINE_QUANT_DTYPE_ENV, "").strip()
-    if want and want != "auto":
-        if want not in _ONLINE_QUANT_DTYPES:
-            raise ValueError(
-                f"{ONLINE_QUANT_DTYPE_ENV}={want!r} is not a supported online "
-                f"quantization dtype. Choose one of "
-                f"{sorted(_ONLINE_QUANT_DTYPES)} or 'auto'.")
-        return _ONLINE_QUANT_DTYPES[want]
-    if want == "auto":
-        gen = _tpu_generation()
-        if gen is not None and gen < 7:
-            return jnp.float8_e4m3b11fnuz
-    return jnp.float8_e4m3fn
-
-
-def _tpu_generation():
-    """Best-effort TPU generation, or None when it cannot be determined."""
-    try:
-        from jax._src import tpu_info as _ti
-        for attr in ("generation", "tpu_generation"):
-            g = getattr(_ti, attr, None)
-            if callable(g):
-                return g()
-    except Exception:  # noqa: BLE001 -- never fail a load over a probe
-        pass
-    try:
-        kind = getattr(jax.devices()[0], "device_kind", "") or ""
-        m = re.search(r"v(\d+)", kind)
-        return int(m.group(1)) if m else None
-    except Exception:  # noqa: BLE001
-        return None
+# The dtype selection lives in the COMMON leaf so that BOTH online requant
+# paths -- this flax/nnx one (26B-A4B MoE) and the vllm/torchax one (12B
+# dense) -- answer it identically. A lever that moved only one of them would
+# make the two arms incomparable rather than configurable.
+_online_fp8_dtype = online_quant_dtype
 
 
 class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
