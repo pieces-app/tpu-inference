@@ -139,18 +139,59 @@ def test_create_weights_is_a_noop_that_never_makes_an_empty_scale():
         "merged (gate_up/qkv) layers must still merge+interleave at load")
 
 
-def test_requant_uses_axis_0_and_shards_scale_on_the_out_axis():
+def test_requant_uses_axis_0_and_never_shards_the_scale_on_the_input_axis():
     src = FP8.read_text()
     cls = _cls(ast.parse(src), "Fp8OnlineLinearMethod")
     pw = _meth(cls, "process_weights_after_loading")
     body = _code_only(ast.get_source_segment(src, pw) or "")
     assert "axis=0" in body, "per-OUTPUT-channel reduction is axis=0 for [in,out]"
-    assert "weight_sharding[1]" in body, (
-        "the per-OUT scale shards on the OUT axis; weight_sharding[0] would "
-        "repeat the Fp8Tensorwise wart of sharding it on the INPUT axis")
-    assert "weight_sharding[0]" not in body
+    # The INVARIANT, not a mechanism: a per-OUTPUT scale must never be
+    # sharded along the INPUT axis (the Fp8Tensorwise wart). This used to be
+    # spelled `weight_sharding[1]`; that whole branch was unreachable (see
+    # the two guards below) and the scale is now left replicated, which
+    # satisfies the invariant trivially -- it is 1-D and tiny.
+    assert "weight_sharding[0]" not in body, (
+        "sharding a per-OUTPUT scale along the INPUT axis repeats the "
+        "Fp8Tensorwise wart")
     assert "batch_features" in body and "NotImplementedError" in body, (
         "batched 3D weights must fail closed, not guess a scale layout")
+
+
+def test_requant_does_not_move_a_tpu_resident_param_to_a_cpu_mesh():
+    """MEASURED: this method could never complete a weight load.
+
+    It opened `with cpu_mesh_context():` around a param that
+    `assign_and_shard_param` has already committed to the TPU model mesh, so
+    the first op (jnp.max inside quantize_tensor) raised "Received
+    incompatible devices for jitted computation". The blockwise sibling is
+    allowed to do this because IT pins its params to cpu_mesh in
+    create_weights_jax; this method creates no params (see the test above),
+    so it must not borrow that discipline.
+    """
+    src = FP8.read_text()
+    cls = _cls(ast.parse(src), "Fp8OnlineLinearMethod")
+    pw = _meth(cls, "process_weights_after_loading")
+    body = _code_only(ast.get_source_segment(src, pw) or "")
+    assert "cpu_mesh_context" not in body, (
+        "requant must happen WHERE THE PARAM LIVES -- this is one of the two "
+        "defects that kept the flax fp8 lane from ever serving a token")
+
+
+def test_requant_does_not_build_a_sharding_from_the_always_none_mesh():
+    """The other half of the same story: `self.linear_config.mesh` is None on
+    the JAX lane, so `NamedSharding(self.linear_config.mesh, ...)` raises
+    TypeError before a token is served. Sharding is derived from the SOURCE
+    ARRAY instead -- the quantized weight keeps the source's shape, so the
+    source's sharding applies unchanged."""
+    src = FP8.read_text()
+    cls = _cls(ast.parse(src), "Fp8OnlineLinearMethod")
+    pw = _meth(cls, "process_weights_after_loading")
+    body = _code_only(ast.get_source_segment(src, pw) or "")
+    assert "NamedSharding(self.linear_config.mesh" not in body, (
+        "linear_config.mesh is None on this lane; building a NamedSharding "
+        "from it is a TypeError at load time")
+    assert "sharding" in body, (
+        "the source array's sharding must still be consulted")
 
 
 def test_experts_and_router_are_not_online_quantized():
