@@ -80,14 +80,30 @@ def test_the_recompute_happens_AFTER_weight_sharding_is_assigned():
         f"is known just reproduces the placeholder's n_shards=1")
 
 
-def test_the_recompute_reads_weight_sharding_and_not_a_literal():
-    """Guard against a 'fix' that hardcodes a TP degree."""
+def test_the_recompute_is_derived_from_sharding_not_a_literal():
+    """Guard against a 'fix' that hardcodes a TP degree.
+
+    AST-based rather than a line window: the recompute was later restructured
+    to route through a safe `_out_axis` local (weight_sharding can be an EMPTY
+    PartitionSpec for batched einsums, so indexing [1] blindly raises), and a
+    proximity check would have failed on a correct change.
+    """
+    import ast
     fn = _init_body()
-    src = CFG.read_text().splitlines()
-    ns_line = max(_assign_lines(fn, "n_shards"))
-    window = "\n".join(src[ns_line - 1:ns_line + 3])
-    assert "weight_sharding" in window, (
-        f"the n_shards recompute does not read self.weight_sharding:\n{window}")
-    assert "get_mesh_shape_product" in window, (
-        "n_shards must come from the active mesh via get_mesh_shape_product, "
-        "the same way the common base computes it")
+    src = CFG.read_text()
+    body = ast.get_source_segment(src, fn) or ""
+
+    # the assigned value must come from the mesh helper, not a constant
+    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Attribute) and t.attr == "n_shards"
+                       for t in n.targets)]
+    assert assigns, "n_shards is never assigned"
+    call_src = ast.get_source_segment(src, assigns[-1]) or ""
+    assert "get_mesh_shape_product" in call_src, (
+        f"n_shards must come from the active mesh, got: {call_src.strip()!r}")
+    assert not any(isinstance(assigns[-1].value, c)
+                   for c in (ast.Constant, )), (
+        "n_shards must not be a hardcoded constant")
+    # and the axis it asks about must trace to a sharding, somewhere in __init__
+    assert ("weight_sharding" in body or "out_features_sharding" in body), (
+        "the recompute must derive its axis from the layer's sharding")

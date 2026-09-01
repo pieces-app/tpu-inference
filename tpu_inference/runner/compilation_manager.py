@@ -62,35 +62,6 @@ class CompilationManager:
         self._sampling_precompiled = False
         self._gather_logprobs_precompiled = False
 
-    def _dummy_mm_bidi_ranges(self, sharding):
-        """The dummy `mm_bidi_ranges` every primer's metadata must carry.
-
-        `mm_bidi_ranges` is a DATA field of the registered AttentionMetadata
-        dataclass, so `None` vs an array is a different pytree treedef -- a
-        hard jit cache miss, not a value difference. `_prepare_inputs`
-        allocates it on EVERY step once `mm_bidi_enabled`, images or not, so a
-        primer that leaves it None primes a graph the runtime can never hit.
-
-        The symptom is nasty precisely because precompilation REPORTS SUCCESS:
-        request #1 then traces and XLA-compiles a 12B/26B model inside the
-        serving loop (minutes of TTFT, and a persistent-cache miss the warm
-        bank cannot cover), or with VLLM_XLA_CHECK_RECOMPILATION=1 the engine
-        dies on the first request with ForbidCompile.
-
-        Sharding differs per primer -- the target uses its
-        metadata_attn_sharding, the drafters their dp_sharding -- so it is a
-        parameter rather than derived here. `(0, 0)` means causal.
-
-        One definition on purpose: this existed inline in the target primer
-        only, and all six other construction sites were missed.
-        """
-        if not getattr(self.runner, "mm_bidi_enabled", False):
-            return None
-        return device_array(self.runner.mesh,
-                            np.zeros((self.runner.max_num_reqs, 2),
-                                     dtype=np.int32),
-                            sharding=sharding)
-
         if not vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info("Enabling JAX compile cache.")
             jax.config.update("jax_compilation_cache_dir",
@@ -124,6 +95,35 @@ class CompilationManager:
                 max_workers=num_workers, thread_name_prefix="aot_compilation")
         self._compile_futures: list[Future] = []
         self._warmup_tasks: list = []
+
+    def _dummy_mm_bidi_ranges(self, sharding):
+        """The dummy `mm_bidi_ranges` every primer's metadata must carry.
+
+        `mm_bidi_ranges` is a DATA field of the registered AttentionMetadata
+        dataclass, so `None` vs an array is a different pytree treedef -- a
+        hard jit cache miss, not a value difference. `_prepare_inputs`
+        allocates it on EVERY step once `mm_bidi_enabled`, images or not, so a
+        primer that leaves it None primes a graph the runtime can never hit.
+
+        The symptom is nasty precisely because precompilation REPORTS SUCCESS:
+        request #1 then traces and XLA-compiles a 12B/26B model inside the
+        serving loop (minutes of TTFT, and a persistent-cache miss the warm
+        bank cannot cover), or with VLLM_XLA_CHECK_RECOMPILATION=1 the engine
+        dies on the first request with ForbidCompile.
+
+        Sharding differs per primer -- the target uses its
+        metadata_attn_sharding, the drafters their dp_sharding -- so it is a
+        parameter rather than derived here. `(0, 0)` means causal.
+
+        One definition on purpose: this existed inline in the target primer
+        only, and all six other construction sites were missed.
+        """
+        if not getattr(self.runner, "mm_bidi_enabled", False):
+            return None
+        return device_array(self.runner.mesh,
+                            np.zeros((self.runner.max_num_reqs, 2),
+                                     dtype=np.int32),
+                            sharding=sharding)
 
     def _create_dummy_tensor(self,
                              shape: Tuple[int, ...],
