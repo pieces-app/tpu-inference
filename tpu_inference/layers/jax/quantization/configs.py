@@ -22,6 +22,7 @@ from tpu_inference.layers.common.quantization.configs import \
     QuantLinearConfig as CommonQuantLinearConfig
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.quantization import QuantizeMethodBase
+from tpu_inference.utils import get_mesh_shape_product
 
 
 class QuantizationConfig(ABC):
@@ -197,3 +198,25 @@ class QuantLinearConfig(CommonQuantLinearConfig):
 
         self.bias_sharding = jax.sharding.PartitionSpec(
             *self.out_features_sharding)
+
+        # n_shards MUST be recomputed here. `super().__init__()` above is called
+        # without weight_sharding, so the base computed it from the placeholder
+        # P(None, None) and got 1 -- and the real spec is only assigned in the
+        # lines just above. Leaving the stale 1 makes
+        # `reorder_concatenated_tensor_for_sharding` the IDENTITY for every
+        # config built this way, which includes Fp8OnlineConfig.
+        #
+        # The bf16 control does not come through here (unquantized.py reads the
+        # param's out_sharding and passes weight_sharding= into the common
+        # config), so it gets the true TP degree. The arithmetic stays correct
+        # either way -- load and apply share the same stale value, so nothing
+        # trips -- but at TP>1 the quantized arm ends up with a DIFFERENT
+        # gate_up column layout than the control, and every throughput and
+        # latency delta between them is then confounded by a layout change
+        # nobody asked for.
+        #
+        # At TP=1 the stale value is accidentally correct, which is why the
+        # single-chip arms never surfaced this. The 4- and 8-chip fp8
+        # comparisons are exactly where it would have.
+        self.n_shards = get_mesh_shape_product(
+            jax.sharding.get_abstract_mesh(), self.weight_sharding[1])
