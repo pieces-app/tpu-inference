@@ -138,9 +138,20 @@ class Gemma4MTPMaskedEmbedder(JaxModule):
         self,
         hidden_states: jax.Array,
         lm_head_weight: jax.Array,
+        suppress_token_ids: tuple = (),
     ) -> jax.Array:
-        """Sparse argmax — returns vocab token IDs directly."""
+        """Sparse argmax — returns vocab token IDs directly.
+
+        The sparse path bypasses the full-vocab scatter, so suppression must
+        mask the SELECTED logits here (the pinned torch model's centroid
+        fast path skips this -- an upstream residual hole; hardened here).
+        Currently dormant on TPU (no caller); (b) is the load-bearing fix.
+        """
         logits, indices = self._select_and_score(hidden_states, lm_head_weight)
+        if suppress_token_ids:
+            sup = jnp.asarray(suppress_token_ids, dtype=jnp.int32)
+            hit = (indices[..., None] == sup[None, None, :]).any(axis=-1)
+            logits = jnp.where(hit, jnp.finfo(logits.dtype).min, logits)
         best_idx = jnp.argmax(logits, axis=-1, keepdims=True)
         return jnp.take_along_axis(indices, best_idx, axis=-1).squeeze(-1)
 
@@ -565,6 +576,39 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
         else:
             self.masked_embedding = None
 
+        # Drafter-side suppress_tokens from the DRAFT checkpoint's
+        # generation_config (the 12B Unified assistant ships
+        # [258883, 258882] -- eoa/eoi placeholder ids; the 26B assistant
+        # ships none, and absence is legitimate). Fail-closed on malformed
+        # presence: a drafted placeholder id corrupts subsequent draft steps
+        # and enters target verification with no embedding behind it
+        # (upstream vllm #53884; the torch drafter suppresses, this one did
+        # not). Mechanism is generic -- ids live ONLY in checkpoint configs,
+        # never in code. Verified against the actual assistant artifacts
+        # 2026-09-01: generation_config carries exactly [258883, 258882] and
+        # the checkpoint has NO mm tensor prefixes (no loader change needed).
+        gen_cfg = (vllm_config.speculative_config.draft_model_config
+                   .try_get_generation_config())
+        raw = (gen_cfg.get("suppress_tokens") or ()) if gen_cfg else ()
+        try:
+            ids = tuple(sorted({int(t) for t in raw}))
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"draft generation_config.suppress_tokens is malformed: "
+                f"{raw!r} ({e}). Refusing to build a drafter whose "
+                f"suppression set cannot be trusted.") from None
+        for t in ids:
+            if t < 0 or t >= text_config.vocab_size:
+                raise ValueError(
+                    f"suppress_tokens id {t} is outside the draft vocab "
+                    f"[0, {text_config.vocab_size}) -- refusing (a wrong id "
+                    f"here silently suppresses the wrong token forever).")
+        self._suppress_token_ids = ids
+        if ids:
+            logger.info(
+                "Gemma4-MTP drafter: suppressing %d token id(s) from the "
+                "draft checkpoint's generation_config: %s", len(ids), ids)
+
     def load_weights(self, weights: Iterable[Tuple[str, Any]]):
         allowed_layers = set(f"layers.{i}."
                              for i in range(len(self.model.layers)))
@@ -657,12 +701,27 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
         else:
             return self.model.embed_tokens.embedding.get_value()
 
+    def _apply_suppress(self, logits: jax.Array) -> jax.Array:
+        # Static Python `if`: an empty set keeps the no-suppress graph
+        # byte-identical (existing 26B/31B warm banks and hashes untouched);
+        # a non-empty set bakes the ids in as compile-time constants.
+        # dtype-min matches the Gemma4MTPMaskedEmbedder fill and is
+        # argmax-equivalent to torch's -inf (torch applies suppression AFTER
+        # softcapping, so -inf never routes through tanh -- same here).
+        if self._suppress_token_ids:
+            sup = jnp.asarray(self._suppress_token_ids, dtype=jnp.int32)
+            logits = logits.at[:, sup].set(jnp.finfo(logits.dtype).min)
+        return logits
+
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if self.masked_embedding is not None:
-            return self.masked_embedding(
-                hidden_states,
-                self._get_full_lm_head_weight(),
-            )
+            # Suppress AFTER the full-vocab scatter: a suppressed id can be
+            # centroid-selected and would otherwise carry a live score.
+            return self._apply_suppress(
+                self.masked_embedding(
+                    hidden_states,
+                    self._get_full_lm_head_weight(),
+                ))
 
         if hasattr(self, "lm_head"):
             logits = self.lm_head(hidden_states)
@@ -672,12 +731,13 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
         if self.final_logit_softcapping is not None:
             logits = (jnp.tanh(logits / self.final_logit_softcapping) *
                       self.final_logit_softcapping)
-        return logits
+        return self._apply_suppress(logits)
 
     def get_top_tokens(self, hidden_states: jax.Array) -> jax.Array:
         if self.masked_embedding is not None:
             return self.masked_embedding.get_top_tokens(
                 hidden_states,
                 self._get_full_lm_head_weight(),
+                suppress_token_ids=self._suppress_token_ids,
             )
         return jnp.argmax(self.compute_logits(hidden_states), axis=-1)
