@@ -507,6 +507,16 @@ class Gemma4Attention(JaxModule):
             v_scale = self._v_scale
             k, v = quantize_kv(self.kv_cache_quantized_dtype, k, v, k_scale,
                                v_scale)
+        # Gemma-4 PrefixLM: image-block bidirectional attention applies to
+        # sliding-window layers only (HF composition:
+        # AND(sliding_window, OR(causal, blockwise))); full-attention layers
+        # stay purely causal. Mirrors the torchax reference
+        # (layers/vllm/backends/flash_attn.py). Without this kwarg the runner
+        # builds md.mm_bidi_ranges and this call site silently drops them --
+        # the flax_nnx tower models (31B / 26B-A4B) served causal-only image
+        # attention while the policy log said ENABLED (issue #156).
+        mm_bidi_ranges = (getattr(attention_metadata, "mm_bidi_ranges", None)
+                          if self.sliding_window is not None else None)
         new_kv_cache, outputs = attention(
             kv_cache,
             q,
@@ -521,6 +531,7 @@ class Gemma4Attention(JaxModule):
             k_scale=k_scale,
             v_scale=v_scale,
             update_kv_cache=not self.is_kv_shared_layer,
+            mm_bidi_ranges=mm_bidi_ranges,
         )
         # (T, D)
         o = self.o_proj(outputs)
