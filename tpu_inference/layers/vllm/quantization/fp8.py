@@ -47,6 +47,7 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
 from tpu_inference.layers.common.quant_methods import FP8
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.quantization.online_fp8_requant import (
+    assert_torchax_representable, online_quant_dtype,
     online_fp8_requant_per_channel)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm.interface.moe import (
@@ -146,6 +147,12 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
                             "non-serialized checkpoint. Opt-in and not yet "
                             "hardware-qualified (issue #158); quality is gated "
                             "on the OD-TPU panel, not on a healthy /health.")
+                        # Refuse a JAX-only dtype HERE, at method selection,
+                        # not 110s later inside torchax's j2t_dtype. Measured
+                        # 2026-09-01: e4m3b11fnuz crashlooped the arm with a
+                        # traceback naming j2t_dtype and never mentioning the
+                        # env var the operator actually set.
+                        assert_torchax_representable(online_quant_dtype())
                         return VllmFp8OnlineLinearMethod(
                             self, self.get_linear_config(layer))
                     # Fail closed. Upstream vLLM routes non-fp8-serialized

@@ -147,3 +147,37 @@ def online_fp8_requant_per_channel(weight_in_out, dtype=None):
         scaled = jnp.clip(jnp.round(scaled), info.min, info.max)
     w_q = scaled.astype(dtype)
     return w_q, jnp.squeeze(scale, axis=0)
+
+# Dtypes the TORCHAX path can carry. That path round-trips the quantized array
+# back through `torch_view()` -> `torchax.ops.mappings.j2t_dtype`, which needs a
+# real torch dtype. `float8_e4m3b11fnuz` is a JAX/ml_dtypes type with NO torch
+# equivalent (torch has e4m3fn / e4m3fnuz / e5m2 / e5m2fnuz, not e4m3b11fnuz),
+# so selecting it on that path dies at WEIGHT LOAD with
+#   RuntimeError: Attempting to convert unknown type: float8_e4m3b11fnuz to torch type
+# MEASURED on v6e 2026-09-01: the eval-12b-q-e4m3b11 arm crashlooped ~110s in,
+# inside vllm/quantization/fp8.py process_weights_after_loading.
+#
+# The flax/nnx path never converts to torch, so it is NOT restricted by this.
+# Hence a per-path check rather than removing the dtype outright: it stays a
+# legitimate option for the 26B, where v6e ingests it natively.
+TORCHAX_REPRESENTABLE = frozenset(
+    {"float8_e4m3fn", "float8_e5m2", "int8"})
+
+
+def assert_torchax_representable(dtype):
+    """Refuse a JAX-only dtype on the torchax path, EARLY and legibly.
+
+    Called at quant-method selection so the failure lands at engine init with
+    an actionable message, instead of ~110s later as a torchax internal error
+    whose traceback names j2t_dtype and not the env var the operator set.
+    """
+    name = getattr(dtype, "__name__", str(dtype))
+    if name not in TORCHAX_REPRESENTABLE:
+        raise ValueError(
+            f"{ONLINE_QUANT_DTYPE_ENV}={name!r} cannot be used on the "
+            f"vLLM/torchax path: torch has no {name} dtype, so converting the "
+            f"quantized weight back to a torch view fails at weight load. "
+            f"Supported here: {sorted(TORCHAX_REPRESENTABLE)}. "
+            f"({name} IS valid on the flax_nnx path, which never converts to "
+            f"torch.)")
+    return dtype
