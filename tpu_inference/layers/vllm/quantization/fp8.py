@@ -118,7 +118,8 @@ class VllmFp8Config(vllm_fp8.Fp8Config, VllmQuantConfig):
                     return VllmUnquantizedLinearMethod(
                         self.get_linear_config(layer))
                 if not self.is_checkpoint_fp8_serialized:
-                    if envs.VLLM_FP8_ONLINE_DENSE:
+                    if (envs.VLLM_FP8_ONLINE_DENSE
+                            and _is_online_fp8_eligible(prefix)):
                         # OPT-IN, issue #158. Dense on-the-fly fp8 for a bf16
                         # checkpoint: create_weights registers a plain bf16
                         # weight (NO empty scale -- that was the garbage trap),
@@ -393,6 +394,40 @@ class VllmFp8LinearMethod(
                                         bias_jax,
                                         mesh=self.linear_config.mesh)
             return torch_view(out)
+
+
+# Layers the on-the-fly dense path must NOT touch (issue #158).
+#
+# MEASURED ON HARDWARE 2026-09-01: with the flag on, the 12B booted, gated,
+# and then died on the FIRST request with
+#     dot_general requires contracting dimensions to have the same shape,
+#     got (1120,) and (6912,)
+# 1120 is max_soft_tokens and 6912 is the Gemma-4 vision patch dim -- the
+# requant had been applied to a multimodal projection whose kernel is not
+# the [in, out] 2-D text-stack layout the per-output-channel scale assumes.
+# Nothing in the load path complains; the shape only meets an activation at
+# inference, which is why a green boot and a passed gate proved nothing.
+#
+# These layers are also worthless to quantize: on the 26B the whole vision
+# tower is 1.15 GB of a 51.6 GB checkpoint (~2%), and on the 12B the mm
+# projections are smaller still. The HBM case for fp8 is the text stack.
+_ONLINE_FP8_SKIP_SUBSTRINGS = (
+    "vision",
+    "embed_vision",
+    "embed_audio",
+    "multi_modal",
+    "multimodal",
+    "mm_",
+    "audio_tower",
+    "vision_tower",
+    "router",  # routing quality is disproportionately sensitive; no HBM win
+)
+
+
+def _is_online_fp8_eligible(prefix: str) -> bool:
+    """True when the on-the-fly dense method may take this layer."""
+    low = prefix.lower()
+    return not any(s in low for s in _ONLINE_FP8_SKIP_SUBSTRINGS)
 
 
 class VllmFp8OnlineLinearMethod(VllmFp8LinearMethod):

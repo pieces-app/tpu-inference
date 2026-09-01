@@ -234,3 +234,54 @@ def test_module_body_has_no_forward_references_to_later_definitions():
                     problems.append(f"module-level call to {sub.func.id} "
                                     f"before its definition")
     assert not problems, "; ".join(problems)
+
+
+# --------------------------------------------- mm/vision exclusion (hardware)
+def test_multimodal_projections_are_excluded_from_online_fp8():
+    """Both lanes must refuse to online-quantize multimodal projections.
+
+    MEASURED 2026-09-01: with the flag on, the 12B booted, PASSED ITS GATE,
+    and then died on the first request:
+        dot_general requires contracting dimensions to have the same shape,
+        got (1120,) and (6912,)
+    1120 = max_soft_tokens, 6912 = the Gemma-4 vision patch dim. A per-
+    output-channel scale assumes the 2-D [in, out] text-stack layout; the mm
+    projections are not that shape, and nothing on the LOAD path notices --
+    the mismatch only meets an activation at inference. A green boot and a
+    passed gate proved nothing, which is why this guard is structural.
+    """
+    src = FP8.read_text()
+    cls = _cls(ast.parse(src), "Fp8OnlineConfig")
+    body = _code_only(ast.get_source_segment(src, _meth(cls, "get_quant_method")) or "")
+    for token in ("vision", "audio", "multi_modal", "router"):
+        assert token in body, (
+            f"the flax online config does not skip {token!r} layers -- "
+            "quantizing a multimodal projection dies at first inference")
+    assert "UnquantizedLinearMethod" in body
+
+
+def test_torchax_lane_has_the_same_exclusion():
+    """The torchax method is what 12B/Unified actually reaches today, so the
+    exclusion must exist on BOTH lanes or the panel dies again."""
+    p = (ROOT / "tpu_inference" / "layers" / "vllm" / "quantization" / "fp8.py")
+    src = p.read_text()
+    assert "_ONLINE_FP8_SKIP_SUBSTRINGS" in src, (
+        "torchax lane has no skip list; it dispatched the online method to a "
+        "vision projection on hardware")
+    tree = ast.parse(src)
+    assigns = [n for n in tree.body if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", "") == "_ONLINE_FP8_SKIP_SUBSTRINGS"
+                       for t in n.targets)]
+    assert assigns, "skip list is not a module-level constant"
+    tokens = [e.value for e in assigns[0].value.elts if isinstance(e, ast.Constant)]
+    for token in ("vision", "audio_tower", "multi_modal", "router"):
+        assert any(token in t for t in tokens), f"skip list misses {token!r}"
+    # and the dispatch must consult it
+    gq = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == "get_quant_method":
+            gq = n
+    assert gq is not None
+    body = _code_only(ast.get_source_segment(src, gq) or "")
+    assert "_is_online_fp8_eligible" in body, (
+        "the skip list exists but the dispatch never consults it")

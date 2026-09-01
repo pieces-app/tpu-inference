@@ -944,9 +944,20 @@ class Fp8OnlineConfig(Fp8Config):
             return UnquantizedFusedMoEMethod(layer)
         if isinstance(layer, JaxEinsum):
             linear_config = QuantLinearConfig(layer, enable_sp=False)
-            if prefix.endswith("router.proj") or ".router." in prefix:
-                # Routing quality is disproportionately sensitive; the
-                # router is a single small matmul with no HBM payoff.
+            # Skip the router (routing quality is disproportionately
+            # sensitive, no HBM payoff) AND every multimodal projection.
+            # MEASURED 2026-09-01 on the torchax twin of this method: a
+            # quantized mm projection booted and gated fine, then died on
+            # the first request with `dot_general ... got (1120,) and
+            # (6912,)` -- max_soft_tokens against the vision patch dim,
+            # because those kernels are not the [in, out] 2-D text-stack
+            # layout a per-output-channel scale assumes. The vision tower is
+            # ~2% of a 26B checkpoint; the HBM case for fp8 is the text
+            # stack.
+            low = prefix.lower()
+            if any(s in low for s in ("router", "vision", "audio", "mm_",
+                                      "multi_modal", "multimodal",
+                                      "embed_vision", "embed_audio")):
                 return UnquantizedLinearMethod(linear_config)
             return Fp8OnlineLinearMethod(layer, linear_config)
         return None
