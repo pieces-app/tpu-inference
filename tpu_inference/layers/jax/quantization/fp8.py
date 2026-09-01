@@ -761,6 +761,76 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                          self.extra_backend_kwargs)
 
 
+class Fp8Config(QuantizationConfig):
+
+    ACTIVATION_SCHEMES = ["dynamic", "static"]
+
+    def __init__(self, hf_quant_config: dict):
+        # Replicating upstream https://github.com/vllm-project/vllm/blob/77c09e1130661197ccac2d968a28cd4a557922d5/vllm/model_executor/layers/quantization/fp8.py#L167-L175
+
+        quant_method = self.get_from_keys(hf_quant_config, ["quant_method"])
+        self.is_checkpoint_fp8_serialized = "fp8" in quant_method
+        activation_scheme = self.get_from_keys(hf_quant_config,
+                                               ["activation_scheme"])
+        ignored_layers = self.get_from_keys(hf_quant_config,
+                                            ["ignored_layers"], None)
+        weight_block_size = self.get_from_keys(hf_quant_config,
+                                               ["weight_block_size"], None)
+        # `ignored_layers` lists exact leaf module names (exact match);
+        # `modules_to_not_convert` lists container/module names meant to
+        # skip everything nested under them (needs substring match) — see
+        # `QuantizationConfig.is_layer_skipped`.
+        self.skip_with_substr = False
+        if not ignored_layers:
+            ignored_layers = self.get_from_keys(hf_quant_config,
+                                                ["modules_to_not_convert"],
+                                                None)
+            self.skip_with_substr = True
+
+        if activation_scheme not in self.ACTIVATION_SCHEMES:
+            raise ValueError(
+                f"Unsupported activation scheme {activation_scheme}")
+        self.activation_scheme = activation_scheme
+        self.ignored_layers = ignored_layers or []
+        if weight_block_size is not None:
+            if not self.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "The block-wise quantization only supports fp8-serialized "
+                    "checkpoint for now.")
+            if len(weight_block_size) != 2:
+                raise ValueError(
+                    "The quantization block size of weight must have 2 "
+                    f"dimensions, but got {len(weight_block_size)} dimensions")
+            if activation_scheme != "dynamic":
+                raise ValueError("The block-wise quantization only supports "
+                                 "dynamic activation scheme for now, but got "
+                                 f"{activation_scheme} activation scheme.")
+        self.weight_block_size = weight_block_size
+
+    def get_quant_method(self, layer: JaxModule,
+                         prefix: str) -> Optional[QuantizeMethodBase]:
+        if isinstance(layer, JaxEinsum):
+            linear_config = QuantLinearConfig(layer, enable_sp=False)
+            if self.is_layer_skipped(prefix,
+                                     ignored_layers=self.ignored_layers,
+                                     skip_with_substr=self.skip_with_substr):
+                return UnquantizedLinearMethod(linear_config)
+            if self.weight_block_size is not None:
+                if isinstance(layer, JaxMergedColumnParallelLinear):
+                    return Fp8BlockwiseMergedLinearMethod(
+                        self, layer, linear_config)
+                return Fp8BlockwiseLinearMethod(self, layer, linear_config)
+            else:
+                return Fp8TensorwiseLinearMethod(layer, linear_config)
+        elif isinstance(layer, (JaxRoutedExperts, JaxMoE)):
+            if self.is_layer_skipped(prefix,
+                                     ignored_layers=self.ignored_layers,
+                                     skip_with_substr=self.skip_with_substr):
+                return UnquantizedFusedMoEMethod(layer)
+            return Fp8FusedMoEMethod(self.weight_block_size)
+        return None
+
+
 class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
     """On-the-fly per-output-channel e4m3 for a BF16 checkpoint (flax lane).
 
@@ -879,74 +949,4 @@ class Fp8OnlineConfig(Fp8Config):
                 # router is a single small matmul with no HBM payoff.
                 return UnquantizedLinearMethod(linear_config)
             return Fp8OnlineLinearMethod(layer, linear_config)
-        return None
-
-
-class Fp8Config(QuantizationConfig):
-
-    ACTIVATION_SCHEMES = ["dynamic", "static"]
-
-    def __init__(self, hf_quant_config: dict):
-        # Replicating upstream https://github.com/vllm-project/vllm/blob/77c09e1130661197ccac2d968a28cd4a557922d5/vllm/model_executor/layers/quantization/fp8.py#L167-L175
-
-        quant_method = self.get_from_keys(hf_quant_config, ["quant_method"])
-        self.is_checkpoint_fp8_serialized = "fp8" in quant_method
-        activation_scheme = self.get_from_keys(hf_quant_config,
-                                               ["activation_scheme"])
-        ignored_layers = self.get_from_keys(hf_quant_config,
-                                            ["ignored_layers"], None)
-        weight_block_size = self.get_from_keys(hf_quant_config,
-                                               ["weight_block_size"], None)
-        # `ignored_layers` lists exact leaf module names (exact match);
-        # `modules_to_not_convert` lists container/module names meant to
-        # skip everything nested under them (needs substring match) — see
-        # `QuantizationConfig.is_layer_skipped`.
-        self.skip_with_substr = False
-        if not ignored_layers:
-            ignored_layers = self.get_from_keys(hf_quant_config,
-                                                ["modules_to_not_convert"],
-                                                None)
-            self.skip_with_substr = True
-
-        if activation_scheme not in self.ACTIVATION_SCHEMES:
-            raise ValueError(
-                f"Unsupported activation scheme {activation_scheme}")
-        self.activation_scheme = activation_scheme
-        self.ignored_layers = ignored_layers or []
-        if weight_block_size is not None:
-            if not self.is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized "
-                    "checkpoint for now.")
-            if len(weight_block_size) != 2:
-                raise ValueError(
-                    "The quantization block size of weight must have 2 "
-                    f"dimensions, but got {len(weight_block_size)} dimensions")
-            if activation_scheme != "dynamic":
-                raise ValueError("The block-wise quantization only supports "
-                                 "dynamic activation scheme for now, but got "
-                                 f"{activation_scheme} activation scheme.")
-        self.weight_block_size = weight_block_size
-
-    def get_quant_method(self, layer: JaxModule,
-                         prefix: str) -> Optional[QuantizeMethodBase]:
-        if isinstance(layer, JaxEinsum):
-            linear_config = QuantLinearConfig(layer, enable_sp=False)
-            if self.is_layer_skipped(prefix,
-                                     ignored_layers=self.ignored_layers,
-                                     skip_with_substr=self.skip_with_substr):
-                return UnquantizedLinearMethod(linear_config)
-            if self.weight_block_size is not None:
-                if isinstance(layer, JaxMergedColumnParallelLinear):
-                    return Fp8BlockwiseMergedLinearMethod(
-                        self, layer, linear_config)
-                return Fp8BlockwiseLinearMethod(self, layer, linear_config)
-            else:
-                return Fp8TensorwiseLinearMethod(layer, linear_config)
-        elif isinstance(layer, (JaxRoutedExperts, JaxMoE)):
-            if self.is_layer_skipped(prefix,
-                                     ignored_layers=self.ignored_layers,
-                                     skip_with_substr=self.skip_with_substr):
-                return UnquantizedFusedMoEMethod(layer)
-            return Fp8FusedMoEMethod(self.weight_block_size)
         return None
