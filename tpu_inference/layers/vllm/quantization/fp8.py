@@ -432,7 +432,7 @@ class VllmFp8OnlineLinearMethod(VllmFp8LinearMethod):
             PartitionSpec(*self.linear_config.weight_sharding[::-1]),
         )
         weight = _load_weight_for_layer(layer, "weight", loading_sharding)
-        weight = jnp.transpose(weight)  # -> [in, out]
+        weight = jnp.transpose(weight)  # -> [out, in]
         delattr(layer, "weight")
 
         # The online step: requant the bf16 weight to e4m3 + per-out-channel
