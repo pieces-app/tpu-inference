@@ -31,6 +31,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_quantized_moe_weights)
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.quantization import quantize_tensor
+from tpu_inference.layers.common.quantization.online_fp8_requant import (
+    ONLINE_QUANT_DTYPE_ENV, online_quant_dtype)
 from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
@@ -137,13 +139,19 @@ class Fp8TensorwiseLinearMethod(QuantizeMethodBase,
                 out += bias
             return out
 
+        # Preserve the leading (batch/token) axes. `out.shape[:-1] +
+        # shape` was a NO-OP that silently FUSED them: after the
+        # flatten `out` is already 2-D, so the restore returned
+        # [N, out] regardless of the caller's rank. Live in the
+        # 26B/31B flax lanes at B>1 and invisible to any B=1 test.
+        leading = x.shape[:-1]
         if len(x.shape) > 2:
             x = x.reshape(-1, self.in_features)
         out = self._apply_fused(x,
                                 layer.weight[...],
                                 layer.weight_scale[...],
                                 bias=bias)
-        out = out.reshape(out.shape[:-1] + self.output_shape)
+        out = out.reshape(tuple(leading) + tuple(self.output_shape))
         return out
 
 
@@ -389,10 +397,16 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
         weight = layer.weight[...]
         scale = getattr(layer, self.weight_scale_name)[...]
         bias = layer.bias[...] if layer.bias is not None else None
+        # Preserve the leading (batch/token) axes. `out.shape[:-1] +
+        # shape` was a NO-OP that silently FUSED them: after the
+        # flatten `out` is already 2-D, so the restore returned
+        # [N, out] regardless of the caller's rank. Live in the
+        # 26B/31B flax lanes at B>1 and invisible to any B=1 test.
+        leading = x.shape[:-1]
         if len(x.shape) > 2:
             x = x.reshape(-1, self.in_features)
         out = self._apply_fused(x, weight, scale, bias=bias)
-        out = out.reshape(out.shape[:-1] + self.out_features)
+        out = out.reshape(tuple(leading) + tuple(self.out_features))
         return out
 
 
@@ -831,6 +845,13 @@ class Fp8Config(QuantizationConfig):
         return None
 
 
+# The dtype selection lives in the COMMON leaf so that BOTH online requant
+# paths -- this flax/nnx one (26B-A4B MoE) and the vllm/torchax one (12B
+# dense) -- answer it identically. A lever that moved only one of them would
+# make the two arms incomparable rather than configurable.
+_online_fp8_dtype = online_quant_dtype
+
+
 class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
     """On-the-fly per-output-channel e4m3 for a BF16 checkpoint (flax lane).
 
@@ -877,37 +898,39 @@ class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
                 "weights; no Gemma-4 dense layer has true batch dims. "
                 "Refusing rather than guessing a scale layout.")
 
-        # Requant on CPU to avoid OOM on device (same discipline as the
-        # blockwise path above).
-        with cpu_mesh_context():
-            weight = layer.weight[...]
-            w2d = weight.reshape(math.prod(self.linear_config.in_features),
-                                 -1)
-            # The same primitive the MoE requant path already trusts; axis=0
-            # is the per-OUTPUT-channel reduction for an [in, out] kernel
-            # (numerically amax/448, matching the torchax leaf after #18).
-            w_q, w_s = quantize_tensor(jnp.float8_e4m3fn, w2d, axis=0)
-            delattr(layer, 'weight')
+        # Requant WHERE THE PARAM LIVES.
+        #
+        # This used to open `with cpu_mesh_context():` around a param that
+        # `assign_and_shard_param` has already committed to the TPU model
+        # mesh, so the first op (jnp.max inside quantize_tensor) raised
+        # "Received incompatible devices for jitted computation" -- the flax
+        # online-fp8 lane could never complete a weight load, which is why no
+        # flax fp8 arm has ever served a token. The blockwise sibling gets
+        # away with cpu_mesh_context because IT pins its params to cpu_mesh
+        # in create_weights_jax; this method deliberately does not create
+        # params at all, so it must not borrow that discipline.
+        weight = layer.weight[...]
+        src_sharding = getattr(weight, "sharding", None)
+        w2d = weight.reshape(math.prod(self.linear_config.in_features), -1)
+        # The same primitive the MoE requant path already trusts; axis=0 is
+        # the per-OUTPUT-channel reduction for an [in, out] kernel
+        # (numerically amax/448, matching the torchax leaf after #18).
+        w_q, w_s = quantize_tensor(_online_fp8_dtype(), w2d, axis=0)
+        delattr(layer, 'weight')
 
-        weight_sharding = self.weight_sharding
-        # The per-OUT scale is sharded on the OUT axis. (Deliberately NOT
-        # weight_sharding[0] -- that wart in Fp8TensorwiseLinearMethod
-        # shards a per-output scale along the INPUT axis.)
-        scale_sharding = None
-        if isinstance(weight_sharding, P) and len(weight_sharding) > 1:
-            scale_sharding = P(weight_sharding[1])
-        elif isinstance(weight_sharding,
-                        (tuple, list)) and len(weight_sharding) > 1:
-            scale_sharding = (weight_sharding[1], )
-
-        w_q = jax.device_put(
-            w_q,
-            NamedSharding(self.linear_config.mesh, P(*weight_sharding))
-            if weight_sharding is not None else None)
-        w_s = jax.device_put(
-            w_s,
-            NamedSharding(self.linear_config.mesh, P(*scale_sharding))
-            if scale_sharding is not None else None)
+        # Sharding is derived from the SOURCE ARRAY, not from
+        # linear_config.mesh -- that attribute is None on the JAX lane, and
+        # NamedSharding(None, spec) raises TypeError before any token is
+        # served. The quantized weight has the source's shape, so the
+        # source's sharding applies unchanged; the per-output scale is
+        # 1-D over the OUT axis and is left replicated (it is tiny, and a
+        # wrong spec here is the Fp8Tensorwise wart of sharding a per-output
+        # scale along the INPUT axis).
+        if src_sharding is not None:
+            try:
+                w_q = jax.device_put(w_q, src_sharding)
+            except (ValueError, TypeError):
+                pass  # shape/mesh mismatch: leave placement to the runtime
         layer.weight = nnx.Param(w_q)
         layer.weight_scale = nnx.Param(w_s)
         logger.info_once(

@@ -65,6 +65,19 @@ def xla_quantized_matmul(
             "Skipping activation quantization due to weight requantization being disabled."
         )
 
+    # RANK-GENERIC contraction. The activation's LAST axis contracts with the
+    # weight's first; every leading axis is a batch/token axis and is
+    # preserved. This was hardcoded to (((1,), (0,)), ((), ())) -- rank-2
+    # exactly -- which is why a rank-3 activation died with
+    #   dot_general requires contracting dimensions to have the same shape,
+    #   got (1120,) and (6912,)
+    # on the Gemma-4 vision projection (measured on v6e 2026-09-01). The
+    # weight layout was innocent: patch_dense is a plain [6912, 3840] kernel
+    # and the correct formulation is identical to a text Linear -- contract
+    # the last axis. (The failure was first mistaken for a layout problem and
+    # "fixed" by excluding multimodal layers; the exclusion is retained for
+    # economics, but this is the actual defect.)
+    xc = (x.ndim - 1, )
     if quantize_activation:
         acc_dtype = jnp.float32
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
@@ -74,19 +87,23 @@ def xla_quantized_matmul(
         out = jax.lax.dot_general(
             x_q,
             w_q,
-            dimension_numbers=(((1, ), (0, )), ((), ())),
+            dimension_numbers=((xc, (0, )), ((), ())),
             preferred_element_type=acc_dtype,
         ).astype(jnp.float32)
-        out *= x_scale
+        # x_scale carries one scale per token row; broadcast it against the
+        # output's leading (batch/token) axes rather than assuming rank 2.
+        out *= jnp.reshape(x_scale, x_scale.shape + (1, ) *
+                           (out.ndim - x_scale.ndim))
     else:
         out = jax.lax.dot_general(
             x,
             w_q,
-            dimension_numbers=(((1, ), (0, )), ((), ())),
+            dimension_numbers=((xc, (0, )), ((), ())),
             preferred_element_type=jnp.float32,
         )
     if not skip_scale:
-        out *= jnp.expand_dims(w_scale, 0)
+        # w_scale is per-output-channel: broadcast over ALL leading axes.
+        out *= jnp.reshape(w_scale, (1, ) * (out.ndim - 1) + (-1, ))
     return out.astype(x.dtype)
 
 
