@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     # checkpoint. Default False keeps get_quant_method fail-closed; enable
     # only for the OD-TPU quality panel (issue #158).
     VLLM_FP8_ONLINE_DENSE: bool = False
+    ALLOW_AUDIO_WEIGHT_SKIP: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
@@ -297,6 +298,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
     "VLLM_FP8_ONLINE_DENSE":
     env_bool("VLLM_FP8_ONLINE_DENSE", default=False),
+    # Opt IN to serving text+vision from an audio-capable checkpoint whose
+    # audio tower this implementation cannot load. Default False: dropping a
+    # checkpoint's entire audio capability must be stated, not defaulted into.
+    "ALLOW_AUDIO_WEIGHT_SKIP":
+    env_bool("ALLOW_AUDIO_WEIGHT_SKIP", default=False),
     # Specify block quantization size
     "REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if
