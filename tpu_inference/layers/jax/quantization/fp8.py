@@ -20,6 +20,7 @@ from typing import Iterable, Optional, Sequence
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.layers.common.linear import sharded_quantized_batched_matmul
@@ -29,6 +30,7 @@ from tpu_inference.layers.common.process_weights.linear_weights import \
 from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_quantized_moe_weights)
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
+from tpu_inference.layers.common.quantization import quantize_tensor
 from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
@@ -757,6 +759,127 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
         return moe_apply(layer, x_TD, router_logits, weights,
                          layer.moe_backend, layer.mesh,
                          self.extra_backend_kwargs)
+
+
+class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
+    """On-the-fly per-output-channel e4m3 for a BF16 checkpoint (flax lane).
+
+    The native (flax_nnx) mirror of the torchax VllmFp8OnlineLinearMethod
+    (issue #158, fork PR #17 + the axis/env fix #18). Reached ONLY when
+    --quantization fp8 is set, the checkpoint is NOT fp8-serialized, and
+    VLLM_FP8_ONLINE_DENSE=1; every other path keeps the clean fail-closed
+    NotImplementedError.
+
+    Discipline inherited from the torchax method: create_weights_jax is a
+    NO-OP so the model's own bf16 kernel and its default loaders survive --
+    no param replacement, and critically NO empty weight_scale param (an
+    uninitialized scale is the garbage the fail-closed guard exists to
+    prevent). The requant happens after load, and apply_jax is inherited
+    unchanged so BOTH lanes land on the same xla_quantized_matmul --
+    arm-to-arm numerical comparability by construction.
+    """
+
+    def create_weights_jax(self, layer: JaxEinsum, *weight_args, rngs,
+                           **extra_weight_attrs):
+        # Keep the model-created bf16 kernel and its default loader. Merged
+        # layers (gate_up / qkv) must still merge+interleave at load, so
+        # delegate to the unquantized merged path; per-output-channel scales
+        # are order-equivariant, so quantizing the already-interleaved
+        # kernel needs no reorder logic. (Blockwise would NOT commute --
+        # explicit non-goal.)
+        from tpu_inference.layers.jax.quantization.unquantized import (
+            UnquantizedLinearMethod, UnquantizedMergedLinearMethod)
+        if isinstance(layer, JaxMergedColumnParallelLinear):
+            UnquantizedMergedLinearMethod.create_weights_jax(
+                self, layer, *weight_args, rngs=rngs, **extra_weight_attrs)
+        else:
+            UnquantizedLinearMethod.create_weights_jax(
+                self, layer, *weight_args, rngs=rngs, **extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: JaxEinsum) -> bool:
+        assert isinstance(layer, JaxEinsum)
+        if not layer.weight.get_metadata("_is_loaded", False):
+            # The kernel can arrive across multiple files; requant once.
+            return False
+        if self.batch_features:
+            raise NotImplementedError(
+                "VLLM_FP8_ONLINE_DENSE does not support batched (3D) linear "
+                "weights; no Gemma-4 dense layer has true batch dims. "
+                "Refusing rather than guessing a scale layout.")
+
+        # Requant on CPU to avoid OOM on device (same discipline as the
+        # blockwise path above).
+        with cpu_mesh_context():
+            weight = layer.weight[...]
+            w2d = weight.reshape(math.prod(self.linear_config.in_features),
+                                 -1)
+            # The same primitive the MoE requant path already trusts; axis=0
+            # is the per-OUTPUT-channel reduction for an [in, out] kernel
+            # (numerically amax/448, matching the torchax leaf after #18).
+            w_q, w_s = quantize_tensor(jnp.float8_e4m3fn, w2d, axis=0)
+            delattr(layer, 'weight')
+
+        weight_sharding = self.weight_sharding
+        # The per-OUT scale is sharded on the OUT axis. (Deliberately NOT
+        # weight_sharding[0] -- that wart in Fp8TensorwiseLinearMethod
+        # shards a per-output scale along the INPUT axis.)
+        scale_sharding = None
+        if isinstance(weight_sharding, P) and len(weight_sharding) > 1:
+            scale_sharding = P(weight_sharding[1])
+        elif isinstance(weight_sharding,
+                        (tuple, list)) and len(weight_sharding) > 1:
+            scale_sharding = (weight_sharding[1], )
+
+        w_q = jax.device_put(
+            w_q,
+            NamedSharding(self.linear_config.mesh, P(*weight_sharding))
+            if weight_sharding is not None else None)
+        w_s = jax.device_put(
+            w_s,
+            NamedSharding(self.linear_config.mesh, P(*scale_sharding))
+            if scale_sharding is not None else None)
+        layer.weight = nnx.Param(w_q)
+        layer.weight_scale = nnx.Param(w_s)
+        logger.info_once(
+            "VLLM_FP8_ONLINE_DENSE=1: serving dense on-the-fly fp8 "
+            "(e4m3, per-output-channel) -- requanted from the bf16 "
+            "checkpoint at load; experts stay on MOE_REQUANTIZE.")
+        return True
+
+
+class Fp8OnlineConfig(Fp8Config):
+    """Config that dispatches the online-dense method for bf16 checkpoints.
+
+    Constructed ONLY by get_tpu_quantization_config when the flag is set
+    (see layers/jax/quantization/__init__.py); it never reads a checkpoint
+    quantization_config, because there is none -- which is exactly why the
+    stock Fp8Config raised KeyError here before.
+    """
+
+    def __init__(self, hf_quant_config: dict | None = None):
+        # Bypass Fp8Config.__init__: nothing to read from the checkpoint.
+        self.is_checkpoint_fp8_serialized = False
+        self.activation_scheme = "dynamic"
+        self.ignored_layers = []
+        self.skip_with_substr = False
+        self.weight_block_size = None
+
+    def get_quant_method(self, layer: JaxModule,
+                         prefix: str) -> Optional[QuantizeMethodBase]:
+        from tpu_inference.layers.jax.quantization.unquantized import (
+            UnquantizedFusedMoEMethod)
+        if isinstance(layer, (JaxRoutedExperts, JaxMoE)):
+            # Experts keep the orthogonal, already-serving requant path
+            # (MOE_REQUANTIZE_WEIGHT_DTYPE) -- never double-quantized here.
+            return UnquantizedFusedMoEMethod(layer)
+        if isinstance(layer, JaxEinsum):
+            linear_config = QuantLinearConfig(layer, enable_sp=False)
+            if prefix.endswith("router.proj") or ".router." in prefix:
+                # Routing quality is disproportionately sensitive; the
+                # router is a single small matmul with no HBM payoff.
+                return UnquantizedLinearMethod(linear_config)
+            return Fp8OnlineLinearMethod(layer, linear_config)
+        return None
 
 
 class Fp8Config(QuantizationConfig):
