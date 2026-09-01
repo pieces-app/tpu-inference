@@ -62,6 +62,35 @@ class CompilationManager:
         self._sampling_precompiled = False
         self._gather_logprobs_precompiled = False
 
+    def _dummy_mm_bidi_ranges(self, sharding):
+        """The dummy `mm_bidi_ranges` every primer's metadata must carry.
+
+        `mm_bidi_ranges` is a DATA field of the registered AttentionMetadata
+        dataclass, so `None` vs an array is a different pytree treedef -- a
+        hard jit cache miss, not a value difference. `_prepare_inputs`
+        allocates it on EVERY step once `mm_bidi_enabled`, images or not, so a
+        primer that leaves it None primes a graph the runtime can never hit.
+
+        The symptom is nasty precisely because precompilation REPORTS SUCCESS:
+        request #1 then traces and XLA-compiles a 12B/26B model inside the
+        serving loop (minutes of TTFT, and a persistent-cache miss the warm
+        bank cannot cover), or with VLLM_XLA_CHECK_RECOMPILATION=1 the engine
+        dies on the first request with ForbidCompile.
+
+        Sharding differs per primer -- the target uses its
+        metadata_attn_sharding, the drafters their dp_sharding -- so it is a
+        parameter rather than derived here. `(0, 0)` means causal.
+
+        One definition on purpose: this existed inline in the target primer
+        only, and all six other construction sites were missed.
+        """
+        if not getattr(self.runner, "mm_bidi_enabled", False):
+            return None
+        return device_array(self.runner.mesh,
+                            np.zeros((self.runner.max_num_reqs, 2),
+                                     dtype=np.int32),
+                            sharding=sharding)
+
         if not vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
             logger.info("Enabling JAX compile cache.")
             jax.config.update("jax_compilation_cache_dir",
@@ -447,14 +476,8 @@ class CompilationManager:
         # metadata pytree must match the runtime shape (`_prepare_inputs`
         # always populates the field for mm-bidi models, (0, 0) = causal),
         # or every real step would recompile against a mismatched signature.
-        if getattr(self.runner, "mm_bidi_enabled", False):
-            mm_bidi_ranges = device_array(self.runner.mesh,
-                                          np.zeros(
-                                              (self.runner.max_num_reqs, 2),
-                                              dtype=np.int32),
-                                          sharding=metadata_attn_sharding)
-        else:
-            mm_bidi_ranges = None
+        mm_bidi_ranges = self._dummy_mm_bidi_ranges(
+            metadata_attn_sharding)
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
@@ -1525,6 +1548,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=eagle3_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
@@ -1669,6 +1693,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
                 )
 
                 def drafter_propose_warmup(_fn, _args, _call_kwargs):
@@ -1803,6 +1828,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=dflash_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
                 )
 
                 def drafter_propose_warmup(_fn,
@@ -1862,6 +1888,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=dflash_mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
                 )
 
                 aux_hidden_states = [
@@ -2013,6 +2040,7 @@ class CompilationManager:
                     request_distribution=request_distribution,
                     mamba_state_indices=mamba_state_indices,
                     padded_num_reqs=num_reqs,
+                    mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
                 )
             else:
                 attn_metadata = GroupedAttentionMetadata(
@@ -2025,6 +2053,7 @@ class CompilationManager:
                             request_distribution=request_distribution,
                             mamba_state_indices=mamba_state_indices,
                             padded_num_reqs=num_reqs,
+                            mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
                         ) for gid in range(
                             len(self.runner.kv_cache_config.kv_cache_groups))),
                     layer_names_per_group=tuple(
