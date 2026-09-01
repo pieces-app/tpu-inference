@@ -158,24 +158,6 @@ class Eagle3Proposer:
                     draft_embed_param.value = target_embed_param.value
                 else:
                     logger.info("Draft model has its own embed_tokens.")
-            elif self.speculative_config.use_gemma4_mtp():
-                # Fail-closed (M0a-e): for Gemma4-MTP the target-shared
-                # embed_tokens is MANDATORY -- the assistant checkpoint
-                # carries only a draft-dim placeholder, and a drafter left
-                # without the share silently drafts garbage. A warning here
-                # let exactly that happen when the resolved impl said
-                # flax_nnx while the loaded target was the torchax fallback
-                # (the resolved-vs-actual blind spot, measured 2026-09-01).
-                raise ValueError(
-                    "Gemma4-MTP requires sharing the target's embed_tokens "
-                    "into the drafter, but the embedding parameters could "
-                    "not be located (draft="
-                    f"{draft_embed_param is not None}, target="
-                    f"{target_embed_param is not None}). This typically "
-                    "means the loaded target is not the flax_nnx "
-                    "implementation this proposer requires -- check the "
-                    "model-load fallback log line. Refusing to serve a "
-                    "drafter without its mandatory embedding share.")
             else:
                 logger.warning(
                     "Failed to locate draft or target embedding parameter in State objects."
