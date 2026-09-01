@@ -60,5 +60,16 @@ def test_no_empty_scale_ever_created():
     the leaf never allocates an uninitialized one."""
     src = LEAF.read_text()
     assert "torch.empty" not in src
-    assert "amax" in src and "/ E4M3_MAX" in src.replace(" ", " ")
+    # The INVARIANT is "the scale is COMPUTED from the data", not the literal
+    # divisor. This used to pin "/ E4M3_MAX"; the divisor is now derived from
+    # the SELECTED dtype (ti #25) because e4m3b11fnuz maxes at 30 and int8 at
+    # 127 -- a hardcoded 448 clipped every weight for those targets, a
+    # wrong-NUMBERS bug rather than a loud one. Pinning the old spelling made
+    # this test fail on a strictly better implementation.
+    assert "amax" in src, "the scale must be computed from the data's amax"
+    assert ("quant_dtype_max" in src or "/ E4M3_MAX" in src), (
+        "the amax must be divided by the target dtype's max -- either the "
+        "dtype-derived helper or, historically, the e4m3 literal")
+    assert "jnp.empty" not in src and "np.empty" not in src, (
+        "no uninitialized scale may be allocated on any path")
 
