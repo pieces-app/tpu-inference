@@ -285,3 +285,35 @@ def test_torchax_lane_has_the_same_exclusion():
     body = _code_only(ast.get_source_segment(src, gq) or "")
     assert "_is_online_fp8_eligible" in body, (
         "the skip list exists but the dispatch never consults it")
+
+
+def test_excluded_layers_return_unquantized_not_the_failclosed_raise():
+    """An EXCLUDED layer under an active online-fp8 run must be served bf16.
+
+    MEASURED 2026-09-01: the first version of the skip merely declined to
+    return the online method, so excluded layers FELL THROUGH to the
+    fail-closed `raise NotImplementedError` further down -- turning an
+    inference-time crash into an ENGINE-INIT crash. The refusal exists for
+    "you asked for fp8 and we cannot provide it", NOT for "we deliberately
+    keep this layer in bf16". Order matters: the exclusion branch must
+    return BEFORE the raise.
+    """
+    p = (ROOT / "tpu_inference" / "layers" / "vllm" / "quantization" / "fp8.py")
+    src = p.read_text()
+    tree = ast.parse(src)
+    gq = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == "get_quant_method":
+            gq = n
+    assert gq is not None
+    seg = ast.get_source_segment(src, gq) or ""
+    excl = seg.find("not _is_online_fp8_eligible")
+    assert excl != -1, "no exclusion branch found"
+    # the exclusion branch must RETURN an unquantized method...
+    after = seg[excl:]
+    ret = after.find("VllmUnquantizedLinearMethod")
+    raise_at = after.find("raise NotImplementedError")
+    assert ret != -1, "exclusion branch does not return an unquantized method"
+    assert raise_at == -1 or ret < raise_at, (
+        "the exclusion branch falls through to the fail-closed raise -- "
+        "excluded layers would abort engine init instead of serving bf16")
