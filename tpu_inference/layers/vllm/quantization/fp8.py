@@ -478,8 +478,24 @@ class VllmFp8OnlineLinearMethod(VllmFp8LinearMethod):
             self.linear_config.mesh,
             PartitionSpec(*self.linear_config.weight_sharding[::-1]),
         )
+        # Capture the Parameter BEFORE loading so its host storage can be
+        # released. `delattr` alone frees nothing: this class inherits
+        # `maybe_process_weights`, so under VLLM_INCREMENTAL_FP8_LOADING it
+        # runs mid-load while the model's own
+        # `params_dict = dict(self.named_parameters())` still holds a strong
+        # reference to every original Parameter for the whole loop. That is
+        # exactly why the offline and MoE siblings resize the storage instead
+        # of relying on the attribute going away.
+        #
+        # Without this a 26B/31B bf16 checkpoint accumulates in host RAM for
+        # the entire load and the pod is OOM-killed mid-load or during first
+        # compile -- which reads as "fp8 needs more host RAM" rather than as
+        # a missing free. Benign under the default (non-incremental) loader,
+        # which is why it has not bitten yet.
+        p_weight = layer.weight
         weight = _load_weight_for_layer(layer, "weight", loading_sharding)
         weight = jnp.transpose(weight)  # -> [in, out]
+        _free_torch_storage(p_weight)
         delattr(layer, "weight")
 
         # The online step: requant the bf16 weight to e4m3 + per-out-channel
@@ -489,10 +505,12 @@ class VllmFp8OnlineLinearMethod(VllmFp8LinearMethod):
         if layer.bias is not None and not layer.skip_bias_add:
             if layer.return_bias:
                 logger.warning_once("Bias might return incorrect value.")
+            p_bias = layer.bias
             bias = _load_weight_for_layer(
                 layer, "bias",
                 NamedSharding(self.linear_config.mesh,
                               self.linear_config.bias_sharding))
+            _free_torch_storage(p_bias)
             delattr(layer, "bias")
         else:
             bias = None
@@ -531,6 +549,11 @@ class VllmFp8OnlineLinearMethod(VllmFp8LinearMethod):
             if has_bias:
                 layer.bias = to_parameter_list(weights.bias)
 
+        # The same trailing release both siblings perform: gc.collect() +
+        # jax.effects_barrier() + malloc_trim(0). Freeing the storage above is
+        # necessary but not sufficient -- without the trim, glibc keeps the
+        # arena and the pod's RSS never drops.
+        _release_host_memory()
 
 
 class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
