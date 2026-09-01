@@ -56,6 +56,25 @@ def _tpu_generation():
         return None
 
 
+_ANNOUNCED = set()
+
+
+def _announce(dtype, why):
+    """Log the selected dtype once per process. Best-effort: never let a log
+    import break a weight load."""
+    key = (getattr(dtype, "__name__", str(dtype)), why)
+    if key in _ANNOUNCED:
+        return
+    _ANNOUNCED.add(key)
+    try:
+        from tpu_inference.logger import init_logger
+        init_logger(__name__).info(
+            "online quant dtype: %s (%s=%s)", key[0], ONLINE_QUANT_DTYPE_ENV,
+            why)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def online_quant_dtype():
     """Which quantized dtype the online requant paths emit.
 
@@ -74,6 +93,11 @@ def online_quant_dtype():
     ~2x. That is why int8 is a first-class option here rather than an
     afterthought. See docs/fp8-all-modalities-design-2026-09-01.md.
     """
+    # Announce the SELECTED dtype once. The existing engagement marker only
+    # proves the online path ran, not WHICH dtype it emitted -- so without
+    # this an int8-labelled arm that silently fell back to e4m3fn is
+    # indistinguishable from a real int8 arm in the logs. Bank deltas
+    # discriminate too, but a log line is the cheap direct proof.
     want = os.environ.get(ONLINE_QUANT_DTYPE_ENV, "").strip()
     if want and want != "auto":
         if want not in ONLINE_QUANT_DTYPES:
@@ -81,11 +105,14 @@ def online_quant_dtype():
                 f"{ONLINE_QUANT_DTYPE_ENV}={want!r} is not a supported online "
                 f"quantization dtype. Choose one of "
                 f"{sorted(ONLINE_QUANT_DTYPES)} or 'auto'.")
+        _announce(ONLINE_QUANT_DTYPES[want], want)
         return ONLINE_QUANT_DTYPES[want]
     if want == "auto":
         gen = _tpu_generation()
         if gen is not None and gen < 7:
+            _announce(jnp.float8_e4m3b11fnuz, "auto/gen<7")
             return jnp.float8_e4m3b11fnuz
+    _announce(jnp.float8_e4m3fn, want or "default")
     return jnp.float8_e4m3fn
 
 
