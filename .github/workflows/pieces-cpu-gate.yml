@@ -1,0 +1,47 @@
+# The CPU gate for the pieces-app fork. Runs on every push/PR to pieces/*.
+#
+# WHY: on 2026-09-02 a PR shipped a test file WITHOUT the fix it described
+# (a scripted edit's assert fired before its write; the commit captured only
+# the test). The suite was red at the tip and nothing said so until a human
+# re-read pytest output. This job makes a red tip un-mergeable.
+#
+# Scope is the EXPLICIT list of tests that run on jax[cpu]+flax with no vllm
+# or torchax (those collect-error under pytest and would mask everything).
+# Every one of these has a negative control in its history; see
+# enrichment_evals_and_optimizations/testing_ledger.md.
+name: pieces-cpu-gate
+on:
+  push:
+    branches: ["pieces/**"]
+  pull_request:
+    branches: ["pieces/**"]
+jobs:
+  cpu-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: deps (jax cpu + flax + numpy + pytest; NO vllm/torch)
+        run: pip install -q "jax[cpu]" flax numpy pytest
+      - name: CPU-safe suite (explicit files -- a directory collect would pull vllm-dependent tests)
+        run: |
+          python -m pytest --noconftest -q \
+            tests/models/jax/test_gemma4_unified.py \
+            tests/models/jax/test_audio_skip_fails_closed.py \
+            tests/layers/jax/quantization/test_online_merged_binds_loader.py \
+            tests/layers/jax/quantization/test_tensorwise_merged_interleaves.py \
+            tests/layers/jax/quantization/test_fp8_online_dense_jax.py \
+            tests/layers/jax/quantization/test_n_shards_tracks_tp.py \
+            tests/layers/common/test_rank_generic_sharding.py \
+            tests/layers/common/test_quantized_matmul_rank.py \
+            tests/layers/common/quantization/test_paths_agree.py \
+            tests/layers/common/quantization/test_torchax_dtype_guard.py \
+            tests/layers/vllm/test_host_memory_release.py \
+            tests/layers/vllm/test_fp8_online_dispatch_structure.py \
+            tests/layers/vllm/test_fp8_online_requant.py \
+            tests/runner/test_init_not_truncated.py \
+            tests/runner/test_primers_carry_mm_bidi_ranges.py
+      - name: no function may have statements after a return (the __init__-truncation shape)
+        run: python -m pytest --noconftest -q tests/runner/test_init_not_truncated.py::test_no_function_has_statements_after_a_return
