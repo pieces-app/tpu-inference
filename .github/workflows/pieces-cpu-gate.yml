@@ -38,7 +38,8 @@ jobs:
             tests/layers/common/test_quantized_matmul_rank.py \
             tests/layers/common/quantization/test_paths_agree.py \
             tests/layers/common/quantization/test_torchax_dtype_guard.py \
-            tests/layers/vllm/test_host_memory_release.py \ \ \ \ \
+            tests/layers/vllm/test_host_memory_release.py \ \ \ \ \ \
+            tests/models/jax/test_audio_hatch_requires_api_limit.py
             tests/models/jax/test_no_kernel_attribute_reads.py
             tests/layers/common/test_w8a16_switch.py
             tests/kernels/test_int8_quant_scale_precision.py
