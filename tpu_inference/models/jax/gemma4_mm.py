@@ -652,6 +652,45 @@ class Gemma4MmModel(JaxModule):
         )
 
 
+def require_audio_disabled_at_api(audio_cfg, vllm_config, cls_name):
+    """ALLOW_AUDIO_WEIGHT_SKIP=1 promises "text+vision only"; make the serving
+    config say so, at boot.
+
+    Setting the hatch alone gets a model that loads without an audio tower and
+    then ACCEPTS audio requests. This class returns zero embeddings for them and
+    vLLM's runner asserts
+
+        Expected number of multimodal embeddings to match number of input
+        items: 1, but got len(mm_embeddings)=0
+
+    inside the model-execute path, which kills EngineCore -- an HTTP 500 and a
+    container restart, not a refused request. MEASURED 2026-09-02 on
+    eval-e2b-base (18:27Z) and eval-e4b-int8 (17:09Z): both booted, both died on
+    the first audio request, both took the whole benchmark arm with them. The
+    lanes that also passed --limit-mm-per-prompt audio:0 survived on the same
+    image, which is what isolated the cause.
+
+    A limit of 0 makes vLLM refuse audio at the API, which is what "text+vision
+    only" actually means. An ABSENT limit is refused too: the measured failures
+    had no audio limit at all, and the default admits audio.
+    """
+    if audio_cfg is None:
+        return
+    mm = getattr(getattr(vllm_config, "model_config", None),
+                 "multimodal_config", None)
+    limits = getattr(mm, "limit_per_prompt", None) or {}
+    if limits.get("audio", 1) != 0:
+        raise ValueError(
+            "ALLOW_AUDIO_WEIGHT_SKIP=1 says serve text+vision only, but the "
+            f"server still accepts audio (limit_per_prompt={dict(limits) or 'unset'}). "
+            f"{cls_name} has no audio tower, so the first audio request "
+            "returns zero multimodal embeddings and the runner's assertion "
+            "kills EngineCore. Add --limit-mm-per-prompt "
+            "'{\"image\":1,\"audio\":0,\"video\":0}' so audio is refused at "
+            "the API, or drop ALLOW_AUDIO_WEIGHT_SKIP and serve this "
+            "checkpoint on a path that implements the tower.")
+
+
 class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
     packed_modules_mapping = Gemma4ForCausalLM.packed_modules_mapping
     WeightLoader = StandardWeightLoader
@@ -747,6 +786,10 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
                 "Set ALLOW_AUDIO_WEIGHT_SKIP=1 to serve text+vision only from "
                 "this checkpoint, or use a path that implements the tower "
                 "(today: the vLLM/torchax fallback).")
+
+        # The hatch has to KEEP its promise -- see the helper's docstring.
+        require_audio_disabled_at_api(audio_cfg, self.vllm_config,
+                                      type(self).__name__)
 
         loader = JaxAutoWeightsLoader(
             self,
