@@ -107,3 +107,40 @@ def test_env_is_forwarded_to_ray_workers():
         "TPU_ONLINE_QUANT_DTYPE missing from the Ray passthrough: a multi-host int8 lane would serve fp8 on the workers (ti #29)")
     assert '"TPU_ONLINE_QUANT_ACT"' in block, (
         "a multi-host Ray run would silently fall back to W8A8 while the lane said W8A16 (the ti #29 shape)")
+
+
+def test_both_w8a16_implementations_agree():
+    """TPU_ONLINE_QUANT_ACT=0 has TWO implementations -- the dense
+    xla_quantized_matmul and the batched xla_quantized_batched_matmul -- and
+    nothing checked they do the same thing. Review 2026-09-02 found the
+    batched one had no explicit widen while the dense one did.
+
+    Also the record: ti #38's commit message says "lax.dot_general refuses
+    bf16 x int8" and that removing the widen "makes the W8A16 test fail loudly
+    on the dtype mismatch". Both are FALSE -- measured on jax 0.11.1, the
+    mixed dot_general is accepted and removing the widen left the tests green.
+    The widen is for symmetry and explicitness, not correctness, and this test
+    pins the property that actually matters: the two paths agree.
+    """
+    import importlib.util as _ilu
+    import jax, jax.numpy as jnp
+    m = _mod(quant_act=False)
+    w, w_q, w_s = _quant_w()                      # w_q [64, 32] int8, per-out scale
+    x = jax.random.normal(jax.random.PRNGKey(3), (5, 64)).astype(jnp.bfloat16)
+
+    dense = m.xla_quantized_matmul(x, w_q, w_s, quantize_activation=False)
+
+    us = _ilu.spec_from_file_location(
+        "tpu_inference.kernels.quantized_matmul.util",
+        ROOT / "tpu_inference" / "kernels" / "quantized_matmul" / "util.py")
+    um = _ilu.module_from_spec(us)
+    import sys as _sys
+    _sys.modules[us.name] = um
+    us.loader.exec_module(um)
+    batched = um.xla_quantized_batched_matmul(
+        x, w_q, w_s, dimension_numbers=(((1,), (0,)), ((), ())),
+        quantize_activation=False)
+
+    d = float(jnp.max(jnp.abs(dense.astype(jnp.float32) - batched.astype(jnp.float32)))
+              / jnp.max(jnp.abs(dense.astype(jnp.float32))))
+    assert d < 1e-3, f"the dense and batched W8A16 paths disagree by {d}"
