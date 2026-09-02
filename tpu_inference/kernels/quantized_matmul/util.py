@@ -119,9 +119,16 @@ def xla_quantized_batched_matmul(
             x_scale = jnp.transpose(x_scale, perm)
         out *= x_scale
     else:
+        # W8A16, batched. Widen the weight EXPLICITLY, exactly as the dense
+        # path (layers/common/linear.py xla_quantized_matmul) does. jax does
+        # promote a bf16 x int8 dot_general today, so this is not a
+        # correctness fix -- it makes the convert a visible op, keeps the two
+        # implementations of TPU_ONLINE_QUANT_ACT=0 symmetric, and does not
+        # depend on a promotion rule staying put.
+        w_dense = w_q if w_q.dtype == x.dtype else w_q.astype(x.dtype)
         out = jax.lax.dot_general(
             x,
-            w_q,
+            w_dense,
             dimension_numbers=(contract_dims, batch_dims),
             preferred_element_type=jnp.float32,
         )
