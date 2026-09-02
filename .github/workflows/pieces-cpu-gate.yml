@@ -42,7 +42,8 @@ jobs:
             tests/layers/vllm/test_fp8_online_dispatch_structure.py \
             tests/layers/vllm/test_fp8_online_requant.py \
             tests/layers/vllm/test_host_memory_release.py \
-            tests/models/jax/test_audio_hatch_requires_api_limit.py \
+            tests/models/jax/test_audio_hatch_requires_api_limit.py \ \
+            tests/models/jax/test_audio_mask_fallback_rank.py
             tests/models/jax/test_audio_skip_fails_closed.py \
             tests/models/jax/test_gemma4_unified.py \
             tests/models/jax/test_no_kernel_attribute_reads.py \

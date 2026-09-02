@@ -372,7 +372,13 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         if isinstance(mask, torch.Tensor):
             mask = jnp.asarray(mask.to(torch.bool).contiguous().numpy())
         if mask is None:
-            mask = jnp.ones(feats.shape[:2], dtype=bool)
+            # All dims but the feature dim: (bn, T) for the documented rank-3
+            # input AND (T,) for the single-item rank-2 input that
+            # _process_audio_input expands. `shape[:2]` was right only for
+            # rank-3; for rank-2 it produced a (T, 640) mask that the gather
+            # `emb[i][mask[i]]` cannot index -- a runtime-only crash on the
+            # branch nothing exercised (review 2026-09-02).
+            mask = jnp.ones(feats.shape[:-1], dtype=bool)
         return Gemma4AudioInputs(type="input_features",
                                  input_features_padded=feats,
                                  input_features_mask=mask)
