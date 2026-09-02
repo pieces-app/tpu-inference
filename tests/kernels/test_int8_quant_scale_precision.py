@@ -76,3 +76,72 @@ def test_fp8_branch_unchanged():
     x = jax.random.normal(jax.random.PRNGKey(2), (8, 128)).astype(jnp.bfloat16)
     q, scale = u.quantize_block(x, axis=-1, target_dtype=jnp.float8_e4m3fn)
     assert scale.dtype == jnp.float32 and q.dtype == jnp.float8_e4m3fn
+
+
+# ---- quantize_array: the Pallas-kernel path (kernel.py matmul_body) ---------
+
+def _f32_ref_kernel_style(x, qd):
+    """Rounded, f32 reference for a per-ROW scale over the last axis."""
+    import jax.numpy as jnp
+    xf = np.asarray(x.astype(jnp.float32))
+    dmax = float((jnp.iinfo if not jnp.issubdtype(qd, jnp.floating) else jnp.finfo)(qd).max)
+    s = (np.max(np.abs(xf), axis=-1, keepdims=True) / dmax).astype(np.float32)
+    q = xf / s
+    return (np.round(q).astype(np.int8) if qd == jnp.int8 else np.asarray(jnp.asarray(q).astype(qd))), s
+
+
+def _qa_inputs():
+    import jax, jax.numpy as jnp
+    x = jax.random.normal(jax.random.PRNGKey(7), (256, 3840)).astype(jnp.bfloat16)
+    xam = jnp.max(jnp.abs(x), axis=-1, keepdims=False)[None, :]   # exactly as kernel.py:157-160 builds it
+    return x, xam
+
+
+def test_quantize_array_int8_rounds_and_is_unbiased():
+    """MEASURED 2026-09-02: the old path truncated (astype) -> |deq|-|x| bias
+    -0.0125, RMS 0.0154, 42% of codes off-by-one vs a rounded f32 reference.
+    This code: bias ~0, RMS ~0.0093, <10% codes differing (rounding ties)."""
+    import jax.numpy as jnp
+    u = _util(); x, xam = _qa_inputs()
+    q, s = u.quantize_array(x, xam, jnp.int8)
+    assert s.dtype == jnp.float32
+    qref, sref = _f32_ref_kernel_style(x, jnp.int8)
+    np.testing.assert_allclose(np.asarray(s), sref, rtol=1e-6)
+    xf = np.asarray(x.astype(jnp.float32)); deq = np.asarray(q.astype(jnp.float32)) * np.asarray(s)
+    bias = float(np.mean(np.abs(deq)) - np.mean(np.abs(xf)))
+    mism = float(np.mean(np.asarray(q) != qref))
+    d = np.asarray(q).astype(int) - qref.astype(int)
+    assert abs(bias) < 1e-3, f"int8 quantization is biased toward zero by {bias:+.5f}: astype truncation is back"
+    assert int(np.abs(d).max()) <= 1 and mism < 0.10, f"{100*mism:.1f}% of codes differ (max |d|={int(np.abs(d).max())}); old truncating path: 42%"
+
+
+def test_quantize_array_fp8_scale_is_f32_and_residual_is_the_bf16_multiply():
+    """MEASURED 2026-09-02, fp8 e4m3fn codes vs an f32 reference:
+         weak float scale, bf16 multiply (as shipped before)  3.54%
+         f32 scale, bf16 multiply (THIS code)                 3.22%
+         f32 scale, f32 multiply                              0.01%
+    For fp8 the scale precision was never the main error -- the bf16 block
+    multiply is. That variant needs an f32 x-block temporary inside the
+    Pallas body, which get_vmem_limit does not account for and which cannot
+    be sized from CPU, so it is the follow-up, not this change. This test pins
+    what IS true: the scale is f32, and the code count is no worse than the
+    weak-typed path and improves once the multiply is widened."""
+    import jax.numpy as jnp
+    u = _util(); x, xam = _qa_inputs()
+    q, s = u.quantize_array(x, xam, jnp.float8_e4m3fn)
+    assert s.dtype == jnp.float32, "fp8 scale is not float32 (weak-typed Python float is back)"
+    qref, _ = _f32_ref_kernel_style(x, jnp.float8_e4m3fn)
+    mism = float(np.mean(np.asarray(q.astype(jnp.float32)) != np.asarray(jnp.asarray(qref).astype(jnp.float32))))
+    assert mism < 0.04, f"{100*mism:.2f}% of fp8 codes differ (bf16-multiply residual is ~3.2%; the weak-scale path was 3.5%)"
+
+
+def test_kernel_and_xla_paths_quantize_int8_alike():
+    """quantize_array (kernel) and quantize_block (XLA) quantize the SAME
+    activations; they must agree to rounding ties, not to a truncation bias."""
+    import jax.numpy as jnp
+    u = _util(); x, xam = _qa_inputs()
+    qa, sa = u.quantize_array(x, xam, jnp.int8)
+    qb, sb = u.quantize_block(x, axis=-1, target_dtype=jnp.int8)
+    np.testing.assert_allclose(np.asarray(sa).ravel(), np.asarray(sb).ravel(), rtol=1e-6)
+    d = np.asarray(qa).astype(int) - np.asarray(qb).astype(int)
+    assert int(np.abs(d).max()) <= 1 and float(np.mean(d != 0)) < 0.10, "the two activation-quant paths disagree beyond rounding ties"

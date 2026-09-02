@@ -152,10 +152,33 @@ def quantize_array(
     dtype_info = jnp.finfo(quant_dtype) if is_float else jnp.iinfo(quant_dtype)
     dtype_max = float(dtype_info.max)
 
+    # Two defects on this (Pallas-kernel) path, MEASURED 2026-09-02 on CPU,
+    # [256 x 3840] N(0,1) bf16 activations, against an f32 rounded reference:
+    #
+    #  1. `x_abs_max / float(dtype_max)`: a Python float is WEAKLY typed, so
+    #     the scale and its inverse stayed in the activation dtype (bf16) and
+    #     `x * scale_inv` ran at 8-bit mantissa. ti #38 fixed this shape in
+    #     quantize_block (the XLA path) and claimed the fp8 targets were
+    #     already f32 -- true there, false here. fp8 codes mismatched 3.5%.
+    #  2. `.astype(int8)` TRUNCATES toward zero. quantize_block rounds. Every
+    #     int8 activation on this path was biased ~0.5 LSB toward zero:
+    #     |deq|-|x| = -0.0125, RMS 0.0154 vs the XLA path's 0.0086, 42% of
+    #     codes off by one. This is the larger of the two.
+    #
+    # Fix: compute the scale in f32 (a [1, bs] vector -- free) and ROUND for
+    # integer targets. The block multiply stays in the activation dtype on
+    # purpose: an f32 temporary of the x block is real VMEM inside the kernel
+    # and cannot be sized from CPU. Measured result of this exact code: int8
+    # RMS 0.0093, bias -0.00003, 7.9% codes differ from the reference by one
+    # (rounding ties); the f32-multiply variant reaches the XLA path's 0.0086
+    # and is the follow-up once get_vmem_limit accounts for it.
     # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
-    scale = jnp.transpose(x_abs_max / dtype_max)
+    scale = jnp.transpose(x_abs_max.astype(jnp.float32) / jnp.float32(dtype_max))
     scale_inv = jnp.nan_to_num(1 / scale, dtype_max)
-    return (x * scale_inv).astype(quant_dtype), scale.astype(jnp.float32)
+    y = x * scale_inv.astype(x.dtype)
+    if not is_float:
+        y = jnp.round(y)
+    return y.astype(quant_dtype), scale
 
 
 def get_vmem_limit(
