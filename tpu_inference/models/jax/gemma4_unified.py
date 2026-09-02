@@ -403,7 +403,13 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         if feats.ndim == 2:
             feats = jnp.expand_dims(feats, 0)
             mask = jnp.expand_dims(mask, 0)
-        target_dtype = self.model.embed_audio.embedding_projection.kernel.value.dtype
+        # `.weight`, NOT `.kernel`: JaxEinsum (layers/jax/linear.py) aliases the
+        # nnx.Einsum param to `weight` and then `delattr(self, 'kernel')` so the
+        # HF-style name matches. Reading `.kernel` raised AttributeError and
+        # killed the whole EngineCore -- MEASURED 2026-09-02 17:06Z, native 12B,
+        # on the first audio request (text and vision were already serving).
+        # Nothing caught it earlier because this line only runs on live audio.
+        target_dtype = self.model.embed_audio.embedding_projection.weight.value.dtype
         emb = self.get_audio_embedding(feats.astype(target_dtype))
         return [emb[i][mask[i]] for i in range(emb.shape[0])]
 
