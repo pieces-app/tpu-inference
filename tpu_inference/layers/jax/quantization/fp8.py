@@ -31,6 +31,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_quantized_moe_weights)
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.quantization import quantize_tensor
+from tpu_inference.layers.common.utils import \
+    reorder_concatenated_tensor_for_sharding
 from tpu_inference.layers.common.quantization.online_fp8_requant import (
     ONLINE_QUANT_DTYPE_ENV, online_quant_dtype)
 from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
@@ -181,7 +183,9 @@ class Fp8TensorwiseMergedLinearMethod(Fp8TensorwiseLinearMethod):
                            *,
                            reshape_dims,
                            permute_dims,
-                           param_name):
+                           param_name,
+                           n_shards=1,
+                           output_sizes=None):
         shards = param.get_metadata("_merged_shards")
         with cpu_mesh_context():
             if shard_id == -1:
@@ -200,6 +204,19 @@ class Fp8TensorwiseMergedLinearMethod(Fp8TensorwiseLinearMethod):
                     for t in shards
                 ],
                                          axis=-1)
+            # REVIEW-CONFIRMED DEFECT (2026-09-01, 3/3): the merged kernel was
+            # stored as plain [gate | up], but the inherited apply path
+            # (common/quantization/fp8.py _apply_fused ->
+            # slice_sharded_tensor_for_concatenation) DE-INTERLEAVES the output
+            # as if the kernel were interleaved by shard. Identity at
+            # n_shards=1 -- every arm so far -- and silently wrong columns at
+            # TP>1 for any compressed-tensors fp8 checkpoint. Store interleaved,
+            # exactly as UnquantizedMergedLinearMethod does. The per-output-
+            # channel scale is 1-D over the same axis, so it gets the same
+            # reorder; that is why this happens BEFORE assign for both.
+            if output_sizes is not None and n_shards > 1:
+                merged = reorder_concatenated_tensor_for_sharding(
+                    merged, output_sizes, n_shards, dim=merged.ndim - 1)
         assign_and_shard_param(param, merged, param_name=param_name)
 
     def create_weights_jax(self, layer: JaxMergedColumnParallelLinear,
@@ -216,14 +233,18 @@ class Fp8TensorwiseMergedLinearMethod(Fp8TensorwiseLinearMethod):
             functools.partial(self._load_merged_shard,
                               reshape_dims=None,
                               permute_dims=(1, 0),
-                              param_name=layer.prefix + ".weight"))
+                              param_name=layer.prefix + ".weight",
+                              n_shards=self.linear_config.n_shards,
+                              output_sizes=self.linear_config.output_sizes))
         layer.weight_scale.set_metadata("_merged_shards", [None] * n_proj)
         layer.weight_scale.set_metadata(
             "weight_loader",
             functools.partial(self._load_merged_shard,
                               reshape_dims=(-1, ),
                               permute_dims=None,
-                              param_name=layer.prefix + ".weight_scale"))
+                              param_name=layer.prefix + ".weight_scale",
+                              n_shards=self.linear_config.n_shards,
+                              output_sizes=self.linear_config.output_sizes))
 
 
 class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
