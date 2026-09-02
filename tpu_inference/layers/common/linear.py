@@ -233,10 +233,17 @@ def sharded_quantized_matmul(x: jax.Array,
             scale_sharding = P(out_axis, )
     out_sharding = P(ShardingAxisName.ATTN_DATA, *batch_dims, out_axis)
 
-    # TPU_ONLINE_QUANT_ACT=0 forces weight-only quantization (W8A16) for every
-    # caller that left maybe_quantize_x at its default. Callers that pass
-    # False explicitly are already weight-only; callers that pass True
-    # explicitly are asking for W8A8 and are left alone.
+    # TPU_ONLINE_QUANT_ACT=0 forces weight-only quantization (W8A16).
+    #
+    # The comment that used to sit here claimed callers passing True
+    # EXPLICITLY are "left alone". That was false (review 2026-09-02): the
+    # parameter defaults to True, so by the time it arrives here an explicit
+    # True and a defaulted True are indistinguishable, and the line below
+    # flips both. That is the intended behaviour for a global serving switch
+    # -- an operator setting the env wants weight-only everywhere, not
+    # weight-only except wherever a call site happens to be explicit -- but
+    # the code should not describe a distinction it cannot make.
+    # Callers that pass False are already weight-only and are unaffected.
     if maybe_quantize_x and not envs.TPU_ONLINE_QUANT_ACT:
         maybe_quantize_x = False
     x = jax.lax.with_sharding_constraint(
