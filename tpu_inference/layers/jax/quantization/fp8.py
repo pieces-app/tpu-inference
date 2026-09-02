@@ -899,6 +899,20 @@ class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
         from tpu_inference.layers.jax.quantization.unquantized import (
             UnquantizedLinearMethod, UnquantizedMergedLinearMethod)
         if isinstance(layer, JaxMergedColumnParallelLinear):
+            # The delegated create_weights_jax builds
+            # functools.partial(self._load_merged_tensor, ...) -- and that is
+            # a staticmethod of UnquantizedMergedLinearMethod, NOT of this
+            # class. Delegating the function without binding the method it
+            # reads off `self` raised
+            #   AttributeError: 'Fp8OnlineLinearMethod' object has no
+            #   attribute '_load_merged_tensor'
+            # at MODEL CONSTRUCTION for every gate_up_proj, killing all four
+            # flax dense-quant arms of the 26B identically (fp8, e4m3b11fnuz,
+            # int8, allint8) ~70s into boot -- measured 2026-09-01 23:07Z.
+            # Never reachable on the 12B, whose torchax path has its own
+            # merged loader, which is why #24's CPU gate did not see it.
+            self._load_merged_tensor = (
+                UnquantizedMergedLinearMethod._load_merged_tensor)
             UnquantizedMergedLinearMethod.create_weights_jax(
                 self, layer, *weight_args, rngs=rngs, **extra_weight_attrs)
         else:

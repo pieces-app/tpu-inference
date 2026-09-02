@@ -81,6 +81,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.gemma4_mm import \
         Gemma4ForConditionalGeneration
     from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
+    from tpu_inference.models.jax.gemma4_unified import \
+        Gemma4UnifiedForConditionalGeneration
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -104,6 +106,12 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
         "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
     _MODEL_REGISTRY["Gemma4ForCausalLM"] = Gemma4ForCausalLM
     _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
+    # The dense 12B (text + encoder-free vision + audio). Registering it is
+    # what moves it off the torchax fallback: MTP requires a flax_nnx target
+    # to share embed_tokens (spec_decode/jax/eagle3.py), and the fallback
+    # never had one -- measured 2026-09-01, eval-12b-mtp refused at load.
+    _MODEL_REGISTRY[
+        "Gemma4UnifiedForConditionalGeneration"] = Gemma4UnifiedForConditionalGeneration
     _MODEL_REGISTRY["DFlashForCausalLM"] = DFlashForCausalLM
     _MODEL_REGISTRY["DFlashDraftModel"] = DFlashForCausalLM
 
