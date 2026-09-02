@@ -247,7 +247,15 @@ def get_max_min(target_dtype):
         return jnp.finfo(target_dtype).max.astype(
             jnp.float32), jnp.finfo(target_dtype).min.astype(jnp.float32)
     else:
-        return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
+        # Match the float branch: return float32 so the scale and the
+        # `data / scale` division below run in f32 for int targets too. With
+        # the bare Python int, `abs_max / 127` stayed in the DATA dtype (bf16
+        # for activations): an 8-bit-mantissa scale and an 8-bit-mantissa
+        # division feeding a 127-level rounding, while every fp8 target got
+        # f32. That biased the int8 arm of the dtype matrix and nothing else
+        # (measured 2026-09-02: int8 W8A8 capped 13/69 requests vs bf16 5).
+        return (jnp.float32(jnp.iinfo(target_dtype).max),
+                jnp.float32(jnp.iinfo(target_dtype).min))
 
 
 def quantize_block(data, axis, target_dtype):
