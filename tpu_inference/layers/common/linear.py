@@ -18,6 +18,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import gmm_v2
 
+from tpu_inference import envs
 from tpu_inference.kernels.quantized_matmul.util import (
     quantize_tensor, xla_quantized_batched_matmul)
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -95,9 +96,19 @@ def xla_quantized_matmul(
         out *= jnp.reshape(x_scale, x_scale.shape + (1, ) *
                            (out.ndim - x_scale.ndim))
     else:
+        # W8A16: bf16 activations against a quantized weight. lax.dot_general
+        # ACCEPTS the mixed pair (verified: jax 0.11.1 promotes bf16 x int8 to
+        # the preferred f32), so the explicit widen is not for correctness --
+        # it makes the int8->bf16 convert a visible, deliberate op instead of
+        # an implicit promotion. On TPU that convert is VPU work per weight per
+        # token, the same emulation cost that held fp8 at 49.7% of the HBM
+        # roofline, so this path may trade the W8A8 quality loss for speed.
+        # That trade is the experiment: TPU_ONLINE_QUANT_ACT=0 selects it, the
+        # lane measures it.
+        w_dense = w_q if w_q.dtype == x.dtype else w_q.astype(x.dtype)
         out = jax.lax.dot_general(
             x,
-            w_q,
+            w_dense,
             dimension_numbers=((xc, (0, )), ((), ())),
             preferred_element_type=jnp.float32,
         )
@@ -222,6 +233,12 @@ def sharded_quantized_matmul(x: jax.Array,
             scale_sharding = P(out_axis, )
     out_sharding = P(ShardingAxisName.ATTN_DATA, *batch_dims, out_axis)
 
+    # TPU_ONLINE_QUANT_ACT=0 forces weight-only quantization (W8A16) for every
+    # caller that left maybe_quantize_x at its default. Callers that pass
+    # False explicitly are already weight-only; callers that pass True
+    # explicitly are asking for W8A8 and are left alone.
+    if maybe_quantize_x and not envs.TPU_ONLINE_QUANT_ACT:
+        maybe_quantize_x = False
     x = jax.lax.with_sharding_constraint(
         x,
         NamedSharding(mesh, x_sharding) if mesh else x_sharding)
@@ -394,7 +411,8 @@ def sharded_quantized_batched_matmul(x: jax.Array,
         NamedSharding(mesh, x_sharding) if mesh else x_sharding)
 
     def wrapper(x, w_q, w_s):
-        _should_quantize_act = x.dtype.itemsize > 1
+        _should_quantize_act = (x.dtype.itemsize > 1
+                                and envs.TPU_ONLINE_QUANT_ACT)
         output = xla_quantized_batched_matmul(
             x,
             w_q,

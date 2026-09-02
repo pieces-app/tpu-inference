@@ -198,6 +198,7 @@ class TpuPlatform(Platform):
         # three different names, which is the false-PASS shape already in
         # runs/ (see evals #29).
         "TPU_ONLINE_QUANT_DTYPE",
+        "TPU_ONLINE_QUANT_ACT",
         "PHASED_PROFILING_DIR",
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",

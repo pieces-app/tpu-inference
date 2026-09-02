@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     # only for the OD-TPU quality panel (issue #158).
     VLLM_FP8_ONLINE_DENSE: bool = False
     ALLOW_AUDIO_WEIGHT_SKIP: bool = False
+    TPU_ONLINE_QUANT_ACT: bool = True
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
@@ -303,6 +304,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoint's entire audio capability must be stated, not defaulted into.
     "ALLOW_AUDIO_WEIGHT_SKIP":
     env_bool("ALLOW_AUDIO_WEIGHT_SKIP", default=False),
+    # W8A8 (default) vs W8A16: whether the ACTIVATION is quantized to the
+    # weight's dtype before the matmul. Default True = the historical
+    # behaviour. Set 0 for weight-only quantization -- the experiment that
+    # separates "int8 weights hurt" from "int8 activations hurt" (measured
+    # 2026-09-02: int8 W8A8 capped 13/69 requests vs bf16's 5).
+    "TPU_ONLINE_QUANT_ACT":
+    env_bool("TPU_ONLINE_QUANT_ACT", default=True),
     # Specify block quantization size
     "REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if
