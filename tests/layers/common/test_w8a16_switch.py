@@ -103,5 +103,7 @@ def test_env_flips_the_sharded_default_without_touching_explicit_callers():
 def test_env_is_forwarded_to_ray_workers():
     plat = (ROOT / "tpu_inference" / "platforms" / "tpu_platform.py").read_text()
     i = plat.index("additional_env_vars"); block = plat[i:i + 1500]
+    assert '"TPU_ONLINE_QUANT_DTYPE"' in block, (
+        "TPU_ONLINE_QUANT_DTYPE missing from the Ray passthrough: a multi-host int8 lane would serve fp8 on the workers (ti #29)")
     assert '"TPU_ONLINE_QUANT_ACT"' in block, (
         "a multi-host Ray run would silently fall back to W8A8 while the lane said W8A16 (the ti #29 shape)")

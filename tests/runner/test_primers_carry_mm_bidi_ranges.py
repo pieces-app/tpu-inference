@@ -87,3 +87,41 @@ def test_the_dummy_has_exactly_one_definition():
     assert src.count("np.zeros((self.runner.max_num_reqs, 2)") <= 1, (
         "a call site is building the dummy inline instead of calling "
         "_dummy_mm_bidi_ranges -- that is how the six sites drifted apart")
+
+
+def test_the_dummy_returns_a_built_array_and_every_site_passes_a_call():
+    """The kwarg test above proves the spelling, not the value (review
+    2026-09-02): a helper that `return None`s keeps every primer green while
+    priming a treedef the runtime never hits. So: the helper's return value
+    must be an expression containing a zeros/array construction, and every
+    primer site must pass a CALL to it, never a literal."""
+    import ast
+    tree = ast.parse(CM.read_text())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_dummy_mm_bidi_ranges")
+    parents = {}
+    for node in ast.walk(fn):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    rets = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    assert rets, "_dummy_mm_bidi_ranges has no return"
+    for r in rets:
+        if r.value is None or (isinstance(r.value, ast.Constant) and r.value.value is None):
+            # The ONE legitimate None: mm_bidi disabled, where the runtime's
+            # metadata is None too (same treedef). Any other None is the bug.
+            guard = parents.get(r)
+            assert isinstance(guard, ast.If) and "mm_bidi_enabled" in ast.unparse(guard.test), (
+                f"_dummy_mm_bidi_ranges returns None at line {r.lineno} outside the mm_bidi_enabled guard")
+    rets = [r for r in rets if r.value is not None and not (isinstance(r.value, ast.Constant) and r.value.value is None)]
+    assert rets, "_dummy_mm_bidi_ranges never returns an array"
+    built = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("zeros", "asarray", "array", "device_put", "full")
+                for r in rets for n in ast.walk(r.value))
+    assert built, "the dummy's return value is not a constructed array"
+    literal_sites = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                # the runtime site passes the real variable (a Name) -- fine;
+                # a primer passing the literal None is the bug
+                if kw.arg == "mm_bidi_ranges" and isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                    literal_sites.append(getattr(node, "lineno", "?"))
+    assert not literal_sites, f"primer sites pass mm_bidi_ranges=None (must be a call to the dummy): lines {literal_sites}"
