@@ -40,9 +40,34 @@ def _guard():
     return ns["require_audio_disabled_at_api"]
 
 
-def _cfg(limits):
+def _cfg(limits, accessor=False):
+    """`limits` as vLLM actually stores it: MMDummyOptions objects with a
+    .count, not ints. A dict of ints is ALSO accepted (older shape). With
+    accessor=True the config exposes get_limit_per_prompt(modality) -> int,
+    which is what vLLM at the pin provides (vllm/config/multimodal.py:487)."""
     mm = types.SimpleNamespace(limit_per_prompt=limits)
+    if accessor and isinstance(limits, dict):
+        mm.get_limit_per_prompt = lambda m: (getattr(limits[m], "count", limits[m]) if m in limits else 999)
     return types.SimpleNamespace(model_config=types.SimpleNamespace(multimodal_config=mm))
+
+
+class _Opt:
+    """Stand-in for vllm.config.multimodal.AudioDummyOptions: an object with a
+    .count that is NEVER == 0 as an object. This is the shape that killed two
+    lanes on 2026-09-02."""
+    def __init__(self, count): self.count = count
+
+
+def test_real_vllm_shape_count_zero_is_accepted():
+    _guard()(AUDIO, _cfg({"image": _Opt(1), "audio": _Opt(0), "video": _Opt(0)}), "Gemma4ForConditionalGeneration")
+    _guard()(AUDIO, _cfg({"image": _Opt(1), "audio": _Opt(0)}, accessor=True), "Gemma4ForConditionalGeneration")
+
+
+def test_real_vllm_shape_count_one_is_refused():
+    with pytest.raises(ValueError):
+        _guard()(AUDIO, _cfg({"image": _Opt(1), "audio": _Opt(1)}), "Gemma4ForConditionalGeneration")
+    with pytest.raises(ValueError):
+        _guard()(AUDIO, _cfg({"image": _Opt(1), "audio": _Opt(1)}, accessor=True), "Gemma4ForConditionalGeneration")
 
 
 AUDIO = object()  # any non-None audio_config

@@ -678,11 +678,32 @@ def require_audio_disabled_at_api(audio_cfg, vllm_config, cls_name):
         return
     mm = getattr(getattr(vllm_config, "model_config", None),
                  "multimodal_config", None)
+    # vLLM's limit_per_prompt values are MMDummyOptions OBJECTS
+    # (AudioDummyOptions(count=0, ...)), not ints. The first version of this
+    # guard compared that object to 0, which is never equal, and so REFUSED
+    # every lane that had set audio:0 exactly as told -- eval-e2b-base and
+    # eval-e4b-int8 died at boot on 2026-09-02 21:41Z/21:43Z with this
+    # function's own message. Use the accessor vLLM provides for this.
+    audio_limit = None
+    if mm is not None:
+        if hasattr(mm, "get_limit_per_prompt"):
+            try:
+                audio_limit = int(mm.get_limit_per_prompt("audio"))
+            except Exception:  # noqa: BLE001 -- fall through to the raw value
+                audio_limit = None
+        if audio_limit is None:
+            raw = (getattr(mm, "limit_per_prompt", None) or {}).get("audio")
+            if raw is None:
+                audio_limit = None
+            elif hasattr(raw, "count"):
+                audio_limit = int(raw.count)
+            else:
+                audio_limit = int(raw)
     limits = getattr(mm, "limit_per_prompt", None) or {}
-    if limits.get("audio", 1) != 0:
+    if audio_limit != 0:
         raise ValueError(
             "ALLOW_AUDIO_WEIGHT_SKIP=1 says serve text+vision only, but the "
-            f"server still accepts audio (limit_per_prompt={dict(limits) or 'unset'}). "
+            f"server still accepts audio (audio limit={audio_limit!r}, limit_per_prompt={dict(limits) or 'unset'}). "
             f"{cls_name} has no audio tower, so the first audio request "
             "returns zero multimodal embeddings and the runner's assertion "
             "kills EngineCore. Add --limit-mm-per-prompt "
