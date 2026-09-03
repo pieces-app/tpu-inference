@@ -100,6 +100,7 @@ def _convert_to_torchax_and_shard(tensor: torch.Tensor,
             # so a module-level import back would be circular (#3400 patch).
             from tpu_inference.layers.vllm.quantization.unquantized import \
                 _release_cpu_storage
+
             # Generate random values directly on TPU.
             _release_cpu_storage(tensor)
             return torch_view(

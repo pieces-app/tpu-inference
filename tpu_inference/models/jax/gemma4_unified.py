@@ -54,7 +54,6 @@ The multimodal front end is DELIBERATELY NOT QUANTIZED (quant_config=None):
 the ten vision tensors are ~24 MB, quantizing them buys nothing, and the
 torchax lane excludes them for the same reason (ti #22).
 """
-import functools
 from typing import Any, Callable, Iterable, List, Optional, Tuple, TypedDict
 
 import jax
@@ -74,16 +73,17 @@ from tpu_inference.layers.jax.norm import JaxLayerNorm
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM, Gemma4Model
 from tpu_inference.models.jax.gemma4_mm import (POSITIONS_PAD_VALUE,
-                                                 Gemma4ImagePixelInputs,
-                                                 Gemma4MultimodalEmbedder,
-                                                 init_fn)
+                                                Gemma4ImagePixelInputs,
+                                                Gemma4MultimodalEmbedder,
+                                                init_fn)
 from tpu_inference.models.jax.gemma4_unified_math import factorized_posemb
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.multi_modal_utils import \
     merge_multimodal_embeddings
-from tpu_inference.models.jax.utils.weight_utils import (
-    JaxAutoWeightsLoader, LoadableWithIterator, StandardWeightLoader)
+from tpu_inference.models.jax.utils.weight_utils import (JaxAutoWeightsLoader,
+                                                         LoadableWithIterator,
+                                                         StandardWeightLoader)
 
 logger = init_logger(__name__)
 
@@ -256,8 +256,7 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         self.patch_pixels = vision_config.model_patch_size**2 * 3
 
         self.final_logit_softcapping = getattr(hf.text_config,
-                                               "final_logit_softcapping",
-                                               None)
+                                               "final_logit_softcapping", None)
 
         if not hf.tie_word_embeddings:
             if self.model.language_model.is_last_rank:
@@ -289,14 +288,17 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
                 f"built={self.model.embed_audio is not None}; refusing to "
                 "load a model whose audio capability disagrees with its "
                 "config.")
-        mapper = WeightsMapper(orig_to_new_prefix={"model.lm_head.": "lm_head."})
+        mapper = WeightsMapper(
+            orig_to_new_prefix={"model.lm_head.": "lm_head."})
         loader = JaxAutoWeightsLoader(
             self,
-            skip_prefixes=(["lm_head"] if not hasattr(self, "lm_head") else []),
+            skip_prefixes=(["lm_head"]
+                           if not hasattr(self, "lm_head") else []),
             # ONLY quantization statistics. NO "audio_tower"/"embed_audio":
             # the whole point of this class is that it loads them.
-            skip_substrs=[".input_max", ".input_min", ".output_max",
-                          ".output_min"],
+            skip_substrs=[
+                ".input_max", ".input_min", ".output_max", ".output_min"
+            ],
         )
         return loader.load_weights(mapper.apply(weights))
 
@@ -307,9 +309,9 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
                         **kwargs) -> jax.Array:
         inputs_embeds = self.model.language_model.embed_tokens(input_ids)
         target_dtype = inputs_embeds.dtype
-        inputs_embeds = (inputs_embeds *
-                         self.model.language_model.embedding_scale).astype(
-                             target_dtype)
+        inputs_embeds = (
+            inputs_embeds *
+            self.model.language_model.embedding_scale).astype(target_dtype)
         if multimodal_embeddings is not None and multimodal_embeddings.shape[
                 0] > 0:
             # BOTH placeholder ids: image AND audio soft tokens are merged.
@@ -328,8 +330,8 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         valid = jnp.logical_not(
             jnp.all(pixel_position_ids == POSITIONS_PAD_VALUE, axis=-1))
         projected = jax.lax.with_sharding_constraint(
-            projected, NamedSharding(self.mesh, PartitionSpec(None, None,
-                                                              None)))
+            projected, NamedSharding(self.mesh,
+                                     PartitionSpec(None, None, None)))
         return projected, valid
 
     @jax.jit
@@ -364,11 +366,11 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
             return None
         if isinstance(feats, torch.Tensor):
             if feats.dtype == torch.bfloat16:
-                feats = jnp.asarray(
-                    feats.contiguous().view(torch.int16).numpy().view(
-                        jnp.bfloat16))
+                feats = jnp.asarray(feats.contiguous().view(
+                    torch.int16).numpy().view(jnp.bfloat16))
             else:
-                feats = jnp.asarray(feats.to(torch.float32).contiguous().numpy())
+                feats = jnp.asarray(
+                    feats.to(torch.float32).contiguous().numpy())
         if isinstance(mask, torch.Tensor):
             mask = jnp.asarray(mask.to(torch.bool).contiguous().numpy())
         if mask is None:
@@ -397,8 +399,8 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         # because the valid count differs per image.
         out: list[jax.Array] = []
         for i in range(pv.shape[0]):
-            proj, valid = self.get_single_image_embedding(pv[i:i + 1],
-                                                          pp[i:i + 1])
+            proj, valid = self.get_single_image_embedding(
+                pv[i:i + 1], pp[i:i + 1])
             out.append(proj[0][valid[0]])
         return out
 
@@ -488,8 +490,9 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
             logits = self.model.language_model.embed_tokens.decode(
                 hidden_states)
         if self.final_logit_softcapping is not None:
-            logits = jnp.tanh(logits / self.final_logit_softcapping
-                              ) * self.final_logit_softcapping
+            logits = jnp.tanh(
+                logits /
+                self.final_logit_softcapping) * self.final_logit_softcapping
         return logits
 
     def precompile_vision_encoder(self, run_compilation_fn: Callable) -> None:
@@ -503,9 +506,9 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         pv = jnp.ones((1, self.max_soft_tokens, self.patch_pixels),
                       dtype=jax_dtype)
         pp = jnp.ones((1, self.max_soft_tokens, 2), dtype=jnp.int32)
-        run_compilation_fn("vision_encoder",
-                           self.get_single_image_embedding,
-                           pv,
-                           pp,
-                           image_shape=[self.max_soft_tokens,
-                                        self.patch_pixels])
+        run_compilation_fn(
+            "vision_encoder",
+            self.get_single_image_embedding,
+            pv,
+            pp,
+            image_shape=[self.max_soft_tokens, self.patch_pixels])

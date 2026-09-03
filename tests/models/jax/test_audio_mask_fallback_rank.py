@@ -21,10 +21,13 @@ def _fallback_expr():
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
               and n.name == "_parse_and_validate_audio_input")
     for node in ast.walk(fn):
-        if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "mask" for t in node.targets)
-                and isinstance(node.value, ast.Call) and ast.unparse(node.value.func).endswith("ones")):
+        if (isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "mask"
+                for t in node.targets) and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func).endswith("ones")):
             return ast.unparse(node.value)
-    raise AssertionError("no `mask = ...ones(...)` fallback in _parse_and_validate_audio_input")
+    raise AssertionError(
+        "no `mask = ...ones(...)` fallback in _parse_and_validate_audio_input")
 
 
 def test_fallback_mask_uses_all_but_the_feature_dim():
@@ -41,8 +44,10 @@ def test_the_rule_gives_the_gatherable_shape(shape):
     feats = jnp.zeros(shape, jnp.bfloat16)
     mask = jnp.ones(feats.shape[:-1], dtype=bool)
     if feats.ndim == 2:
-        feats = jnp.expand_dims(feats, 0); mask = jnp.expand_dims(mask, 0)
-    emb = jnp.zeros(feats.shape[:2] + (3840,), jnp.bfloat16)   # what get_audio_embedding returns
+        feats = jnp.expand_dims(feats, 0)
+        mask = jnp.expand_dims(mask, 0)
+    emb = jnp.zeros(feats.shape[:2] + (3840, ),
+                    jnp.bfloat16)  # what get_audio_embedding returns
     out = [emb[i][mask[i]] for i in range(emb.shape[0])]
     assert all(o.shape == (feats.shape[1], 3840) for o in out)
 
@@ -52,8 +57,9 @@ def test_the_old_rule_breaks_rank_2():
     rank-2 input yields a mask the gather cannot use."""
     jnp = pytest.importorskip("jax").numpy
     feats = jnp.zeros((37, 640), jnp.bfloat16)
-    mask = jnp.ones(feats.shape[:2], dtype=bool)          # the old rule
-    feats = jnp.expand_dims(feats, 0); mask = jnp.expand_dims(mask, 0)
+    mask = jnp.ones(feats.shape[:2], dtype=bool)  # the old rule
+    feats = jnp.expand_dims(feats, 0)
+    mask = jnp.expand_dims(mask, 0)
     emb = jnp.zeros((1, 37, 3840), jnp.bfloat16)
     with pytest.raises(Exception):
         _ = emb[0][mask[0]]

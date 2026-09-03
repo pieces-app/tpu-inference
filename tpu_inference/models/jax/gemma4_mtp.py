@@ -135,10 +135,10 @@ class Gemma4MTPMaskedEmbedder(JaxModule):
         return output
 
     def get_top_tokens(
-        self,
-        hidden_states: jax.Array,
-        lm_head_weight: jax.Array,
-        suppress_token_ids: tuple = (),
+            self,
+            hidden_states: jax.Array,
+            lm_head_weight: jax.Array,
+            suppress_token_ids: tuple = (),
     ) -> jax.Array:
         """Sparse argmax — returns vocab token IDs directly.
 
@@ -587,8 +587,8 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
         # never in code. Verified against the actual assistant artifacts
         # 2026-09-01: generation_config carries exactly [258883, 258882] and
         # the checkpoint has NO mm tensor prefixes (no loader change needed).
-        gen_cfg = (vllm_config.speculative_config.draft_model_config
-                   .try_get_generation_config())
+        gen_cfg = (vllm_config.speculative_config.draft_model_config.
+                   try_get_generation_config())
         raw = (gen_cfg.get("suppress_tokens") or ()) if gen_cfg else ()
         try:
             ids = tuple(sorted({int(t) for t in raw}))

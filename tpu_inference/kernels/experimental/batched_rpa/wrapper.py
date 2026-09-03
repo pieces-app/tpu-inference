@@ -361,7 +361,9 @@ def ragged_paged_attention(
         (configs.RpaCase.MIXED, prefill_block_sizes, "prefill"),
     ):
         blocks = blocks_override or get_tuned_params(
-            model_cfgs, serve_cfgs, case=case,
+            model_cfgs,
+            serve_cfgs,
+            case=case,
             vmem_limit_bytes=vmem_limit_bytes)
         mode_cfgs = configs.RpaConfigs(
             block=blocks,

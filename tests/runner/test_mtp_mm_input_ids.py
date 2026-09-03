@@ -102,7 +102,9 @@ class TestMtpMmInputIdsPreserved:
             MagicMock(),  # spec_decode_metadata (draft tokens scheduled)
             None,  # logits_indices_selector
             8,  # padded_num_reqs
-            {0: []},  # req_ids_dp
+            {
+                0: []
+            },  # req_ids_dp
             0,  # padded_num_scheduled_tokens_per_dp_rank
             None,  # tokens_indices_selector
             None,  # shared_attn_metadata
@@ -130,8 +132,10 @@ class TestMtpMmInputIdsPreserved:
         runner.kv_caches = MagicMock()
         runner.lora_utils = MagicMock()
 
-        model_fn = MagicMock(return_value=(MagicMock(), jnp.zeros(
-            (num_tokens, hidden_size)), None, None))
+        model_fn = MagicMock(return_value=(MagicMock(),
+                                           jnp.zeros((num_tokens,
+                                                      hidden_size)), None,
+                                           None))
         runner.model_fn = model_fn
         runner.compute_logits_fn = MagicMock(return_value=jnp.zeros((2, 16)))
         # Shadow the jitted staticmethod with a passthrough.

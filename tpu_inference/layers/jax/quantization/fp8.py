@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Sequence
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference.layers.common.linear import sharded_quantized_batched_matmul
@@ -31,13 +30,12 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
     FusedMoEWeights, process_quantized_moe_weights)
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.quantization import quantize_tensor
-from tpu_inference.layers.common.utils import \
-    reorder_concatenated_tensor_for_sharding
-from tpu_inference.layers.common.quantization.online_fp8_requant import (
-    ONLINE_QUANT_DTYPE_ENV, online_quant_dtype)
+from tpu_inference.layers.common.quantization.online_fp8_requant import \
+    online_quant_dtype
 from tpu_inference.layers.common.quantization.online_host_quant import (
     HostQuantRequest, adopt_host_quant_scale, request_host_quant)
-from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
+from tpu_inference.layers.common.utils import (
+    cpu_mesh, cpu_mesh_context, reorder_concatenated_tensor_for_sharding)
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
 from tpu_inference.layers.jax.linear import (JaxEinsum,
@@ -947,8 +945,11 @@ class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
             UnquantizedMergedLinearMethod.create_weights_jax(
                 self, layer, *weight_args, rngs=rngs, **extra_weight_attrs)
         else:
-            UnquantizedLinearMethod.create_weights_jax(
-                self, layer, *weight_args, rngs=rngs, **extra_weight_attrs)
+            UnquantizedLinearMethod.create_weights_jax(self,
+                                                       layer,
+                                                       *weight_args,
+                                                       rngs=rngs,
+                                                       **extra_weight_attrs)
 
         # Ask the loader to quantize this kernel on the HOST and place only
         # (w_q, w_s). MEASURED 2026-09-02 23:09Z: requanting after placement
@@ -1061,8 +1062,8 @@ class Fp8OnlineConfig(Fp8Config):
 
     def get_quant_method(self, layer: JaxModule,
                          prefix: str) -> Optional[QuantizeMethodBase]:
-        from tpu_inference.layers.jax.quantization.unquantized import (
-            UnquantizedFusedMoEMethod)
+        from tpu_inference.layers.jax.quantization.unquantized import \
+            UnquantizedFusedMoEMethod
         if isinstance(layer, (JaxRoutedExperts, JaxMoE)):
             # Experts keep the orthogonal, already-serving requant path
             # (MOE_REQUANTIZE_WEIGHT_DTYPE) -- never double-quantized here.
@@ -1080,9 +1081,9 @@ class Fp8OnlineConfig(Fp8Config):
             # ~2% of a 26B checkpoint; the HBM case for fp8 is the text
             # stack.
             low = prefix.lower()
-            if any(s in low for s in ("router", "vision", "audio", "mm_",
-                                      "multi_modal", "multimodal",
-                                      "embed_vision", "embed_audio")):
+            if any(s in low
+                   for s in ("router", "vision", "audio", "mm_", "multi_modal",
+                             "multimodal", "embed_vision", "embed_audio")):
                 return UnquantizedLinearMethod(linear_config)
             return Fp8OnlineLinearMethod(layer, linear_config)
         return None

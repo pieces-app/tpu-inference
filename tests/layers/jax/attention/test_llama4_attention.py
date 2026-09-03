@@ -27,11 +27,11 @@ from dataclasses import dataclass, field
 # flags in one string is undefined, and a test that needs more devices than the
 # environment granted should SKIP VISIBLY rather than silently disagree with
 # the count everything else is using.
-if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+if "xla_force_host_platform_device_count" not in os.environ.get(
+        "XLA_FLAGS", ""):
     os.environ["XLA_FLAGS"] = (
-        os.environ.get("XLA_FLAGS", "")
-        + " --xla_force_host_platform_device_count=8"
-    ).strip()
+        os.environ.get("XLA_FLAGS", "") +
+        " --xla_force_host_platform_device_count=8").strip()
 
 import jax
 import jax.numpy as jnp

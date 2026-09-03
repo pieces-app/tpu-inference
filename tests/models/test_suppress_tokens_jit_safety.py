@@ -29,6 +29,7 @@ def _make(cached: bool):
     cache; `not cached` mirrors the p9 fix (rebuild every call)."""
 
     class Model:
+
         def __init__(self):
             self._cache = None
 
@@ -49,9 +50,7 @@ def _suppressed_correctly(result) -> bool:
     r = np.asarray(result)
     return bool(
         np.isinf(r[:, SUPPRESS[0]]).all()
-        and np.isinf(r[:, SUPPRESS[1]]).all()
-        and not np.isinf(r[:, 0]).any()
-    )
+        and np.isinf(r[:, SUPPRESS[1]]).all() and not np.isinf(r[:, 0]).any())
 
 
 def _warmup(fn, batch):

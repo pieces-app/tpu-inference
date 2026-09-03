@@ -256,17 +256,17 @@ def test_signed_int4_codes_bit_exact(pattern):
     out_features, in_features, group_size = 8, 128, 32
 
     if pattern == "all_16_codes":
-        q = torch.arange(-8, 8, dtype=torch.int8).repeat(
-            out_features, in_features // 16)
+        q = torch.arange(-8, 8,
+                         dtype=torch.int8).repeat(out_features,
+                                                  in_features // 16)
     else:
         q = torch.empty((out_features, in_features), dtype=torch.int8)
         q[:, 0::2], q[:, 1::2] = -8, 7
         q[1::2, 0::2], q[1::2, 1::2] = 7, -8  # both nibble phases
     assert int(q.min()) == -8 and int(q.max()) == 7
 
-    scale = (torch.rand(out_features,
-                        in_features // group_size,
-                        dtype=torch.float32) + 0.01)
+    scale = (torch.rand(
+        out_features, in_features // group_size, dtype=torch.float32) + 0.01)
     args = QuantizationArgs(
         num_bits=4,
         type="int",
@@ -278,7 +278,8 @@ def test_signed_int4_codes_bit_exact(pattern):
     packed = pack_to_int32(q, num_bits=4)
     ref_dequant = dequantize(q, scale, args=args, dtype=torch.float32)
 
-    ours_uint = unpack_quantized_values_into_int32(packed, scalar_types.uint4,
+    ours_uint = unpack_quantized_values_into_int32(packed,
+                                                   scalar_types.uint4,
                                                    packed_dim=1)
     ours_q = t2j(ours_uint, use_dlpack=False) - 8
     np.testing.assert_array_equal(
@@ -583,8 +584,7 @@ def test_qkv_parallel_linear(model, bias, fuse_matmuls, num_devices):
 @pytest.mark.parametrize("fuse_matmuls", [False, True])
 @pytest.mark.parametrize("num_devices", [1, 4], ids=["tp1", "tp4"])
 @pytest.mark.parametrize("model", MODELS)
-def test_merged_column_parallel_linear(model, bias, fuse_matmuls,
-                                       num_devices):
+def test_merged_column_parallel_linear(model, bias, fuse_matmuls, num_devices):
     """See test_qkv_parallel_linear: TP>1 makes the fused reorder real."""
     mesh = require_devices(num_devices)
     dtype = torch.bfloat16
@@ -714,8 +714,6 @@ def test_stored_weights_dequant_bit_exact_per_group(model):
     _stored_dequant_bit_exact(layer)
 
 
-
-
 def _rebuild_layer_with_group_size(layer, group_size: int):
     """Swap the checkpoint-derived scheme (group 64 for the test model) for
     a directly constructed WNA16 scheme with ``group_size`` and re-create
@@ -729,8 +727,8 @@ def _rebuild_layer_with_group_size(layer, group_size: int):
         strategy="group",
         group_size=group_size,
     )
-    scheme = VllmCompressedTensorsWNA16(
-        weight_quant=weight_quant, linear_config=old_scheme.linear_config)
+    scheme = VllmCompressedTensorsWNA16(weight_quant=weight_quant,
+                                        linear_config=old_scheme.linear_config)
     for name in ("weight_packed", "weight_scale", "weight_shape"):
         if hasattr(layer, name):
             delattr(layer, name)
@@ -826,19 +824,18 @@ def test_forward_alternating_extreme_codes(model):
     q = torch.empty((out_features, in_features), dtype=torch.int8)
     q[:, 0::2], q[:, 1::2] = -8, 7
     q[1::2, 0::2], q[1::2, 1::2] = 7, -8  # both nibble phases
-    scale = (torch.rand(out_features,
-                        in_features // group_size,
-                        dtype=torch.float32) * 0.05 + 0.01).to(dtype)
+    scale = (torch.rand(
+        out_features, in_features // group_size, dtype=torch.float32) * 0.05 +
+             0.01).to(dtype)
 
     # Reference-packed, exactly as serialized on disk (bit-compatibility
     # with vllm's unpack is proven by test_signed_int4_codes_bit_exact).
     layer.weight_packed.data = pack_to_int32(q, num_bits=4)
     layer.weight_scale.data = scale
 
-    w_float = (q.to(torch.float32) * scale.to(torch.float32).
-               repeat_interleave(group_size, dim=1))
-    x = ((torch.rand(4, in_features, dtype=torch.float32) - 0.5) /
-         5).to(dtype)
+    w_float = (q.to(torch.float32) *
+               scale.to(torch.float32).repeat_interleave(group_size, dim=1))
+    x = ((torch.rand(4, in_features, dtype=torch.float32) - 0.5) / 5).to(dtype)
     ref = torch.einsum('bd,fd->bf', x.to(torch.float32), w_float)
 
     with torchax.default_env():
@@ -900,10 +897,10 @@ def test_forward_two_shapes_one_process(model):
                 refs[batch],
                 rtol=0.05,
                 atol=0.05,
-                msg=lambda m, b=batch: (
-                    f"forward at batch={b} diverged from its reference "
-                    f"after another shape was traced in the same process "
-                    f"(trace-cached state reuse): {m}"))
+                msg=lambda m, b=batch:
+                (f"forward at batch={b} diverged from its reference "
+                 f"after another shape was traced in the same process "
+                 f"(trace-cached state reuse): {m}"))
 
 
 def _weight_args(**overrides):
@@ -926,9 +923,8 @@ def test_is_wNa16_group_predicate_screens_configs():
     assert is_wNa16_group(ok, None, pack)
 
     # Screened here (fall through to the explicit weight-only refusal):
-    assert not is_wNa16_group(
-        _weight_args(strategy="channel", group_size=None), None,
-        pack)  # channelwise int4
+    assert not is_wNa16_group(_weight_args(
+        strategy="channel", group_size=None), None, pack)  # channelwise int4
     assert not is_wNa16_group(_weight_args(num_bits=8), None, pack)  # w8
     assert not is_wNa16_group(ok, None, "int-quantized")  # non-pack format
     assert not is_wNa16_group(ok, None, None)  # missing format
@@ -1000,8 +996,7 @@ def test_w4a16_moe_dispatch_fails_closed():
     non-serialized guard one dispatch table over."""
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 
-    from tpu_inference.layers.vllm.quantization.compressed_tensors \
-        .compressed_tensors_moe.compressed_tensors_moe import \
+    from tpu_inference.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import \
         VllmCompressedTensorsMoEMethod
 
     weight_quant = QuantizationArgs(num_bits=4,
@@ -1035,10 +1030,9 @@ def test_w4a16_moe_dispatch_fails_closed():
         "weights": weight_quant,
         "input_activations": MagicMock(num_bits=8),
     }
-    with patch(
-            "tpu_inference.layers.vllm.quantization.compressed_tensors"
-            ".compressed_tensors_moe.compressed_tensors_moe_w4a8"
-            ".VllmCompressedTensorsW4A8MoEMethod") as ctor:
+    with patch("tpu_inference.layers.vllm.quantization.compressed_tensors"
+               ".compressed_tensors_moe.compressed_tensors_moe_w4a8"
+               ".VllmCompressedTensorsW4A8MoEMethod") as ctor:
         VllmCompressedTensorsMoEMethod.get_moe_method(
             quant_config, layer, "model.layers.0.mlp.experts")
         ctor.assert_called_once()
@@ -1085,9 +1079,8 @@ def _spy_gmm_v2(calls: list):
 
 def _stored_scales(layer) -> list:
     stored = layer.weight_scale
-    return list(stored) if isinstance(stored, torch.nn.ParameterList) else [
-        stored
-    ]
+    return list(stored) if isinstance(stored,
+                                      torch.nn.ParameterList) else [stored]
 
 
 @pytest.mark.parametrize("model", MODELS)

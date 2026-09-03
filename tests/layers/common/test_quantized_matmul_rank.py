@@ -53,17 +53,22 @@ def _mod():
 
     class _Axis(str):
         pass
+
     sharding_stub = types.ModuleType("tpu_inference.layers.common.sharding")
     sharding_stub.ShardingAxisName = type(
-        "ShardingAxisName", (), {n: _Axis(n) for n in
-                                 ("ATTN_DATA", "MLP", "VOCAB", "MODEL",
-                                  "DATA", "EXPERT", "ATTN_HEAD")})
+        "ShardingAxisName", (), {
+            n: _Axis(n)
+            for n in ("ATTN_DATA", "MLP", "VOCAB", "MODEL", "DATA", "EXPERT",
+                      "ATTN_HEAD")
+        })
     sys.modules.setdefault("tpu_inference.layers.common.sharding",
                            sharding_stub)
 
     class _Logger:
+
         def __getattr__(self, _):
             return lambda *a, **k: None
+
     logger_stub = types.ModuleType("tpu_inference.logger")
     logger_stub.init_logger = lambda *a, **k: _Logger()
     sys.modules.setdefault("tpu_inference.logger", logger_stub)
@@ -114,9 +119,8 @@ def _weight_quant(w):
     """Per-output-channel e4m3 via the REAL common-leaf primitive."""
     import jax.numpy as jnp
     qspec = importlib.util.spec_from_file_location(
-        "_q_leaf2",
-        ROOT / "tpu_inference" / "layers" / "common" / "quantization" /
-        "__init__.py")
+        "_q_leaf2", ROOT / "tpu_inference" / "layers" / "common" /
+        "quantization" / "__init__.py")
     qmod = importlib.util.module_from_spec(qspec)
     qspec.loader.exec_module(qmod)
     return qmod.quantize_tensor(jnp.float8_e4m3fn, w, axis=0)
@@ -148,19 +152,24 @@ def test_rank_n_equals_rank_2_on_flattened_input(lead):
 
     flat = m.xla_quantized_matmul(x.reshape(-1, in_f), w_q, w_s)
     assert flat.shape == (int(jnp.prod(jnp.array(lead))), out_f)
-    diff = float(jnp.max(jnp.abs(out.reshape(-1, out_f).astype(jnp.float32) -
-                                 flat.astype(jnp.float32))))
+    diff = float(
+        jnp.max(
+            jnp.abs(
+                out.reshape(-1, out_f).astype(jnp.float32) -
+                flat.astype(jnp.float32))))
     assert diff == 0.0, (
         f"rank-{len(lead)+1} result differs from the flattened rank-2 result "
         f"by {diff} -- the leading axes are not pure batch")
 
 
-@pytest.mark.parametrize("dtype_name", [
-    "float8_e4m3fn",        # the historical default
-    "float8_e4m3b11fnuz",   # what a v6e (<gen 7) ingests without a cast
-    "float8_e5m2",
-    "int8",                 # ~2x bf16 FLOPs on v6e -- the real throughput lever
-])
+@pytest.mark.parametrize(
+    "dtype_name",
+    [
+        "float8_e4m3fn",  # the historical default
+        "float8_e4m3b11fnuz",  # what a v6e (<gen 7) ingests without a cast
+        "float8_e5m2",
+        "int8",  # ~2x bf16 FLOPs on v6e -- the real throughput lever
+    ])
 def test_every_online_quant_dtype_computes_at_rank_3(dtype_name):
     """Each dtype `Fp8OnlineLinearMethod` can select must survive the whole
     path -- weight quant, activation quant, contraction -- at rank 3.
@@ -176,9 +185,8 @@ def test_every_online_quant_dtype_computes_at_rank_3(dtype_name):
     m = _mod()
     dtype = getattr(jnp, dtype_name)
     qspec = importlib.util.spec_from_file_location(
-        "_q_leaf3",
-        ROOT / "tpu_inference" / "layers" / "common" / "quantization" /
-        "__init__.py")
+        "_q_leaf3", ROOT / "tpu_inference" / "layers" / "common" /
+        "quantization" / "__init__.py")
     qmod = importlib.util.module_from_spec(qspec)
     qspec.loader.exec_module(qmod)
 
@@ -193,8 +201,9 @@ def test_every_online_quant_dtype_computes_at_rank_3(dtype_name):
     assert out.shape == (2, 3, out_f)
 
     ref = jnp.einsum("...i,io->...o", x.astype(jnp.float32), w)
-    rel = float(jnp.max(jnp.abs(out.astype(jnp.float32) - ref)) /
-                jnp.max(jnp.abs(ref)))
+    rel = float(
+        jnp.max(jnp.abs(out.astype(jnp.float32) - ref)) /
+        jnp.max(jnp.abs(ref)))
     # Loose: this asserts "quantization happened and did not destroy the
     # signal", not a quality bar. Quality is a hardware measurement.
     assert rel < 0.35, (

@@ -225,9 +225,8 @@ class QuantLinearConfig(CommonQuantLinearConfig):
         # MODEL CONSTRUCTION, turning a quantization detail into a boot
         # failure. Fall back to out_features_sharding, which is what "the TP
         # axis of the OUTPUT" means and which both branches always define.
-        _out_axis = (self.weight_sharding[1]
-                     if len(self.weight_sharding) > 1 else
-                     (self.out_features_sharding[0]
-                      if self.out_features_sharding else None))
+        _out_axis = (self.weight_sharding[1] if len(self.weight_sharding) > 1
+                     else (self.out_features_sharding[0]
+                           if self.out_features_sharding else None))
         self.n_shards = get_mesh_shape_product(
             jax.sharding.get_abstract_mesh(), _out_axis)

@@ -66,8 +66,10 @@ _IDENTITY_PUT = lambda x, spec: x  # noqa: E731
 def _bf16_weight(shape, seed):
     import jax
     import jax.numpy as jnp
-    w = (jax.random.normal(jax.random.PRNGKey(seed), shape) * 2.0).astype(jnp.bfloat16)
-    return w.at[..., 3].set(0)  # a whole zero OUTPUT column: the scale-0 branch
+    w = (jax.random.normal(jax.random.PRNGKey(seed), shape) * 2.0).astype(
+        jnp.bfloat16)
+    return w.at[...,
+                3].set(0)  # a whole zero OUTPUT column: the scale-0 branch
 
 
 def _bits(a):
@@ -83,18 +85,26 @@ def test_host_path_is_bit_identical_to_the_eager_device_path(name):
     w = _bf16_weight((256, 384), 1)
     # The pre-fix on-device call, verbatim (fp8.py: quantize_tensor(dtype, w2d, axis=0)).
     e_q, e_s = q.quantize_tensor(dtype, w, axis=0)
-    assert float(e_s[3]) == 0.0 and int(np.asarray(e_q.astype(jnp.float32))[0, 3]) == 0, (
-        "the zero column did not take the scale-0 branch; the test input is wrong")
+    assert float(e_s[3]) == 0.0 and int(
+        np.asarray(e_q.astype(jnp.float32))[0, 3]
+    ) == 0, (
+        "the zero column did not take the scale-0 branch; the test input is wrong"
+    )
 
     p = _Param()
-    h.request_host_quant(p, h.HostQuantRequest(dtype, (256, 384), (None, None), (None, )))
+    h.request_host_quant(
+        p, h.HostQuantRequest(dtype, (256, 384), (None, None), (None, )))
     assert h.place_host_quantized(p, w, mesh=_NOWHERE, put=_IDENTITY_PUT)
     w_s = h.adopt_host_quant_scale(p)
 
     assert p.value.dtype == dtype and w_s.dtype == jnp.float32
     assert p.value.shape == e_q.shape and w_s.shape == e_s.shape
-    assert np.array_equal(_bits(p.value), _bits(e_q)), f"{name}: codes differ between the host and device paths"
-    assert np.array_equal(_bits(w_s), _bits(e_s)), f"{name}: scales differ between the host and device paths"
+    assert np.array_equal(
+        _bits(p.value),
+        _bits(e_q)), f"{name}: codes differ between the host and device paths"
+    assert np.array_equal(
+        _bits(w_s),
+        _bits(e_s)), f"{name}: scales differ between the host and device paths"
 
 
 def test_three_d_kernel_is_flattened_exactly_as_the_device_path_did():
@@ -105,14 +115,16 @@ def test_three_d_kernel_is_flattened_exactly_as_the_device_path_did():
     w = _bf16_weight((4, 32, 64), 2)
     e_q, e_s = q.quantize_tensor(jnp.int8, w.reshape(128, 64), axis=0)
     p = _Param()
-    h.request_host_quant(p, h.HostQuantRequest(jnp.int8, (128, 64), ("model", None), (None, )))
+    h.request_host_quant(
+        p, h.HostQuantRequest(jnp.int8, (128, 64), ("model", None), (None, )))
     assert h.place_host_quantized(p, w, mesh=_NOWHERE, put=_IDENTITY_PUT)
     assert p.value.shape == (128, 64)
     assert np.array_equal(_bits(p.value), _bits(e_q))
     assert np.array_equal(_bits(h.adopt_host_quant_scale(p)), _bits(e_s))
 
 
-def test_quantize_on_host_is_quantize_tensor_jitted_not_a_second_implementation():
+def test_quantize_on_host_is_quantize_tensor_jitted_not_a_second_implementation(
+):
     src = LEAF.read_text()
     assert "jax.jit(quantize_tensor" in src, "the host path must jit the shipped primitive"
     assert "def quantize_tensor" not in src, "a re-implementation could drift from the device path"
@@ -123,9 +135,14 @@ def test_specs_reach_put_verbatim_weight_then_scale():
     q, h = _leaves()
     seen = []
     p = _Param()
-    h.request_host_quant(p, h.HostQuantRequest(jnp.int8, (64, 32), (None, "model"), ("model", )))
-    assert h.place_host_quantized(p, _bf16_weight((64, 32), 3), mesh=_NOWHERE,
-                                  put=lambda x, spec: (seen.append((x.shape, spec)), x)[1])
+    h.request_host_quant(
+        p, h.HostQuantRequest(jnp.int8, (64, 32), (None, "model"),
+                              ("model", )))
+    assert h.place_host_quantized(p,
+                                  _bf16_weight((64, 32), 3),
+                                  mesh=_NOWHERE,
+                                  put=lambda x, spec: (seen.append(
+                                      (x.shape, spec)), x)[1])
     assert seen == [((64, 32), (None, "model")), ((32, ), ("model", ))], seen
 
 
@@ -133,18 +150,24 @@ def test_the_scale_is_parked_once_and_adopted_once():
     import jax.numpy as jnp
     q, h = _leaves()
     p = _Param()
-    h.request_host_quant(p, h.HostQuantRequest(jnp.int8, (64, 32), (None, None), (None, )))
-    assert h.place_host_quantized(p, _bf16_weight((64, 32), 4), mesh=_NOWHERE, put=_IDENTITY_PUT)
+    h.request_host_quant(
+        p, h.HostQuantRequest(jnp.int8, (64, 32), (None, None), (None, )))
+    assert h.place_host_quantized(p,
+                                  _bf16_weight((64, 32), 4),
+                                  mesh=_NOWHERE,
+                                  put=_IDENTITY_PUT)
     first = h.adopt_host_quant_scale(p)
     assert first is not None and first.shape == (32, )
-    assert h.adopt_host_quant_scale(p) is None, "adoption must clear the parked reference"
+    assert h.adopt_host_quant_scale(
+        p) is None, "adoption must clear the parked reference"
     assert p.md[h.HOST_QUANT_SCALE] is None
 
 
 def test_without_a_request_nothing_is_touched():
     q, h = _leaves()
     p = _Param()
-    assert not h.place_host_quantized(p, _bf16_weight((64, 32), 5), mesh=_NOWHERE, put=_IDENTITY_PUT)
+    assert not h.place_host_quantized(
+        p, _bf16_weight((64, 32), 5), mesh=_NOWHERE, put=_IDENTITY_PUT)
     assert p.value is None and p.md == {}
     assert h.adopt_host_quant_scale(p) is None
 
@@ -155,8 +178,10 @@ def test_a_weight_already_on_the_mesh_is_left_to_the_device_path():
     import jax.numpy as jnp
     q, h = _leaves()
     w = _bf16_weight((64, 32), 6)
-    on_mesh = types.SimpleNamespace(devices=np.array(sorted(w.devices(), key=lambda d: d.id), dtype=object))
+    on_mesh = types.SimpleNamespace(devices=np.array(
+        sorted(w.devices(), key=lambda d: d.id), dtype=object))
     p = _Param()
-    h.request_host_quant(p, h.HostQuantRequest(jnp.int8, (64, 32), (None, None), (None, )))
+    h.request_host_quant(
+        p, h.HostQuantRequest(jnp.int8, (64, 32), (None, None), (None, )))
     assert not h.place_host_quantized(p, w, mesh=on_mesh, put=_IDENTITY_PUT)
     assert p.value is None and h.adopt_host_quant_scale(p) is None

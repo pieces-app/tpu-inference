@@ -23,16 +23,17 @@ def _get_quant_method_fn():
     tree = ast.parse(FP8_PATH.read_text())
     cfg = next(n for n in ast.walk(tree)
                if isinstance(n, ast.ClassDef) and n.name == "VllmFp8Config")
-    return next(n for n in ast.walk(cfg)
-                if isinstance(n, ast.FunctionDef) and n.name == "get_quant_method")
+    return next(
+        n for n in ast.walk(cfg)
+        if isinstance(n, ast.FunctionDef) and n.name == "get_quant_method")
 
 
 def _online_return(fn):
     """The `return VllmFp8OnlineLinearMethod(...)` node, if present as real code."""
     for node in ast.walk(fn):
         if (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
-                and getattr(node.value.func, "id", None)
-                == "VllmFp8OnlineLinearMethod"):
+                and getattr(node.value.func, "id",
+                            None) == "VllmFp8OnlineLinearMethod"):
             return node
     return None
 
@@ -50,9 +51,10 @@ def _flag_guarded(fn):
 
 
 def _online_return_in(stmt):
-    return any(isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
-               and getattr(n.value.func, "id", None) == "VllmFp8OnlineLinearMethod"
-               for n in ast.walk(stmt))
+    return any(
+        isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None) == "VllmFp8OnlineLinearMethod"
+        for n in ast.walk(stmt))
 
 
 def _fail_closed_raise(fn):
@@ -85,7 +87,9 @@ def test_fail_closed_default_preserved_and_after_optin():
     cls = next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
                 and n.name == "VllmFp8OnlineLinearMethod"), None)
     assert cls is not None
-    assert any(getattr(b, "id", None) == "VllmFp8LinearMethod"
-               for b in cls.bases), "must inherit VllmFp8LinearMethod (apply)"
-    assert not any(isinstance(n, ast.FunctionDef) and n.name == "apply"
-                   for n in cls.body), "must inherit apply, not override it"
+    assert any(
+        getattr(b, "id", None) == "VllmFp8LinearMethod"
+        for b in cls.bases), "must inherit VllmFp8LinearMethod (apply)"
+    assert not any(
+        isinstance(n, ast.FunctionDef) and n.name == "apply"
+        for n in cls.body), "must inherit apply, not override it"

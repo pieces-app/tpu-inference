@@ -101,8 +101,9 @@ def test_ref_mm_bidi_matches_dense_oracle(sliding_window, blk):
     v = rng.standard_normal((q_len, num_kv_heads, head_dim)).astype(np.float32)
 
     total_pages = max_num_seqs * pages_per_seq
-    kv_cache = np.zeros((total_pages, page_size, num_kv_heads * 2, 1, head_dim),
-                        dtype=np.float32)
+    kv_cache = np.zeros(
+        (total_pages, page_size, num_kv_heads * 2, 1, head_dim),
+        dtype=np.float32)
     kv_lens = np.array([kv_len, 0], dtype=np.int32)
     page_indices = np.arange(max_num_seqs * pages_per_seq, dtype=np.int32)
     cu_q_lens = np.array([0, q_len, q_len], dtype=np.int32)
@@ -164,9 +165,13 @@ def test_bidi_actually_changes_output():
 
     def run(mm):
         out, _ = ref_ragged_paged_attention(
-            jnp.asarray(q), jnp.asarray(k), jnp.asarray(v),
-            jnp.asarray(kv_cache), jnp.asarray(kv_lens),
-            jnp.asarray(page_indices), jnp.asarray(cu_q_lens),
+            jnp.asarray(q),
+            jnp.asarray(k),
+            jnp.asarray(v),
+            jnp.asarray(kv_cache),
+            jnp.asarray(kv_lens),
+            jnp.asarray(page_indices),
+            jnp.asarray(cu_q_lens),
             jnp.asarray(distribution),
             jnp.asarray(mm) if mm is not None else None,
             sm_scale=head_dim**-0.5,

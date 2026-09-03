@@ -93,8 +93,8 @@ def xla_quantized_matmul(
         ).astype(jnp.float32)
         # x_scale carries one scale per token row; broadcast it against the
         # output's leading (batch/token) axes rather than assuming rank 2.
-        out *= jnp.reshape(x_scale, x_scale.shape + (1, ) *
-                           (out.ndim - x_scale.ndim))
+        out *= jnp.reshape(x_scale,
+                           x_scale.shape + (1, ) * (out.ndim - x_scale.ndim))
     else:
         # W8A16: bf16 activations against a quantized weight. lax.dot_general
         # ACCEPTS the mixed pair (verified: jax 0.11.1 promotes bf16 x int8 to

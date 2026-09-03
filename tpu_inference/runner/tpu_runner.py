@@ -1063,7 +1063,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 "degrades fine-text fidelity.", reason)
             return False
 
-        archs = getattr(self.model_config.hf_config, "architectures", None) or []
+        archs = getattr(self.model_config.hf_config, "architectures",
+                        None) or []
         if not any(a in self._MM_BIDI_VALIDATED_ARCHS for a in archs):
             if setting != "force":
                 return _off(
@@ -2932,9 +2933,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         if hasattr(pos_info, "extract_embeds_range"):
                             ranges.extend(pos_info.extract_embeds_range())
                         else:
-                            ranges.append((pos_info.offset,
-                                           pos_info.offset +
-                                           pos_info.length - 1))
+                            ranges.append(
+                                (pos_info.offset,
+                                 pos_info.offset + pos_info.length - 1))
                     if len(ranges) == 1:
                         start, last = ranges[0]
                         mm_bidi_ranges_cpu[req_offset + i, 0] = start

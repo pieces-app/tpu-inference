@@ -19,8 +19,6 @@ Two guards, because either alone is escapable:
 import ast
 import pathlib
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CM = ROOT / "tpu_inference" / "runner" / "compilation_manager.py"
 
@@ -30,12 +28,14 @@ def _tree():
 
 
 def test_compilation_manager_init_still_enables_the_compile_cache():
-    cls = next((n for n in ast.walk(_tree())
-                if isinstance(n, ast.ClassDef) and n.name == "CompilationManager"),
-               None)
+    cls = next(
+        (n for n in ast.walk(_tree())
+         if isinstance(n, ast.ClassDef) and n.name == "CompilationManager"),
+        None)
     assert cls is not None
     init = next((f for f in cls.body
-                 if isinstance(f, ast.FunctionDef) and f.name == "__init__"), None)
+                 if isinstance(f, ast.FunctionDef) and f.name == "__init__"),
+                None)
     assert init is not None, "CompilationManager.__init__ not found"
     src = ast.get_source_segment(CM.read_text(), init) or ""
     assert "VLLM_DISABLE_COMPILE_CACHE" in src, (
@@ -49,8 +49,10 @@ def test_compilation_manager_init_still_enables_the_compile_cache():
 def test_no_function_has_statements_after_a_return():
     """The general form of the bug: unreachable trailing statements."""
     offenders = []
-    for fn in [n for n in ast.walk(_tree())
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+    for fn in [
+            n for n in ast.walk(_tree())
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]:
         for i, stmt in enumerate(fn.body[:-1]):
             if isinstance(stmt, ast.Return):
                 nxt = fn.body[i + 1]

@@ -47,7 +47,10 @@ def _paths():
 
 
 @pytest.mark.parametrize("name", [
-    "float8_e4m3fn", "float8_e4m3b11fnuz", "float8_e5m2", "int8",
+    "float8_e4m3fn",
+    "float8_e4m3b11fnuz",
+    "float8_e5m2",
+    "int8",
 ])
 def test_both_paths_quantize_a_bf16_weight_identically(name):
     import jax
@@ -73,9 +76,9 @@ def test_both_paths_quantize_a_bf16_weight_identically(name):
         f"26B (flax) and 12B (torchax) arms of the dtype matrix would then "
         f"differ by the instrument as well as by the dtype.")
 
-    assert jnp.array_equal(w_flax.astype(jnp.float32),
-                           w_tx.astype(jnp.float32)), (
-        f"{name}: same weight, same dtype, different quantized values")
+    assert jnp.array_equal(w_flax.astype(jnp.float32), w_tx.astype(
+        jnp.float32)), (
+            f"{name}: same weight, same dtype, different quantized values")
 
 
 def test_the_reduction_happens_in_f32_not_the_input_dtype():
@@ -92,7 +95,8 @@ def test_the_reduction_happens_in_f32_not_the_input_dtype():
         _, s_from_bf16 = q.quantize_tensor(dtype, wbf, axis=0)
         # The reference: the SAME values, already widened. Any difference is
         # the reduction's precision, not the data's.
-        _, s_from_f32 = q.quantize_tensor(dtype, wbf.astype(jnp.float32),
+        _, s_from_f32 = q.quantize_tensor(dtype,
+                                          wbf.astype(jnp.float32),
                                           axis=0)
         assert jnp.array_equal(s_from_bf16, s_from_f32), (
             f"{dtype.__name__}: reducing a bf16 tensor gives a different "

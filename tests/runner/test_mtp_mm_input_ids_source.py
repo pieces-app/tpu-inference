@@ -78,9 +78,8 @@ def _runtime_error_guards_on_input_ids(fn: ast.FunctionDef):
         if not isinstance(node, ast.If):
             continue
         test = node.test
-        if not (isinstance(test, ast.Compare)
-                and isinstance(test.left, ast.Name)
-                and test.left.id == "input_ids"
+        if not (isinstance(test, ast.Compare) and isinstance(
+                test.left, ast.Name) and test.left.id == "input_ids"
                 and any(isinstance(op, ast.Is) for op in test.ops)):
             continue
         for stmt in node.body:

@@ -190,7 +190,8 @@ class TestFittingConfigsUnchanged:
         "model,serve,mode",
         [
             # TP=1 full model at 16k ctx / page 16.
-            (_model_cfgs(16, 8), _serve_cfgs(16, 1024), configs.RpaCase.DECODE),
+            (_model_cfgs(16, 8), _serve_cfgs(16, 1024), configs.RpaCase.DECODE
+             ),
             (_model_cfgs(16, 8), _serve_cfgs(16, 1024), configs.RpaCase.MIXED),
             # Upstream-CI-like: page 256 (vllm-project/tpu-inference#3280
             # pins batched-RPA perf jobs to block size 256, which is why
@@ -238,15 +239,22 @@ class TestWrapperFallback:
     def test_falls_back_to_v3_at_incident_config(self):
         args = _incident_inputs()
 
-        v3_mock = mock.MagicMock(side_effect=lambda q, k, v, kv_cache, *a, **
-                                 kw: (q, kv_cache))
+        v3_mock = mock.MagicMock(
+            side_effect=lambda q, k, v, kv_cache, *a, **kw: (q, kv_cache))
         with mock.patch(
                 "tpu_inference.kernels.ragged_paged_attention.v3.kernel"
                 ".ragged_paged_attention", v3_mock):
             out, new_cache = jax.eval_shape(
-                lambda *a: wrapper.ragged_paged_attention(
-                    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-                    sliding_window=1024), *args)
+                lambda *a: wrapper.ragged_paged_attention(a[0],
+                                                          a[1],
+                                                          a[2],
+                                                          a[3],
+                                                          a[4],
+                                                          a[5],
+                                                          a[6],
+                                                          a[7],
+                                                          sliding_window=1024),
+                *args)
 
         assert v3_mock.call_count == 1
         kwargs = v3_mock.call_args.kwargs

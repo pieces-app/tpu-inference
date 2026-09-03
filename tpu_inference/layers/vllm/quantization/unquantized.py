@@ -46,7 +46,8 @@ from tpu_inference.layers.common.quant_methods import UNQUANTIZED
 from tpu_inference.layers.common.quantization import \
     unquantized as common_unquantized
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context, general_device_put
+from tpu_inference.layers.common.utils import (cpu_mesh, cpu_mesh_context,
+                                               general_device_put)
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
@@ -70,9 +71,7 @@ def _release_cpu_storage(tensor: torch.Tensor) -> None:
     except RuntimeError as exc:
         if "not resizable" not in str(exc):
             raise
-        logger.debug(
-            "CPU weight storage is non-resizable; dropping reference"
-        )
+        logger.debug("CPU weight storage is non-resizable; dropping reference")
 
 
 def _load_weight_for_layer(
