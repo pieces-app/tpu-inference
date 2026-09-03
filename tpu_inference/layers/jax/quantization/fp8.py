@@ -35,6 +35,8 @@ from tpu_inference.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from tpu_inference.layers.common.quantization.online_fp8_requant import (
     ONLINE_QUANT_DTYPE_ENV, online_quant_dtype)
+from tpu_inference.layers.common.quantization.online_host_quant import (
+    HostQuantRequest, adopt_host_quant_scale, request_host_quant)
 from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
@@ -890,6 +892,14 @@ class Fp8Config(QuantizationConfig):
 # make the two arms incomparable rather than configurable.
 _online_fp8_dtype = online_quant_dtype
 
+# The lane tooling greps this line as one half of the engagement proof (bank
+# writes are the other half). Emitted by BOTH the host-quantized path and the
+# on-device fallback, so the proof does not depend on which path ran.
+_ONLINE_DENSE_MARKER = (
+    "VLLM_FP8_ONLINE_DENSE=1: serving dense on-the-fly fp8 "
+    "(e4m3, per-output-channel) -- requanted from the bf16 "
+    "checkpoint at load; experts stay on MOE_REQUANTIZE.")
+
 
 class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
     """On-the-fly per-output-channel e4m3 for a BF16 checkpoint (flax lane).
@@ -940,6 +950,24 @@ class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
             UnquantizedLinearMethod.create_weights_jax(
                 self, layer, *weight_args, rngs=rngs, **extra_weight_attrs)
 
+        # Ask the loader to quantize this kernel on the HOST and place only
+        # (w_q, w_s). MEASURED 2026-09-02 23:09Z: requanting after placement
+        # put the whole bf16 checkpoint, the int8 copies AND two f32
+        # temporaries on one v6e at once and the 12B int8 arm died at load
+        # (online_host_quant has the arithmetic). The request rides on the
+        # Param's metadata, like weight_loader, because the loader only
+        # knows the Param; process_weights_after_loading adopts the parked
+        # scale. kernel_shape / weight_sharding are the 2-D [in, out] layout
+        # and spec the apply path assumes, so the placement matches the
+        # forward. Batched kernels keep the fail-closed refusal below.
+        if not self.batch_features:
+            request_host_quant(
+                layer.weight,
+                HostQuantRequest(dtype=_online_fp8_dtype(),
+                                 kernel_shape=tuple(self.kernel_shape),
+                                 weight_spec=tuple(self.weight_sharding),
+                                 scale_spec=(self.weight_sharding[1], )))
+
     def process_weights_after_loading(self, layer: JaxEinsum) -> bool:
         assert isinstance(layer, JaxEinsum)
         if not layer.weight.get_metadata("_is_loaded", False):
@@ -951,7 +979,31 @@ class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
                 "weights; no Gemma-4 dense layer has true batch dims. "
                 "Refusing rather than guessing a scale layout.")
 
-        # Requant WHERE THE PARAM LIVES.
+        w_s = adopt_host_quant_scale(layer.weight)
+        if w_s is not None:
+            # The loader quantized this kernel on the HOST and placed only
+            # (w_q, w_s): no bf16 kernel reached the mesh. Re-wrap the SAME
+            # device buffers as fresh Params (no copy, no metadata) -- the
+            # post-load state the on-device path below produces. The old
+            # Param that JaxAutoWeightsLoader.load_weights still holds in
+            # its params_dict now pins an int8 buffer that is shared with
+            # the new Param, not a bf16 one that nothing else uses.
+            w_q = layer.weight[...]
+            delattr(layer, 'weight')
+            layer.weight = nnx.Param(w_q)
+            layer.weight_scale = nnx.Param(w_s)
+            logger.info_once(
+                "online quant: kernels quantized on the host before "
+                "placement; no bf16 kernel reached the model mesh.")
+            logger.info_once(_ONLINE_DENSE_MARKER)
+            return True
+
+        # FALLBACK: a bf16 kernel that reached the mesh unquantized. Only a
+        # loader that hands assign_and_shard_param an array ALREADY on the
+        # model mesh gets here (pathways_dummy builds its dummies on the
+        # TPU); every checkpoint path is served above. This is the pre-fix
+        # path, unchanged: it holds the bf16 kernel and two f32 temporaries
+        # on the mesh at once. Requant WHERE THE PARAM LIVES.
         #
         # This used to open `with cpu_mesh_context():` around a param that
         # `assign_and_shard_param` has already committed to the TPU model
@@ -986,10 +1038,7 @@ class Fp8OnlineLinearMethod(Fp8TensorwiseLinearMethod):
                 pass  # shape/mesh mismatch: leave placement to the runtime
         layer.weight = nnx.Param(w_q)
         layer.weight_scale = nnx.Param(w_s)
-        logger.info_once(
-            "VLLM_FP8_ONLINE_DENSE=1: serving dense on-the-fly fp8 "
-            "(e4m3, per-output-channel) -- requanted from the bf16 "
-            "checkpoint at load; experts stay on MOE_REQUANTIZE.")
+        logger.info_once(_ONLINE_DENSE_MARKER)
         return True
 
 
