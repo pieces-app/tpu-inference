@@ -33,6 +33,17 @@ bound methods:
   MM-encoder JIT manager's traced path, hooked as defensive coverage):
   reset the recorder, run, then emit ONE line for the whole call.
 
+Under ``PIECES_MM_DEBUG_LAYERS`` it additionally wraps every encoder layer
+and every attention module inside the tower and emits a SECOND line,
+``site=<site>:layers``, carrying ``A0..An`` (each layer's attention output)
+and ``L0..Ln`` (each layer's output).  That is the instrument for the one
+thing a CPU differential cannot settle: the 2026-09-03 CPU run showed the
+torchax tower reproducing transformers' eager tower to bf16 noise at every
+layer and every grid on the real E4B weights, so a divergence that only
+appears on a chip has to be localised on the chip.  The flax tower emits
+the same two names from ``models/jax/gemma4_mm.py``, so the two lanes'
+lines can be diffed layer by layer.
+
 WHY THE POOLER, and not the projector's input, is ``tower``
 -----------------------------------------------------------
 The two runtimes hand the projector different tensors for the same image,
@@ -117,6 +128,10 @@ class _Recorder:
         self.tower_mask: list = []
         self.tower_from_pooler = False
         self.proj: list = []
+        # PIECES_MM_DEBUG_LAYERS: index -> chunks, one entry per encoder
+        # layer. Kept sparse (a dict) so a partial run still formats.
+        self.attn: dict[int, list] = {}
+        self.layer: dict[int, list] = {}
 
 
 def _wrap_forward(module: Any, after: Callable[[tuple, dict, Any],
@@ -139,6 +154,52 @@ def _wrap_forward(module: Any, after: Callable[[tuple, dict, Any],
     module.forward = forward
 
 
+ENCODER_LAYER_SUFFIX = "EncoderLayer"
+ATTENTION_SUFFIX = "Attention"
+
+
+def _install_layer_hooks(tower: Any, rec: "_Recorder",
+                         to_jax: Callable[[Any], Any]) -> list[str]:
+    """Record each encoder layer's attention output and layer output.
+
+    Ordering is the module tree's, which for ``nn.ModuleList`` is the layer
+    order, so ``A3``/``L3`` are layer 3's. Both hooks run inside the jitted
+    region when the encoder is a ``JittableModule``; the recorded values are
+    then tracers, and ``emit_mm_debug_stats`` turns them into one host
+    ``jax.debug.callback`` -- the same mechanism the existing fields use.
+    """
+    named = getattr(tower, "named_modules", None)
+    if not callable(named):
+        return []
+    layers = [(n, m) for n, m in named()
+              if type(m).__name__.endswith(ENCODER_LAYER_SUFFIX)]
+    attns = [(n, m) for n, m in named()
+             if type(m).__name__.endswith(ATTENTION_SUFFIX)]
+
+    def _recorder(attribute: str, index: int):
+        # The store is looked up on ``rec`` at CALL time, not captured here:
+        # ``rec.reset()`` rebinds the dicts before every encoder call, and a
+        # captured dict would collect into the previous call's store.
+
+        def after(args: tuple, kwargs: dict, out: Any) -> None:
+            value = out[0] if isinstance(out, (tuple, list)) and out else out
+            value = getattr(value, "last_hidden_state", value)
+            getattr(rec, attribute).setdefault(index, []).append(to_jax(value))
+
+        return after
+
+    installed: list[str] = []
+    for index, (name, module) in enumerate(attns):
+        if callable(getattr(module, "forward", None)):
+            _wrap_forward(module, _recorder("attn", index))
+            installed.append(f"attn[{index}]={name}")
+    for index, (name, module) in enumerate(layers):
+        if callable(getattr(module, "forward", None)):
+            _wrap_forward(module, _recorder("layer", index))
+            installed.append(f"layer[{index}]={name}")
+    return installed
+
+
 def install_mm_debug(
     vllm_model: Any,
     *,
@@ -146,6 +207,7 @@ def install_mm_debug(
     log: Callable[[str], None],
     emit: Callable[..., None] | None = None,
     path: str = "torchax",
+    per_layer: bool = False,
 ) -> list[str]:
     """Install the recorder on ``vllm_model``; return what was hooked.
 
@@ -157,6 +219,9 @@ def install_mm_debug(
         emit: ``mm_debug_stats.emit_mm_debug_stats`` (imported lazily so this
             module stays importable without the ``tpu_inference`` package).
         path: the ``path=`` field of the line.
+        per_layer: also hook every encoder layer and attention module in the
+            tower and emit the second, ``site=<site>:layers`` line
+            (``PIECES_MM_DEBUG_LAYERS``).
 
     Returns the list of hook names installed; empty when the model has no
     vision-shaped members. Idempotent per instance.
@@ -220,6 +285,9 @@ def install_mm_debug(
         _wrap_forward(embed_vision, after_embed_vision)
         installed.append("embed_vision")
 
+    if per_layer and tower is not None:
+        installed += _install_layer_hooks(tower, rec, to_jax)
+
     def _emit(site: str, pixel_values: Any, position_ids: Any,
               soft_tokens: int, n_images: int) -> None:
         pv = [to_jax(t) for t in _as_list(pixel_values)]
@@ -247,6 +315,37 @@ def install_mm_debug(
             counts={"soft_tokens": int(soft_tokens)},
             extra={
                 "site": site,
+                "n_images": int(n_images)
+            },
+        )
+        if not rec.layer and not rec.attn:
+            return
+        per_layer_tensors: dict = {}
+        for prefix, store in (("A", rec.attn), ("L", rec.layer)):
+            for index in sorted(store):
+                per_layer_tensors[f"{prefix}{index}"] = list(store[index])
+        # The encoder's chunks are per encoder CALL and pv's are per image;
+        # they line up only when the call carried one image, which is what
+        # the debug lane runs. Drop the masks rather than mis-index when
+        # they do not, so the line still prints (over all rows, padding
+        # included -- which the shape field makes visible).
+        per_layer_masks = None
+        if pv_mask:
+            per_layer_masks = {
+                name: pv_mask
+                for name, chunks in per_layer_tensors.items()
+                if len(chunks) == len(pv_mask) and all(
+                    tuple(c.shape[:-1]) == tuple(m.shape)
+                    for c, m in zip(chunks, pv_mask))
+            } or None
+        emit(
+            log,
+            path,
+            tensors=per_layer_tensors,
+            masks=per_layer_masks,
+            counts={},
+            extra={
+                "site": f"{site}:layers",
                 "n_images": int(n_images)
             },
         )

@@ -322,8 +322,14 @@ def _enclosing_if_tests(node, parents):
 _GUARDS = {"envs.PIECES_MM_DEBUG", "debug_sink is not None"}
 
 
+# The `:layers` sites are the PIECES_MM_DEBUG_LAYERS second line (A0..An,
+# L0..Ln); they sit inside the same `if debug_sink is not None:` block, so
+# PIECES_MM_DEBUG alone still gates them.
 @pytest.mark.parametrize("path, expected_sites", [
-    (GEMMA4_MM, {"get_single_image_embedding", "encoder_cudagraph_forward"}),
+    (GEMMA4_MM, {
+        "get_single_image_embedding", "encoder_cudagraph_forward",
+        "get_single_image_embedding:layers", "encoder_cudagraph_forward:layers"
+    }),
     (GEMMA4_UNIFIED, {"get_single_image_embedding"}),
 ])
 def test_every_native_emit_is_guarded_by_the_flag(path, expected_sites):

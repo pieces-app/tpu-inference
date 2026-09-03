@@ -234,7 +234,10 @@ def _install_torchax_mm_debug(vllm_model) -> None:
 
     for line in tower_census_lines(vllm_model):
         logger.info("[mm-debug] %s", line)
-    installed = install_mm_debug(vllm_model, to_jax=to_jax, log=logger.info)
+    installed = install_mm_debug(vllm_model,
+                                 to_jax=to_jax,
+                                 log=logger.info,
+                                 per_layer=envs.PIECES_MM_DEBUG_LAYERS)
     logger.info("[mm-debug] torchax hooks on %s: %s",
                 type(vllm_model).__name__, installed
                 or "none (no vision-shaped members)")

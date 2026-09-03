@@ -57,6 +57,7 @@ jobs:
             tests/models/jax/test_gemma4_unified.py
             tests/models/jax/test_gemma4_vision_clipping.py
             tests/models/jax/test_no_kernel_attribute_reads.py
+            tests/models/vllm/experimental/test_gemma4_vision_attention.py
             tests/models/vllm/experimental/test_mm_debug_patch.py
             tests/models/vllm/experimental/test_mm_jit_static_args.py
             tests/runner/test_draft_token_owners_survive_condense.py

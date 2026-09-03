@@ -26,6 +26,8 @@ for f in \
   models/jax/gemma4_mm.py \
   models/jax/gemma4_vision_clip.py \
   models/jax/gemma4_unified.py \
+  models/vllm/experimental/gemma4_mm_patcher.py \
+  models/vllm/experimental/gemma4_vision_attention.py \
   models/vllm/experimental/gemma4_unified_patcher.py \
   models/vllm/experimental/mm_debug_patch.py \
   models/vllm/experimental/mm_jit_signature.py \

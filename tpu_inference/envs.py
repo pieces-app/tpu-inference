@@ -90,6 +90,9 @@ if TYPE_CHECKING:
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
     PIECES_MM_DEBUG: bool = False
+    PIECES_MM_DEBUG_LAYERS: bool = False
+    PIECES_GEMMA4_VISION_ATTN_FP32: bool = False
+    PIECES_GEMMA4_VISION_ATTN_CHUNK: int = 1024
 
 
 def env_with_choices(
@@ -533,6 +536,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Written for the E4B torchax-vs-native image divergence (ti #54).
     "PIECES_MM_DEBUG":
     env_bool("PIECES_MM_DEBUG", default=False),
+    # PIECES_MM_DEBUG plus per-encoder-layer stats: one extra
+    # `site=...:layers` line carrying A0..An (attention output) and L0..Ln
+    # (layer output) from BOTH towers, so the two lanes can be diffed layer
+    # by layer on a chip. Off by default: it adds one host callback per
+    # image and a long line. No effect without PIECES_MM_DEBUG.
+    "PIECES_MM_DEBUG_LAYERS":
+    env_bool("PIECES_MM_DEBUG_LAYERS", default=False),
+    # Gemma-4 vision tower on the torchax path: keep the QK^T scores in
+    # fp32. torchax lowers F.scaled_dot_product_attention to
+    # `_sdpa_reference`, which materialises the product in the operand dtype
+    # (bf16); every other backend, including the flax path's Pallas kernel,
+    # keeps the scores in fp32. Measured in isolation that costs ~5x the
+    # attention op's error, but on google/gemma-4-E4B-it's own vision weights
+    # it does not move the tower output (1-cos 6.5e-6 either way at layer 0),
+    # so it is OFF by default: an opt-in arm, not a fix for the E4B image
+    # degeneracy, which the CPU differential rules this out as.
+    "PIECES_GEMMA4_VISION_ATTN_FP32":
+    env_bool("PIECES_GEMMA4_VISION_ATTN_FP32", default=False),
+    # Query-axis block size for that attention. fp32 scores are twice the
+    # bytes of bf16 ones, so they are computed in blocks; 0 disables the
+    # blocking and builds the whole (q_len, kv_len) matrix at once.
+    "PIECES_GEMMA4_VISION_ATTN_CHUNK":
+    lambda: int(os.getenv("PIECES_GEMMA4_VISION_ATTN_CHUNK", "1024")),
 }
 
 
