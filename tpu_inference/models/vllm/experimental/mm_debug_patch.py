@@ -18,18 +18,44 @@ Installed by ``model_patcher.apply_model_specific_patches`` ONLY under the
 flag, after ``patch_mm_model`` has (optionally) wrapped
 ``model.vision_tower.encoder`` in a ``torchax.interop.JittableModule``. It
 never touches the module tree -- ``torch.func.functional_call`` keys weights
-by module path -- it only replaces ``forward`` on two instances and two
+by module path -- it only replaces ``forward`` on three instances and two
 bound methods:
 
 * ``vision_tower.encoder.forward``: records ``last_hidden_state`` (the
   pre-pooler encoder output, i.e. the output of the jitted region) and the
   ``attention_mask`` it was called with;
-* ``embed_vision.forward``: records its input (the tower output as the
-  projector consumes it) and its output (the projector output);
+* ``vision_tower.pooler.forward``: records the ``(pooled_states,
+  valid_mask)`` pair as ``tower`` -- see WHY THE POOLER below;
+* ``embed_vision.forward``: records its output (the projector output), and
+  its input as ``tower`` only when the tower exposes no pooler to hook;
 * ``_process_image_input`` (the eager vLLM path -- what the
   ``eval-e4b-torchax`` lane runs) and ``encoder_cudagraph_forward`` (the
   MM-encoder JIT manager's traced path, hooked as defensive coverage):
   reset the recorder, run, then emit ONE line for the whole call.
+
+WHY THE POOLER, and not the projector's input, is ``tower``
+-----------------------------------------------------------
+The two runtimes hand the projector different tensors for the same image,
+and reading ``tower`` off the projector made that difference look like lost
+embeddings. For a 3402x2158 screenshot at ``max_soft_tokens=1120`` the
+pooler produces a ``(1, 1120, D)`` buffer of which 1092 rows are valid:
+
+* the flax path (``models/jax/gemma4_mm.py``) keeps the padding, projects
+  all 1120 rows and sorts the valid ones to the front, so it logged
+  ``tower.shape=(1,1120,D)``;
+* the vLLM path strips the padding first (``pooled_states[valid_mask]``,
+  matching HF's own ``Gemma4VisionModel.forward``) and projects 1092 rows,
+  so it logged ``tower.shape=(1,1092,D)``.
+
+Both are correct and both feed the language model 1092 embeddings for the
+1092 ``<image>`` placeholders the processor put in the prompt -- 1092 is the
+answer, 1120 is the buffer. Recording the pooler's own output makes the two
+lines report the same tensor at the same point, with the pooler's mask
+restricting the statistics to the valid rows, so the padded-vs-packed
+difference can no longer be misread as 28 missing image embeddings.
+``proj`` still differs in shape by construction (the vLLM projector runs on
+the packed rows); ``soft_tokens`` is the valid count on BOTH paths and is
+the number that has to match the placeholders.
 
 The recorder holds torchax tensors converted with the injected ``to_jax``
 (``jax_view(t.detach())`` in the patcher); the stats themselves are computed
@@ -83,7 +109,13 @@ class _Recorder:
     def reset(self) -> None:
         self.enc: list = []
         self.enc_mask: list = []
+        # ``tower`` is the pooler's padded output when a pooler was hooked
+        # (``tower_mask`` then carries its valid-row mask), and the
+        # projector's input otherwise. ``tower_mask`` is empty in the
+        # fallback: those rows are already stripped.
         self.tower: list = []
+        self.tower_mask: list = []
+        self.tower_from_pooler = False
         self.proj: list = []
 
 
@@ -154,16 +186,35 @@ def install_mm_debug(
         _wrap_forward(encoder, after_encoder)
         installed.append("vision_tower.encoder")
 
+    pooler = getattr(tower, "pooler", None) if tower is not None else None
+    if pooler is not None and callable(getattr(pooler, "forward", None)):
+
+        def after_pooler(args: tuple, kwargs: dict, out: Any) -> None:
+            # Gemma4VisionPooler.forward -> (pooled_states, valid_mask).
+            if not isinstance(out, (tuple, list)) or len(out) != 2:
+                return
+            pooled, mask = out
+            rec.tower.append(to_jax(pooled))
+            rec.tower_mask.append(None if mask is None else to_jax(mask))
+            rec.tower_from_pooler = True
+
+        _wrap_forward(pooler, after_pooler)
+        installed.append("vision_tower.pooler")
+
     embed_vision = getattr(vllm_model, "embed_vision", None)
     if embed_vision is not None and callable(
             getattr(embed_vision, "forward", None)):
 
         def after_embed_vision(args: tuple, kwargs: dict, out: Any) -> None:
-            inputs = kwargs.get("inputs_embeds")
-            if inputs is None and args:
-                inputs = args[0]
-            if inputs is not None:
-                rec.tower.append(to_jax(inputs))
+            # Only the fallback: with a pooler hooked, ``tower`` is already
+            # the padded pooled buffer and its mask, which is what the flax
+            # path reports.
+            if not rec.tower_from_pooler:
+                inputs = kwargs.get("inputs_embeds")
+                if inputs is None and args:
+                    inputs = args[0]
+                if inputs is not None:
+                    rec.tower.append(to_jax(inputs))
             rec.proj.append(to_jax(out))
 
         _wrap_forward(embed_vision, after_embed_vision)
@@ -177,6 +228,8 @@ def install_mm_debug(
                    for p in pos] if len(pos) == len(pv) else None
         enc_masks = rec.enc_mask if all(m is not None
                                         for m in rec.enc_mask) else None
+        tower_masks = rec.tower_mask if (rec.tower_mask and all(
+            m is not None for m in rec.tower_mask)) else None
         emit(
             log,
             path,
@@ -189,6 +242,7 @@ def install_mm_debug(
             masks={
                 "pv": pv_mask,
                 "enc": enc_masks,
+                "tower": tower_masks,
             },
             counts={"soft_tokens": int(soft_tokens)},
             extra={
