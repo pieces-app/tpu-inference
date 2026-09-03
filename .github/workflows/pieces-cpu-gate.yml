@@ -55,6 +55,7 @@ jobs:
             tests/models/jax/test_audio_mask_fallback_rank.py
             tests/models/jax/test_audio_skip_fails_closed.py
             tests/models/jax/test_gemma4_unified.py
+            tests/models/jax/test_gemma4_vision_clipping.py
             tests/models/jax/test_no_kernel_attribute_reads.py
             tests/models/vllm/experimental/test_mm_debug_patch.py
             tests/models/vllm/experimental/test_mm_jit_static_args.py
