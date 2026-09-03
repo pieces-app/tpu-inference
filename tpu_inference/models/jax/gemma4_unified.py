@@ -67,10 +67,12 @@ from vllm.model_executor.models.gemma4_unified import \
     Gemma4UnifiedForConditionalGeneration as PtGemma4Unified
 from vllm.model_executor.models.utils import WeightsMapper
 
+from tpu_inference import envs
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.linear import JaxEinsum
 from tpu_inference.layers.jax.norm import JaxLayerNorm
 from tpu_inference.logger import init_logger
+from tpu_inference.models.common.mm_debug_stats import emit_mm_debug_stats
 from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM, Gemma4Model
 from tpu_inference.models.jax.gemma4_mm import (POSITIONS_PAD_VALUE,
                                                 Gemma4ImagePixelInputs,
@@ -332,6 +334,28 @@ class Gemma4UnifiedForConditionalGeneration(JaxModule, LoadableWithIterator):
         projected = jax.lax.with_sharding_constraint(
             projected, NamedSharding(self.mesh,
                                      PartitionSpec(None, None, None)))
+        if envs.PIECES_MM_DEBUG:
+            # Trace-time guard: off (the default) adds nothing to the jaxpr.
+            # No encoder here (encoder-free embedder), so no `enc` entry.
+            emit_mm_debug_stats(
+                logger.info,
+                "native",
+                tensors={
+                    "pv": pixel_values,
+                    "tower": embedded,
+                    "proj": projected,
+                },
+                masks={
+                    "pv": valid,
+                    "tower": valid,
+                    "proj": valid,
+                },
+                counts={"soft_tokens": valid},
+                extra={
+                    "site": "get_single_image_embedding",
+                    "n_images": int(pixel_values.shape[0]),
+                },
+            )
         return projected, valid
 
     @jax.jit

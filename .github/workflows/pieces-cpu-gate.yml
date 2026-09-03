@@ -50,15 +50,18 @@ jobs:
             tests/layers/vllm/test_fp8_online_dispatch_structure.py
             tests/layers/vllm/test_fp8_online_requant.py
             tests/layers/vllm/test_host_memory_release.py
+            tests/models/common/test_mm_debug_stats.py
             tests/models/jax/test_audio_hatch_requires_api_limit.py
             tests/models/jax/test_audio_mask_fallback_rank.py
             tests/models/jax/test_audio_skip_fails_closed.py
             tests/models/jax/test_gemma4_unified.py
             tests/models/jax/test_no_kernel_attribute_reads.py
+            tests/models/vllm/experimental/test_mm_debug_patch.py
             tests/models/vllm/experimental/test_mm_jit_static_args.py
             tests/runner/test_draft_token_owners_survive_condense.py
             tests/runner/test_init_not_truncated.py
             tests/runner/test_primers_carry_mm_bidi_ranges.py
+            tests/test_pieces_mm_debug_env.py
           )
           for f in "${GATE_FILES[@]}"; do
             [[ -n "$f" && -f "$f" ]] || { echo "::error::gate path blank or missing: '$f'"; exit 1; }

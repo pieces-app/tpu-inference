@@ -22,6 +22,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
+from tpu_inference import envs
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.utils.multi_modal_utils import \
     sanity_check_mm_encoder_outputs
@@ -119,6 +120,10 @@ class MultiModalManager:
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         # List of tuple (mm_hash, pos_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
+        # PIECES_MM_DEBUG: the owners (req_id:mm_hash) of every item, in the
+        # order the encoder batches see them, so the model's per-call
+        # [mm-debug] stats line can be joined back to a request on both paths.
+        debug_owners = [] if envs.PIECES_MM_DEBUG else None
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.runner.requests[req_id]
             for mm_input_id in encoder_input_ids:
@@ -150,6 +155,8 @@ class MultiModalManager:
                         "active for this vLLM version.")
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
+                if debug_owners is not None:
+                    debug_owners.append(f"{req_id}:{mm_hash}")
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -159,8 +166,17 @@ class MultiModalManager:
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
+        debug_offset = 0
         for modality, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
                 mm_kwargs):
+            if debug_owners is not None:
+                # group_and_batch_mm_kwargs preserves item order, so the
+                # owners of this group are the next num_items entries.
+                logger.info(
+                    "[mm-debug] encoder batch modality=%s num_items=%d "
+                    "owners=%s", modality, num_items, ",".join(
+                        debug_owners[debug_offset:debug_offset + num_items]))
+                debug_offset += num_items
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
             # 1. A tensor of shape (num_items, feature_size, hidden_size)
