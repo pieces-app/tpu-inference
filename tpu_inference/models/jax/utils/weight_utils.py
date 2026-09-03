@@ -41,6 +41,8 @@ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from tpu_inference import envs, utils
+from tpu_inference.layers.common.quantization.online_host_quant import \
+    place_host_quantized
 from tpu_inference.layers.common.utils import (cpu_mesh_context,
                                                general_device_put)
 from tpu_inference.layers.jax import JaxModule, JaxModuleList
@@ -772,6 +774,12 @@ def assign_and_shard_param(jax_param: nnx.Param,
                            mesh: Optional[Mesh] = None) -> None:
     """Distributes a JAX array across devices according to the `nnx.Param`'s sharding metadata, assigns it to the parameter, and marks it as loaded.
 
+    A Param carrying an online-quant request (see online_host_quant) is
+    quantized HERE, on the host, and only (w_q, w_s) are placed: the bf16
+    kernel never reaches the mesh. This is the one choke point every loader
+    path (plain, merged-shard, jax_dummy) goes through, which is why the
+    hook lives here and not in any single weight_loader.
+
     Args:
         jax_param: The target nnx.Param to assign the weight to.
         jax_weight: The JAX array containing the weight data.
@@ -786,7 +794,13 @@ def assign_and_shard_param(jax_param: nnx.Param,
     param_mesh = jax_param.get_metadata().get("mesh") or mesh
     shape = jax_weight.shape
     try:
-        jax_param.set_value(shard_put(jax_weight, spec, mesh=param_mesh))
+        placed = place_host_quantized(
+            jax_param,
+            jax_weight,
+            mesh=param_mesh or get_mesh(),
+            put=lambda x, spec_: shard_put(x, spec_, mesh=param_mesh))
+        if not placed:
+            jax_param.set_value(shard_put(jax_weight, spec, mesh=param_mesh))
         jax_param.set_metadata("_is_loaded", True)
         del jax_weight
     except Exception as e:
