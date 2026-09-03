@@ -24,6 +24,7 @@ for f in \
   layers/vllm/backends/flash_attn.py \
   models/common/mm_debug_stats.py \
   models/jax/gemma4_mm.py \
+  models/jax/gemma4_vision_clip.py \
   models/jax/gemma4_unified.py \
   models/vllm/experimental/gemma4_unified_patcher.py \
   models/vllm/experimental/mm_debug_patch.py \
