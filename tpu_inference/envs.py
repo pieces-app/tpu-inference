@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
+    PIECES_MM_DEBUG: bool = False
 
 
 def env_with_choices(
@@ -520,6 +521,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when initializing large FP8 models on smaller RAM TPUs such as TPU8i.
     "VLLM_INCREMENTAL_FP8_LOADING":
     env_bool("VLLM_INCREMENTAL_FP8_LOADING", default=False),
+    # Opt-in multimodal debug telemetry (pieces-app fork). When set, BOTH
+    # model paths log ONE line per vision-encoder call with host-computed
+    # stats of pixel_values, the vision-tower output, the projector
+    # (embed_vision) output and the soft-token count, the runner logs the
+    # req_id:mm_hash owners of every encoder batch, and the torchax path logs
+    # a boot-time census of the linear classes inside the vision tower. The
+    # stats are computed on the host (jax.debug.callback / a detached copy),
+    # so device numerics and dtypes are untouched; with the flag off every
+    # call site is a trace-time Python `if`, so no op is added to any jaxpr.
+    # Written for the E4B torchax-vs-native image divergence (ti #54).
+    "PIECES_MM_DEBUG":
+    env_bool("PIECES_MM_DEBUG", default=False),
 }
 
 

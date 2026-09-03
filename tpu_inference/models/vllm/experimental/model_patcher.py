@@ -25,8 +25,9 @@ import importlib
 from typing import TYPE_CHECKING, Sequence
 
 import jax
+import jax.numpy as jnp
 import torchax
-from torchax.interop import JittableModule, torch_view
+from torchax.interop import JittableModule, jax_view, torch_view
 
 from tpu_inference import envs
 from tpu_inference.logger import init_logger
@@ -34,6 +35,8 @@ from tpu_inference.models.vllm.experimental.gemma4_mm_patcher import \
     maybe_apply_gemma4_mm_patches
 from tpu_inference.models.vllm.experimental.gemma4_unified_patcher import \
     maybe_apply_gemma4_unified_patches
+from tpu_inference.models.vllm.experimental.mm_debug_patch import (
+    install_mm_debug, tower_census_lines)
 from tpu_inference.models.vllm.experimental.mm_jit_signature import \
     compute_mm_jit_static_args
 from tpu_inference.models.vllm.experimental.qwen3_omni_patcher import \
@@ -215,6 +218,28 @@ def patch_mm_model(
     return model, params_and_buffers
 
 
+def _install_torchax_mm_debug(vllm_model) -> None:
+    """PIECES_MM_DEBUG=1: the boot-time census of what runs inside the vision
+    tower (class[quant_method] histogram, encoder wrapper, attention impl),
+    then the per-call stats hooks. Runs AFTER patch_mm_model, so the census
+    sees the JittableModule and the tpu_inference linear replacement."""
+    import torch
+
+    def to_jax(value):
+        if isinstance(value, torchax.tensor.Tensor):
+            return jax_view(value.detach())
+        if isinstance(value, torch.Tensor):
+            return jnp.asarray(value.detach().float().cpu().numpy())
+        return value
+
+    for line in tower_census_lines(vllm_model):
+        logger.info("[mm-debug] %s", line)
+    installed = install_mm_debug(vllm_model, to_jax=to_jax, log=logger.info)
+    logger.info("[mm-debug] torchax hooks on %s: %s",
+                type(vllm_model).__name__, installed
+                or "none (no vision-shaped members)")
+
+
 def apply_model_specific_patches(vllm_model) -> None:
     """A consolidated entrypoint to apply model-specific JIT patches.
     """
@@ -222,3 +247,7 @@ def apply_model_specific_patches(vllm_model) -> None:
     maybe_apply_qwen3_omni_patches(vllm_model)
     maybe_apply_gemma4_mm_patches(vllm_model)
     maybe_apply_gemma4_unified_patches(vllm_model)
+    # Guard at the call site: with the flag off nothing is imported, wrapped
+    # or logged here.
+    if envs.PIECES_MM_DEBUG:
+        _install_torchax_mm_debug(vllm_model)

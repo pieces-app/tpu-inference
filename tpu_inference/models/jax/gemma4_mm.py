@@ -38,6 +38,7 @@ from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import make_layers
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
+from tpu_inference.models.common.mm_debug_stats import emit_mm_debug_stats
 from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM, Gemma4Model
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
@@ -552,12 +553,19 @@ class Gemma4VisionModel(JaxModule):
         pixel_values: jax.Array,
         pixel_position_ids: jax.Array,
         input_mask: Optional[jax.Array] = None,
+        debug_sink: Optional[list] = None,
     ):
         hidden_states = self.patch_embedder(pixel_values, pixel_position_ids)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(hidden_states, pixel_position_ids,
                                   input_mask)
+
+        if debug_sink is not None:
+            # PIECES_MM_DEBUG only: hand the pre-pooler encoder output to the
+            # caller's one-line stats. The default path passes no sink, so
+            # this is a trace-time no-op there.
+            debug_sink.append(hidden_states)
 
         outputs = self.pooler(hidden_states, pixel_position_ids)
 
@@ -851,16 +859,43 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
                                    pixel_position_ids: jax.Array) -> jax.Array:
         input_mask = pixel_position_ids[..., 0] != -1
 
+        # PIECES_MM_DEBUG: a trace-time Python guard. Off (the default) passes
+        # debug_sink=None and traces no callback, so the jaxpr is byte-identical
+        # to the unpatched method; on, ONE host-side stats line per call.
+        debug_sink = [] if envs.PIECES_MM_DEBUG else None
         vision_outputs = self.model.vision_tower(
             pixel_values,
             input_mask=input_mask,
-            pixel_position_ids=pixel_position_ids)
+            pixel_position_ids=pixel_position_ids,
+            debug_sink=debug_sink)
 
-        projected_vision_features = vision_outputs[0][0]
+        tower_features = vision_outputs[0][0]
         pooler_mask = vision_outputs[0][1]
 
-        projected_vision_features = self.model.embed_vision(
-            projected_vision_features)
+        projected_vision_features = self.model.embed_vision(tower_features)
+
+        if debug_sink is not None:
+            emit_mm_debug_stats(
+                logger.info,
+                "native",
+                tensors={
+                    "pv": pixel_values,
+                    "enc": debug_sink[0] if debug_sink else None,
+                    "tower": tower_features,
+                    "proj": projected_vision_features,
+                },
+                masks={
+                    "pv": input_mask,
+                    "enc": input_mask,
+                    "tower": pooler_mask,
+                    "proj": pooler_mask,
+                },
+                counts={"soft_tokens": pooler_mask},
+                extra={
+                    "site": "get_single_image_embedding",
+                    "n_images": int(pixel_values.shape[0]),
+                },
+            )
 
         seq_len = pooler_mask.shape[1]
         indices = jnp.arange(seq_len)
@@ -1106,14 +1141,40 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
 
         input_mask = pixel_position_ids[..., 0] != POSITIONS_PAD_VALUE
 
+        # PIECES_MM_DEBUG: same trace-time guard as get_single_image_embedding.
+        debug_sink = [] if envs.PIECES_MM_DEBUG else None
         vision_outputs = self.model.vision_tower(
             pixel_values,
             input_mask=input_mask,
             pixel_position_ids=pixel_position_ids,
+            debug_sink=debug_sink,
         )
-        projected = vision_outputs[0][0]
+        tower_features = vision_outputs[0][0]
         pooler_mask = vision_outputs[0][1]
-        projected = self.model.embed_vision(projected)
+        projected = self.model.embed_vision(tower_features)
+
+        if debug_sink is not None:
+            emit_mm_debug_stats(
+                logger.info,
+                "native",
+                tensors={
+                    "pv": pixel_values,
+                    "enc": debug_sink[0] if debug_sink else None,
+                    "tower": tower_features,
+                    "proj": projected,
+                },
+                masks={
+                    "pv": input_mask,
+                    "enc": input_mask,
+                    "tower": pooler_mask,
+                    "proj": pooler_mask,
+                },
+                counts={"soft_tokens": pooler_mask},
+                extra={
+                    "site": "encoder_cudagraph_forward",
+                    "n_images": int(pixel_values.shape[0]),
+                },
+            )
 
         seq_len = pooler_mask.shape[1]
         sort_indices = jnp.arange(seq_len)

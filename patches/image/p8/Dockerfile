@@ -28,21 +28,30 @@ RUN set -e; \
     TI_DIR=/workspace/tpu_inference/tpu_inference; \
     test -f "$TI_DIR/kernels/ragged_paged_attention/v3/kernel.py" || { echo "tpu_inference not located"; exit 1; }; \
     for f in \
+      envs.py \
       kernels/ragged_paged_attention/v3/kernel.py \
       layers/common/attention_metadata.py \
       layers/common/attention_interface.py \
       layers/vllm/backends/flash_attn.py \
+      models/common/mm_debug_stats.py \
+      models/jax/gemma4_mm.py \
+      models/jax/gemma4_unified.py \
       models/vllm/experimental/gemma4_unified_patcher.py \
+      models/vllm/experimental/mm_debug_patch.py \
       models/vllm/experimental/mm_jit_signature.py \
       models/vllm/experimental/model_patcher.py \
       runner/tpu_runner.py \
       runner/compilation_manager.py \
+      runner/multimodal_manager.py \
     ; do \
       cp "/tmp/p8/tpu_inference/$f" "$TI_DIR/$f"; \
     done; \
-    rm -rf "$TI_DIR/kernels/ragged_paged_attention/v3/__pycache__" \
+    rm -rf "$TI_DIR/__pycache__" \
+           "$TI_DIR/kernels/ragged_paged_attention/v3/__pycache__" \
            "$TI_DIR/layers/common/__pycache__" \
            "$TI_DIR/layers/vllm/backends/__pycache__" \
+           "$TI_DIR/models/common/__pycache__" \
+           "$TI_DIR/models/jax/__pycache__" \
            "$TI_DIR/models/vllm/experimental/__pycache__" \
            "$TI_DIR/runner/__pycache__" /tmp/p8; \
     grep -q "mm_bidi_ranges" "$TI_DIR/kernels/ragged_paged_attention/v3/kernel.py"; \
@@ -50,6 +59,13 @@ RUN set -e; \
     grep -q "maybe_apply_gemma4_unified_patches" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     grep -q "compute_mm_jit_static_args" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     test -f "$TI_DIR/models/vllm/experimental/mm_jit_signature.py"; \
+    grep -q "PIECES_MM_DEBUG" "$TI_DIR/envs.py"; \
+    grep -q "_install_torchax_mm_debug" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
+    grep -q "emit_mm_debug_stats" "$TI_DIR/models/jax/gemma4_mm.py"; \
+    grep -q "emit_mm_debug_stats" "$TI_DIR/models/jax/gemma4_unified.py"; \
+    grep -q "debug_owners" "$TI_DIR/runner/multimodal_manager.py"; \
+    test -f "$TI_DIR/models/common/mm_debug_stats.py"; \
+    test -f "$TI_DIR/models/vllm/experimental/mm_debug_patch.py"; \
     python3 -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/workspace/tpu_inference/tpu_inference/**/*.py', recursive=True)]"; \
     python3 -c "import tpu_inference.kernels.ragged_paged_attention.v3.kernel; print('kernel module imports OK')"; \
     echo "P6 PATCHES APPLIED AND VERIFIED"
