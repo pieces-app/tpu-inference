@@ -37,6 +37,8 @@ RUN set -e; \
       models/jax/gemma4_mm.py \
       models/jax/gemma4_vision_clip.py \
       models/jax/gemma4_unified.py \
+      models/vllm/experimental/gemma4_mm_patcher.py \
+      models/vllm/experimental/gemma4_vision_attention.py \
       models/vllm/experimental/gemma4_unified_patcher.py \
       models/vllm/experimental/mm_debug_patch.py \
       models/vllm/experimental/mm_jit_signature.py \
@@ -70,6 +72,10 @@ RUN set -e; \
     grep -q "vision_tower.pooler" "$TI_DIR/models/vllm/experimental/mm_debug_patch.py"; \
     test -f "$TI_DIR/models/jax/gemma4_vision_clip.py"; \
     grep -q "Gemma4VisionClippedEinsum" "$TI_DIR/models/jax/gemma4_mm.py"; \
+    test -f "$TI_DIR/models/vllm/experimental/gemma4_vision_attention.py"; \
+    grep -q "fp32_logit_attention" "$TI_DIR/models/vllm/experimental/gemma4_vision_attention.py"; \
+    grep -q "maybe_apply_gemma4_vision_attention_patch" "$TI_DIR/models/vllm/experimental/gemma4_mm_patcher.py"; \
+    grep -q "PIECES_GEMMA4_VISION_ATTN_FP32" "$TI_DIR/envs.py"; \
     grep -q "_verify_vision_clamps_loaded" "$TI_DIR/models/jax/gemma4_mm.py"; \
     python3 -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/workspace/tpu_inference/tpu_inference/**/*.py', recursive=True)]"; \
     python3 -c "import tpu_inference.kernels.ragged_paged_attention.v3.kernel; print('kernel module imports OK')"; \

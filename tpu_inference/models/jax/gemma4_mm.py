@@ -508,12 +508,19 @@ class Gemma4VisionEncoderLayer(JaxModule):
     def __call__(self,
                  inputs: jax.Array,
                  positions: jax.Array,
-                 input_mask: Optional[jax.Array] = None) -> jax.Array:
+                 input_mask: Optional[jax.Array] = None,
+                 attn_sink: Optional[list] = None) -> jax.Array:
         normed_inputs = self.input_layernorm(inputs)
 
         attn_output = self.self_attn(normed_inputs,
                                      positions,
                                      input_mask=input_mask)
+
+        if attn_sink is not None:
+            # PIECES_MM_DEBUG_LAYERS only: the raw attention output, the same
+            # tensor the torchax lane records as ``A<i>``. The default path
+            # passes no sink, so this is a trace-time no-op there.
+            attn_sink.append(attn_output)
 
         attn_output = self.post_attention_layernorm(attn_output)
         attn_output += inputs
@@ -612,12 +619,20 @@ class Gemma4VisionModel(JaxModule):
         pixel_position_ids: jax.Array,
         input_mask: Optional[jax.Array] = None,
         debug_sink: Optional[list] = None,
+        layer_sink: Optional[list] = None,
+        attn_sink: Optional[list] = None,
     ):
         hidden_states = self.patch_embedder(pixel_values, pixel_position_ids)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(hidden_states, pixel_position_ids,
-                                  input_mask)
+            hidden_states = layer(hidden_states,
+                                  pixel_position_ids,
+                                  input_mask,
+                                  attn_sink=attn_sink)
+            if layer_sink is not None:
+                # PIECES_MM_DEBUG_LAYERS only: this layer's output, the same
+                # tensor the torchax lane records as ``L<i>``.
+                layer_sink.append(hidden_states)
 
         if debug_sink is not None:
             # PIECES_MM_DEBUG only: hand the pre-pooler encoder output to the
@@ -805,6 +820,35 @@ def require_audio_disabled_at_api(audio_cfg, vllm_config, cls_name):
             "checkpoint on a path that implements the tower.")
 
 
+def _new_layer_sinks() -> tuple[Optional[list], Optional[list]]:
+    """Fresh per-layer sinks, or (None, None) with the flag off.
+
+    A trace-time Python guard: off (the default) the tower's loop appends
+    nothing and traces no callback, so the jaxpr is byte-identical.
+    """
+    if not (envs.PIECES_MM_DEBUG and envs.PIECES_MM_DEBUG_LAYERS):
+        return None, None
+    return [], []
+
+
+def _vision_layer_tensors(layer_sink: Optional[list],
+                          attn_sink: Optional[list]) -> dict:
+    """PIECES_MM_DEBUG_LAYERS: the ``A<i>``/``L<i>`` tensors, or ``{}``.
+
+    ``A<i>`` is layer i's attention output and ``L<i>`` is layer i's output --
+    the same two names ``models/vllm/experimental/mm_debug_patch.py`` emits on
+    the torchax lane, so the two towers can be diffed layer by layer on a
+    chip. That is the one thing the CPU differential cannot settle: on the
+    real E4B weights the torchax tower reproduces transformers' eager tower
+    to bf16 noise at every layer and every grid.
+    """
+    tensors: dict = {}
+    for prefix, sink in (("A", attn_sink), ("L", layer_sink)):
+        for index, value in enumerate(sink or []):
+            tensors[f"{prefix}{index}"] = value
+    return tensors
+
+
 class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
     packed_modules_mapping = Gemma4ForCausalLM.packed_modules_mapping
     WeightLoader = StandardWeightLoader
@@ -963,11 +1007,14 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
         # debug_sink=None and traces no callback, so the jaxpr is byte-identical
         # to the unpatched method; on, ONE host-side stats line per call.
         debug_sink = [] if envs.PIECES_MM_DEBUG else None
+        layer_sink, attn_sink = _new_layer_sinks()
         vision_outputs = self.model.vision_tower(
             pixel_values,
             input_mask=input_mask,
             pixel_position_ids=pixel_position_ids,
-            debug_sink=debug_sink)
+            debug_sink=debug_sink,
+            layer_sink=layer_sink,
+            attn_sink=attn_sink)
 
         tower_features = vision_outputs[0][0]
         pooler_mask = vision_outputs[0][1]
@@ -996,6 +1043,20 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
                     "n_images": int(pixel_values.shape[0]),
                 },
             )
+            layer_tensors = _vision_layer_tensors(layer_sink, attn_sink)
+            if layer_tensors:
+                emit_mm_debug_stats(
+                    logger.info,
+                    "native",
+                    tensors=layer_tensors,
+                    masks={name: input_mask
+                           for name in layer_tensors},
+                    counts={},
+                    extra={
+                        "site": "get_single_image_embedding:layers",
+                        "n_images": int(pixel_values.shape[0]),
+                    },
+                )
 
         seq_len = pooler_mask.shape[1]
         indices = jnp.arange(seq_len)
@@ -1243,11 +1304,14 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
 
         # PIECES_MM_DEBUG: same trace-time guard as get_single_image_embedding.
         debug_sink = [] if envs.PIECES_MM_DEBUG else None
+        layer_sink, attn_sink = _new_layer_sinks()
         vision_outputs = self.model.vision_tower(
             pixel_values,
             input_mask=input_mask,
             pixel_position_ids=pixel_position_ids,
             debug_sink=debug_sink,
+            layer_sink=layer_sink,
+            attn_sink=attn_sink,
         )
         tower_features = vision_outputs[0][0]
         pooler_mask = vision_outputs[0][1]
@@ -1275,6 +1339,20 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
                     "n_images": int(pixel_values.shape[0]),
                 },
             )
+            layer_tensors = _vision_layer_tensors(layer_sink, attn_sink)
+            if layer_tensors:
+                emit_mm_debug_stats(
+                    logger.info,
+                    "native",
+                    tensors=layer_tensors,
+                    masks={name: input_mask
+                           for name in layer_tensors},
+                    counts={},
+                    extra={
+                        "site": "encoder_cudagraph_forward:layers",
+                        "n_images": int(pixel_values.shape[0]),
+                    },
+                )
 
         seq_len = pooler_mask.shape[1]
         sort_indices = jnp.arange(seq_len)

@@ -751,3 +751,129 @@ def test_tower_without_a_pooler_still_reports_the_projector_input():
     jax.block_until_ready(model._process_image_input(_images()))
     f = _fields(log[0])
     assert f["tower.shape"] == f"2x(1,4,{H})"
+
+
+# ------------------------------------------- PIECES_MM_DEBUG_LAYERS (A/L)
+class _VisionAttention(_Mod):
+    """Class name ends in "Attention"; returns (output, attn_weights)."""
+
+    def forward(self, hidden, **kwargs):
+        return jnp.tanh(hidden @ W_ENC), None
+
+
+class _VisionEncoderLayer(_Mod):
+    """Class name ends in "EncoderLayer"; returns the hidden states."""
+
+    def __init__(self):
+        self.self_attn = _VisionAttention()
+        self._children = {"self_attn": self.self_attn}
+
+    def forward(self, hidden, **kwargs):
+        attn, _ = self.self_attn(hidden)
+        return hidden + attn
+
+
+class _LayeredEncoder(_Mod):
+
+    def __init__(self, n_layers=2):
+        self.layers = [_VisionEncoderLayer() for _ in range(n_layers)]
+        self._children = {
+            f"layers.{i}": layer
+            for i, layer in enumerate(self.layers)
+        }
+
+    def forward(self, inputs_embeds, attention_mask, pixel_position_ids=None,
+                **kwargs):
+        hidden = inputs_embeds
+        for layer in self.layers:
+            hidden = layer(hidden)
+        return _Output(hidden * attention_mask[..., None].astype(hidden.dtype))
+
+
+def _layered_model():
+    return _FakeGemma4(encoder=_LayeredEncoder())
+
+
+def test_per_layer_off_emits_one_line_and_no_layer_fields():
+    """Negative control: the flag off changes nothing about the line."""
+    log = []
+    model = _layered_model()
+    _install(model, log)
+    model._process_image_input(_images())
+    assert len(log) == 1, log
+    fields = _fields(log[0])
+    assert not [k for k in fields if k.startswith(("A0.", "L0."))]
+
+
+def test_per_layer_on_emits_a_second_line_with_every_layer():
+    log = []
+    model = _layered_model()
+    PATCH.install_mm_debug(model,
+                           to_jax=lambda t: t,
+                           log=log.append,
+                           emit=STATS.emit_mm_debug_stats,
+                           per_layer=True)
+    model._process_image_input(_images())
+    assert len(log) == 2, log
+    main, layers = _fields(log[0]), _fields(log[1])
+    assert main["site"] == "_process_image_input"
+    assert layers["site"] == "_process_image_input:layers"
+    # Two layers, each with an attention output and a layer output.
+    for name in ("A0", "A1", "L0", "L1"):
+        assert f"{name}.std" in layers, (name, sorted(layers))
+        assert f"{name}.nan" in layers
+    assert "A2.std" not in layers
+    # The recorded tensors are the encoder's own, so a layer's stats must
+    # differ from the attention output it is built from.
+    assert layers["A0.std"] != layers["L0.std"]
+
+
+def test_per_layer_hooks_leave_the_encoder_output_unchanged():
+    """The hooks record; they must not alter what the tower returns."""
+    images = _images()   # _RNG advances per call, so build the input ONCE
+    clean = _layered_model()._process_image_input(images)
+    hooked_model = _layered_model()
+    PATCH.install_mm_debug(hooked_model,
+                           to_jax=lambda t: t,
+                           log=[].append,
+                           emit=STATS.emit_mm_debug_stats,
+                           per_layer=True)
+    hooked = hooked_model._process_image_input(images)
+    assert len(clean) == len(hooked)
+    for a, b in zip(clean, hooked):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_per_layer_hooks_reach_inside_a_jittable_module():
+    """The encoder is wrapped by patch_mm_model before the hooks go in."""
+    log = []
+    model = _FakeGemma4(encoder=JittableModule(_LayeredEncoder()))
+    PATCH.install_mm_debug(model,
+                           to_jax=lambda t: t,
+                           log=log.append,
+                           emit=STATS.emit_mm_debug_stats,
+                           per_layer=True)
+    model._process_image_input(_images())
+    assert len(log) == 2, log
+    assert "L1.std" in _fields(log[1])
+
+
+def test_the_patcher_passes_the_layers_flag_through():
+    src = PATCHER_SRC.read_text()
+    assert "per_layer=envs.PIECES_MM_DEBUG_LAYERS" in src
+
+
+def test_the_flax_tower_emits_the_same_two_names_under_the_same_flag():
+    """A one-sided instrument cannot produce a differential."""
+    flax_src = (ROOT / "tpu_inference" / "models" / "jax" /
+                "gemma4_mm.py").read_text()
+    assert "envs.PIECES_MM_DEBUG_LAYERS" in flax_src
+    assert 'f"A{index}"' in flax_src or '"A"' in flax_src
+    assert "layer_sink" in flax_src and "attn_sink" in flax_src
+    # ... and the sinks stay None with the flag off, so the jaxpr is unchanged.
+    tree = ast.parse(flax_src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_new_layer_sinks")
+    body = ast.unparse(fn)
+    assert "envs.PIECES_MM_DEBUG and envs.PIECES_MM_DEBUG_LAYERS" in body
+    assert "return (None, None)" in body

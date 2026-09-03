@@ -47,6 +47,8 @@ from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.sequence import IntermediateTensors
 
 from tpu_inference.logger import init_logger
+from tpu_inference.models.vllm.experimental.gemma4_vision_attention import \
+    maybe_apply_gemma4_vision_attention_patch
 
 logger = init_logger(__name__)
 
@@ -146,6 +148,9 @@ def apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
 def maybe_apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
     if not isinstance(vllm_model, Gemma4ForConditionalGeneration):
         return
+    # The vision-attention fix applies to every Gemma-4 with a tower,
+    # including the variants that have no PLE buffer to replace.
+    maybe_apply_gemma4_vision_attention_patch(vllm_model)
     ple_dim = getattr(vllm_model.config.text_config,
                       "hidden_size_per_layer_input", None)
     if ple_dim is None or ple_dim <= 0:
