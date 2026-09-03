@@ -35,6 +35,7 @@ jobs:
             tests/kernels/test_int8_quant_scale_precision.py
             tests/layers/common/quantization/test_paths_agree.py
             tests/layers/common/quantization/test_torchax_dtype_guard.py
+            tests/layers/common/test_moe_w8a16_switch.py
             tests/layers/common/test_quantized_matmul_rank.py
             tests/layers/common/test_rank_generic_sharding.py
             tests/layers/common/test_w8a16_switch.py
