@@ -33,6 +33,7 @@ RUN set -e; \
       layers/common/attention_interface.py \
       layers/vllm/backends/flash_attn.py \
       models/vllm/experimental/gemma4_unified_patcher.py \
+      models/vllm/experimental/mm_jit_signature.py \
       models/vllm/experimental/model_patcher.py \
       runner/tpu_runner.py \
       runner/compilation_manager.py \
@@ -47,6 +48,8 @@ RUN set -e; \
     grep -q "mm_bidi_ranges" "$TI_DIR/kernels/ragged_paged_attention/v3/kernel.py"; \
     grep -q "mm_bidi_enabled" "$TI_DIR/runner/tpu_runner.py"; \
     grep -q "maybe_apply_gemma4_unified_patches" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
+    grep -q "compute_mm_jit_static_args" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
+    test -f "$TI_DIR/models/vllm/experimental/mm_jit_signature.py"; \
     python3 -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/workspace/tpu_inference/tpu_inference/**/*.py', recursive=True)]"; \
     python3 -c "import tpu_inference.kernels.ragged_paged_attention.v3.kernel; print('kernel module imports OK')"; \
     echo "P6 PATCHES APPLIED AND VERIFIED"

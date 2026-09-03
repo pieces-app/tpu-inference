@@ -55,6 +55,7 @@ jobs:
             tests/models/jax/test_audio_skip_fails_closed.py
             tests/models/jax/test_gemma4_unified.py
             tests/models/jax/test_no_kernel_attribute_reads.py
+            tests/models/vllm/experimental/test_mm_jit_static_args.py
             tests/runner/test_draft_token_owners_survive_condense.py
             tests/runner/test_init_not_truncated.py
             tests/runner/test_primers_carry_mm_bidi_ranges.py

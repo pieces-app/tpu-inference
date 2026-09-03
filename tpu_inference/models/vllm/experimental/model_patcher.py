@@ -34,6 +34,8 @@ from tpu_inference.models.vllm.experimental.gemma4_mm_patcher import \
     maybe_apply_gemma4_mm_patches
 from tpu_inference.models.vllm.experimental.gemma4_unified_patcher import \
     maybe_apply_gemma4_unified_patches
+from tpu_inference.models.vllm.experimental.mm_jit_signature import \
+    compute_mm_jit_static_args
 from tpu_inference.models.vllm.experimental.qwen3_omni_patcher import \
     maybe_apply_qwen3_omni_patches
 from tpu_inference.models.vllm.experimental.qwen3_vl_patcher import \
@@ -173,13 +175,15 @@ def patch_mm_model(
             cur_module = getattr(cur_module, name)
 
         target_module_name = module_names[-1]
-        # Pass static JIT arguments for Qwen3-VL visual submodule
-        extra_jit_args = {
-            "static_argnums": (3, ),
-            "static_argnames": ("grid_thw", ),
-        }
+        target_module = getattr(cur_module, target_module_name)
+        # Derive the static/dynamic split from this module's own forward
+        # signature. A fixed mapping cannot be reused across architectures:
+        # index 3 is Qwen3-VL's `grid_thw`, but on Gemma-4's
+        # Gemma4VisionEncoder.forward the same index is `attention_mask`.
+        extra_jit_args = compute_mm_jit_static_args(target_module.forward)
+        logger.info("Jit static args for %s: %s", module_key, extra_jit_args)
 
-        jitted_module = JittableModule(getattr(cur_module, target_module_name),
+        jitted_module = JittableModule(target_module,
                                        extra_jit_args=extra_jit_args)
         setattr(cur_module, target_module_name, jitted_module)
 
