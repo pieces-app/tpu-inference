@@ -81,22 +81,50 @@ def _ple_forward(
     # [replaces upstream forward's buffer read] Upstream forward does
     #   per_layer_inputs = self.per_layer_embeddings[:inputs_embeds.shape[0]]
     #   (guarded on per_layer_embeddings/inputs_embeds not None).
-    # Here PLE is computed inline instead, under the equivalent guard
-    # (input_ids replaces the buffer as the data source).
+    # Here PLE is computed inline instead, under the same
+    # `inputs_embeds is not None` guard (input_ids, or zeros when the runner
+    # withheld them, replaces the buffer as the data source).
     per_layer_inputs = None
-    if inputs_embeds is not None and input_ids is not None:
-        # [new — replaces upstream embed_input_ids' is_multimodal mask]
-        # Upstream masks multimodal placeholder positions to token 0 via the
-        # is_multimodal tensor, which forward does not receive. Those
-        # positions hold the image/audio placeholder token ids, so masking
-        # by token id selects the same positions.
-        ple_input_ids = input_ids
-        for token_id in self._tpu_ple_mask_token_ids:
-            ple_input_ids = torch.where(
-                ple_input_ids == token_id,
-                torch.zeros_like(ple_input_ids),
-                ple_input_ids,
-            )
+    if inputs_embeds is not None:
+        # THE GUARD USED TO REQUIRE input_ids TOO, and that made this whole
+        # block dead on exactly the steps it was written for. The runner
+        # hands the model EITHER input_ids OR inputs_embeds, never both
+        # (tpu_runner._get_input_ids_embeds): a step carrying image
+        # embeddings passes inputs_embeds and input_ids=None, a text step
+        # passes input_ids and inputs_embeds=None. So `both non-None` never
+        # held, per_layer_inputs was always None here, and on image steps
+        # Gemma4SelfDecoderLayers.forward then ran
+        # project_per_layer_inputs(hidden_states, None), which returns the
+        # PROJECTION TRACK ALONE (vllm/model_executor/models/gemma4.py) --
+        # the per-layer embedding track was dropped for the entire image
+        # prompt. Text steps were never affected: with inputs_embeds None the
+        # language model recomputes both tracks from input_ids itself.
+        #
+        # The flax path reaches the same missing-ids case and synthesises
+        # zeros (models/jax/gemma4.py, Gemma4Model.compute_per_layer_inputs),
+        # so take the same fallback and the two paths compute the same
+        # per-layer inputs on an image prefill.
+        if input_ids is not None:
+            # [new — replaces upstream embed_input_ids' is_multimodal mask]
+            # Upstream masks multimodal placeholder positions to token 0 via
+            # the is_multimodal tensor, which forward does not receive. Those
+            # positions hold the image/audio placeholder token ids, so masking
+            # by token id selects the same positions.
+            ple_input_ids = input_ids
+            for token_id in self._tpu_ple_mask_token_ids:
+                ple_input_ids = torch.where(
+                    ple_input_ids == token_id,
+                    torch.zeros_like(ple_input_ids),
+                    ple_input_ids,
+                )
+        else:
+            # positions is (num_tokens,), or (3, num_tokens) under mRoPE;
+            # either way its last axis is the padded token count, which is
+            # inputs_embeds.shape[0]. Deriving the zeros from an argument
+            # keeps them on the same device/dtype as the real ids without a
+            # torch factory call inside the torchax trace.
+            pos = positions if positions.dim() == 1 else positions[0]
+            ple_input_ids = torch.zeros_like(pos)
         # [upstream embed_input_ids, verbatim] The PLE producer computation
         # (lookup + reshape), minus the final buffer copy_.
         per_layer_inputs = self.language_model.model.get_per_layer_inputs(

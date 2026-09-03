@@ -32,6 +32,7 @@ for f in \
   models/vllm/experimental/mm_debug_patch.py \
   models/vllm/experimental/mm_jit_signature.py \
   models/vllm/experimental/model_patcher.py \
+  runner/mm_bidi_ranges.py \
   runner/tpu_runner.py \
   runner/compilation_manager.py \
   runner/multimodal_manager.py \
