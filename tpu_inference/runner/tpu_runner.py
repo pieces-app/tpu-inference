@@ -76,6 +76,7 @@ from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
+from tpu_inference.runner.mm_bidi_ranges import build_mm_bidi_ranges
 from tpu_inference.runner.multimodal_manager import MultiModalManager
 from tpu_inference.runner.persistent_batch_manager import \
     PersistentBatchManager
@@ -1053,7 +1054,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             return False
 
         text_cfg = getattr(self.model_config.hf_config, "text_config", None)
-        if getattr(text_cfg, "use_bidirectional_attention", None) != "vision":
+        declared = getattr(text_cfg, "use_bidirectional_attention", None)
+        if declared != "vision":
+            # This return used to be SILENT, and its silence cost a session:
+            # gemma-4 E4B/E2B print NO mm-bidi line at all (12B prints
+            # ENABLED, 26B/31B print the arch warning below), so "is the
+            # blockwise mask armed on this lane?" could only be answered by
+            # noticing an absent log line. Multimodal models say it out loud.
+            if getattr(self.model_config, "is_multimodal_model", False):
+                logger.info(
+                    "mm-bidi: not applicable — text_config."
+                    "use_bidirectional_attention=%r (not \"vision\"). Image "
+                    "tokens attend causally only on BOTH the flax and the "
+                    "torchax path.", declared)
             return False
 
         def _off(reason: str) -> bool:
@@ -2915,45 +2928,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # (0, 0) = no block for that request. Mirrors the GPU runner's
         # mm_req_doc_ranges (extract_embeds_range), limited to one contiguous
         # range per request (the practical Gemma-4 single-image case); other
-        # shapes fall back to causal for that request.
+        # shapes fall back to causal for that request. The arithmetic lives in
+        # runner/mm_bidi_ranges.py so it can be tested without a chip.
+        #
+        # Under PIECES_MM_DEBUG the rows are walked even when the feature is
+        # OFF, so one line per image request says whether the mask the kernel
+        # receives is armed or inert -- the question that cost a full session
+        # to answer from the ABSENCE of a boot line (E4B/E2B: their text
+        # config does not declare use_bidirectional_attention="vision", so
+        # _init_mm_bidi returns before it logs anything at all).
         mm_bidi_ranges_cpu = None
-        if self.mm_bidi_enabled:
-            mm_bidi_ranges_cpu = np.zeros((self.max_num_reqs, 2),
-                                          dtype=np.int32)
+        mm_bidi_debug = envs.PIECES_MM_DEBUG
+        if self.mm_bidi_enabled or mm_bidi_debug:
+            mm_bidi_rows = []
             for dp_rank in range(dp_size):
                 req_offset = dp_rank * max_num_reqs_per_dp_rank
                 for i, req_id in enumerate(req_ids_dp[dp_rank]):
                     req_state = self.requests.get(req_id)
-                    feats = getattr(req_state, "mm_features", None) or []
-                    ranges: list[tuple[int, int]] = []
-                    for feat in feats:
-                        if getattr(feat, "modality", None) == "audio":
-                            continue
-                        pos_info = feat.mm_position
-                        if hasattr(pos_info, "extract_embeds_range"):
-                            ranges.extend(pos_info.extract_embeds_range())
-                        else:
-                            ranges.append(
-                                (pos_info.offset,
-                                 pos_info.offset + pos_info.length - 1))
-                    if len(ranges) == 1:
-                        start, last = ranges[0]
-                        mm_bidi_ranges_cpu[req_offset + i, 0] = start
-                        mm_bidi_ranges_cpu[req_offset + i, 1] = last + 1
-                    elif len(ranges) > 1:
-                        # KNOWN LIMITATION: the kernel operand carries one
-                        # [start, end) per request, so a multi-image (or
-                        # multi-frame video) request keeps causal-only
-                        # attention over its image blocks and will show the
-                        # same fine-text degradation this feature fixes.
-                        # Warn per request-shape, not once globally, so it
-                        # cannot hide behind an earlier single-image warning.
-                        logger.warning(
-                            "mm-bidi: request %s has %d image blocks but the "
-                            "kernel operand holds one range per request — "
-                            "falling back to CAUSAL-ONLY attention for this "
-                            "request's images (degraded fine-text fidelity).",
-                            req_id, len(ranges))
+                    mm_bidi_rows.append((req_offset + i, req_id,
+                                         getattr(req_state, "mm_features",
+                                                 None)))
+            mm_bidi_ranges_cpu = build_mm_bidi_ranges(
+                self.max_num_reqs,
+                mm_bidi_rows,
+                enabled=self.mm_bidi_enabled,
+                logger=logger,
+                debug=mm_bidi_debug,
+            )
 
         # populate logits_indices
         for dp_rank in range(dp_size):

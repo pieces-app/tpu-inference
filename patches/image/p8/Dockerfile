@@ -43,6 +43,7 @@ RUN set -e; \
       models/vllm/experimental/mm_debug_patch.py \
       models/vllm/experimental/mm_jit_signature.py \
       models/vllm/experimental/model_patcher.py \
+      runner/mm_bidi_ranges.py \
       runner/tpu_runner.py \
       runner/compilation_manager.py \
       runner/multimodal_manager.py \
@@ -59,6 +60,9 @@ RUN set -e; \
            "$TI_DIR/runner/__pycache__" /tmp/p8; \
     grep -q "mm_bidi_ranges" "$TI_DIR/kernels/ragged_paged_attention/v3/kernel.py"; \
     grep -q "mm_bidi_enabled" "$TI_DIR/runner/tpu_runner.py"; \
+    test -f "$TI_DIR/runner/mm_bidi_ranges.py"; \
+    grep -q "build_mm_bidi_ranges" "$TI_DIR/runner/tpu_runner.py"; \
+    grep -q "if inputs_embeds is not None:" "$TI_DIR/models/vllm/experimental/gemma4_mm_patcher.py"; \
     grep -q "maybe_apply_gemma4_unified_patches" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     grep -q "compute_mm_jit_static_args" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     test -f "$TI_DIR/models/vllm/experimental/mm_jit_signature.py"; \
