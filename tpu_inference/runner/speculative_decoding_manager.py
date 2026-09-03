@@ -39,32 +39,53 @@ class SpeculativeDecodingManager:
 
     def __init__(self, runner: TPUModelRunner):
         self.runner = runner
-        # Cached draft tokens.
+        # Cached draft tokens, together with the batch geometry they were
+        # proposed under: `_req_indices_dp` (per-rank row -> batch index) and
+        # `_draft_req_ids` (batch index -> request id). Both are captured in
+        # propose_draft_token_ids and consumed together by
+        # take_draft_token_ids, because the batch can change in between.
         self._draft_token_ids: Optional[list[list[int]]] = None
         self._req_indices_dp: Optional[dict] = None
+        self._draft_req_ids: Optional[list[str]] = None
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         if self._draft_token_ids is None:
             return None
-        req_ids = self.runner.input_batch.req_ids
+        # Row i of the cached drafts belongs to the request that sat at batch
+        # index i WHEN THEY WERE PROPOSED, not to whatever sits there now.
+        # Under async scheduling the engine core takes the drafts of step N-1
+        # (to validate them against each request's grammar and build the
+        # (1 + K) bitmask rows for step N) only after step N's execute_model
+        # has already run update_states, which removes finished requests and
+        # condenses the batch (InputBatch.condense moves the last request into
+        # the hole). Zipping the rows with the live input_batch.req_ids handed
+        # request X's drafts to request Y: the scheduler validated X's drafts
+        # under Y's grammar, built Y's rows from that prefix, and the recovery
+        # token sampled under a row built for the wrong prefix could violate
+        # Y's grammar ("Unexpected: grammar rejected tokens [...]", 15/138
+        # requests on eval-26b-mtp 2026-09-03). Use the proposal-time owners.
+        req_ids = self._draft_req_ids
+        assert req_ids is not None, (
+            "draft token ids were cached without their owners; "
+            "propose_draft_token_ids must record _draft_req_ids")
         draft_token_ids = self._draft_token_ids
+        req_indices_dp = self._req_indices_dp
+        self._draft_token_ids = None
+        self._req_indices_dp = None
+        self._draft_req_ids = None
 
-        if self._req_indices_dp is None:
-            self._draft_token_ids = None
-            self._req_indices_dp = None
-            return DraftTokenIds(req_ids, draft_token_ids)
+        if req_indices_dp is None:
+            return DraftTokenIds(req_ids, draft_token_ids[:len(req_ids)])
 
         # reorders per-rank outputs back to the original batch ordering
         num_spec = self.runner.speculative_config.num_speculative_tokens
-        reorded_draft_token_ids = [[] for _ in range(len(draft_token_ids))]
+        reorded_draft_token_ids = [[] for _ in range(len(req_ids))]
         max_num_reqs_per_dp_rank = self.runner.max_num_reqs // self.runner.dp_size
         for rank in range(self.runner.dp_size):
-            req_indices = self._req_indices_dp[rank]
+            req_indices = req_indices_dp[rank]
             for j, req_idx in enumerate(req_indices):
                 tokens = draft_token_ids[j + rank * max_num_reqs_per_dp_rank]
                 reorded_draft_token_ids[req_idx] = tokens[:num_spec]
-        self._draft_token_ids = None
-        self._req_indices_dp = None
         return DraftTokenIds(req_ids, reorded_draft_token_ids)
 
     def propose_draft_token_ids(
@@ -85,6 +106,11 @@ class SpeculativeDecodingManager:
         if async_scheduling:
             assert self.runner.speculative_config.use_eagle(
             ), "async scheduling is only supported with eagle3 spec decoding"
+        # Snapshot which request owns each draft row now. take_draft_token_ids
+        # may run after the next step's update_states has condensed the batch,
+        # at which point input_batch.req_ids no longer describes these rows.
+        num_reqs = self.runner.input_batch.num_reqs
+        self._draft_req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             # For n-gram based proposer, the drafter run on host

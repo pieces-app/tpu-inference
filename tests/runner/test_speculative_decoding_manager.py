@@ -232,8 +232,12 @@ class TestSpeculativeDecodingManager:
         self.runner.input_batch.add_request(req1)
         self.runner.input_batch.add_request(req2)
 
-        # Set the draft tokens to be taken
+        # Set the draft tokens to be taken, with the owners recorded at
+        # proposal time (propose_draft_token_ids snapshots them; the live
+        # batch may already have been condensed by the time they are taken).
         self.runner.speculative_decoding_manager._draft_token_ids = mock_draft_ids
+        self.runner.speculative_decoding_manager._draft_req_ids = list(
+            mock_req_ids)
         self.runner.speculative_decoding_manager._req_indices_dp = {
             rank:
             list(
@@ -255,6 +259,7 @@ class TestSpeculativeDecodingManager:
 
         # Assert that the internal state is reset
         assert self.runner.speculative_decoding_manager._draft_token_ids is None
+        assert self.runner.speculative_decoding_manager._draft_req_ids is None
 
         # Case 3: Call again after taking, should return None
         result_after = self.runner.take_draft_token_ids()
