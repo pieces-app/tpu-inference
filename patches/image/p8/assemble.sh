@@ -22,6 +22,7 @@ for f in \
   layers/common/attention_interface.py \
   layers/vllm/backends/flash_attn.py \
   models/vllm/experimental/gemma4_unified_patcher.py \
+  models/vllm/experimental/mm_jit_signature.py \
   models/vllm/experimental/model_patcher.py \
   runner/tpu_runner.py \
   runner/compilation_manager.py \
