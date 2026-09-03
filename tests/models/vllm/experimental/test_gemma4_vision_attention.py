@@ -74,8 +74,8 @@ def _fn(tree, name):
 
 
 def _src(path, name):
-    return ast.get_source_segment(path.read_text(), _fn(ast.parse(
-        path.read_text()), name))
+    return ast.get_source_segment(path.read_text(),
+                                  _fn(ast.parse(path.read_text()), name))
 
 
 # --------------------------------------------------------------------- #
@@ -104,8 +104,7 @@ def _inputs(n_query, n_pad, seed=0):
     # transformers' sdpa_mask for this tower: bidirectional, AND the padding
     # mask, which is indexed by kv only -- so the mask is constant down the
     # query axis.
-    mask = np.broadcast_to(valid[:, None, None, :],
-                           (1, 1, n_query, n_query))
+    mask = np.broadcast_to(valid[:, None, None, :], (1, 1, n_query, n_query))
     return q, k, v, mask, valid
 
 
@@ -123,7 +122,8 @@ def _attention(q, k, v, mask, score_dtype, out_dtype, chunk=0):
     parts = []
     for start in range(0, n, block):
         stop = min(start + block, n)
-        s = jnp.einsum("bhqd,bhkd->bhqk", q[:, :, start:stop].astype(score_dtype),
+        s = jnp.einsum("bhqd,bhkd->bhqk", q[:, :,
+                                            start:stop].astype(score_dtype),
                        k.astype(score_dtype))
         s = jnp.where(m[:, :, start:stop, :], s,
                       jnp.asarray(jnp.finfo(score_dtype).min, score_dtype))
@@ -134,7 +134,8 @@ def _attention(q, k, v, mask, score_dtype, out_dtype, chunk=0):
 
 def _reference(q, k, v, mask):
     """fp64 softmax attention -- the answer both formulations approximate."""
-    s = np.einsum("bhqd,bhkd->bhqk", q.astype(np.float64), k.astype(np.float64))
+    s = np.einsum("bhqd,bhkd->bhqk", q.astype(np.float64),
+                  k.astype(np.float64))
     s = np.where(mask, s, -np.inf)
     s -= s.max(-1, keepdims=True)
     p = np.exp(s)
@@ -157,8 +158,8 @@ def test_bf16_scores_are_several_times_further_from_the_reference(
     ref = _reference(q, k, v, mask)
     bf16_scores = _defect(
         _attention(q, k, v, mask, jnp.bfloat16, jnp.bfloat16), ref)
-    fp32_scores = _defect(
-        _attention(q, k, v, mask, jnp.float32, jnp.bfloat16), ref)
+    fp32_scores = _defect(_attention(q, k, v, mask, jnp.float32, jnp.bfloat16),
+                          ref)
     assert fp32_scores > 0.0, "the reference must not be reproduced exactly"
     assert bf16_scores > 3 * fp32_scores, (
         f"bf16 scores {bf16_scores:.3e} vs fp32 scores {fp32_scores:.3e}: "
@@ -174,8 +175,8 @@ def test_fp32_scores_reach_full_bf16_accuracy(n_query, n_pad):
     ref = _reference(q, k, v, mask)
     # Everything in fp32 is the floor: bf16 q/k/v cannot beat it.
     floor = _defect(_attention(q, k, v, mask, jnp.float32, jnp.float32), ref)
-    fp32_scores = _defect(
-        _attention(q, k, v, mask, jnp.float32, jnp.bfloat16), ref)
+    fp32_scores = _defect(_attention(q, k, v, mask, jnp.float32, jnp.bfloat16),
+                          ref)
     assert floor < 1e-12
     assert fp32_scores < 1e-4
 
@@ -210,7 +211,8 @@ def test_padded_keys_are_excluded_and_padded_queries_still_attend():
     clean = _attention(q, k, v, mask, jnp.float32, jnp.float32)
     poisoned = _attention(q, k_poisoned, v_poisoned, mask, jnp.float32,
                           jnp.float32)
-    assert np.array_equal(clean[:, :, valid[0], :], poisoned[:, :, valid[0], :])
+    assert np.array_equal(clean[:, :, valid[0], :], poisoned[:, :,
+                                                             valid[0], :])
     # ... and the padded query rows are computed, not left as garbage/NaN.
     assert np.isfinite(clean[:, :, ~valid[0], :]).all()
 
