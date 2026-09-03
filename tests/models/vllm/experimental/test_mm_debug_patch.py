@@ -506,3 +506,248 @@ def test_real_jittable_module_instance_forward_override_is_observed():
     assert f["proj.shape"] == f"(4,{D})"
     assert f["soft_tokens"] == "4"
     assert f["enc.nan"] == "0" and f["proj.nan"] == "0"
+
+
+# ------------------------------------- the pooler, at Gemma-4 E4B scale
+#
+# The lane serves --mm-processor-kwargs '{"max_soft_tokens": 1120}', so the
+# HF Gemma4 image processor emits MAX_PATCHES = 1120 * 3^2 = 10080 patches
+# per image, right-padded with (-1, -1) positions. The pooler's output
+# buffer is therefore always 1120 slots; how many of them are VALID depends
+# on the image's patch grid, and that valid count -- not 1120 -- is what the
+# processor put in the prompt as <image> placeholders.
+#
+# _Pooler mirrors transformers Gemma4VisionPooler._avg_pool_by_positions.
+# Verified against the real module (transformers 5.16.1) for the grids
+# below: (1, 1120, D) pooled, 1092 / 1092 / 1104 valid.
+MAX_SOFT_TOKENS = 1120
+POOL_K = 3
+MAX_PATCHES = MAX_SOFT_TOKENS * POOL_K**2  # 10080
+# (image WxH, cols x rows after the processor's aspect-preserving resize,
+#  soft tokens the prompt gets). Three real images from the iso-cases-wide
+# set the eval-e4b lanes serve.
+E4B_GRIDS = [
+    ("3402x2158", 126, 78, 1092),
+    ("2946x2070", 117, 84, 1092),
+    ("1840x872", 144, 69, 1104),
+]
+
+
+def _pool_by_positions(hidden, pos, length):
+    """transformers Gemma4VisionPooler._avg_pool_by_positions, in jnp.
+
+    The index math is copied verbatim -- ``max_x // k`` as the row stride is
+    where the valid-slot count comes from. The reduction is written as a
+    segment sum rather than the reference one-hot matmul (which would
+    allocate a 10080x1120 weight matrix); the two agree exactly, and
+    ``test_segment_form_matches_the_reference_one_hot_matmul`` pins that.
+    """
+    k = int((hidden.shape[1] // length)**0.5)
+    clamped = jnp.clip(pos, 0, None)
+    max_x = clamped[..., 0].max(axis=-1, keepdims=True) + 1
+    kernel_idxs = clamped // k
+    idx = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+    pooled = jnp.stack([
+        jax.ops.segment_sum(hidden[b], idx[b], num_segments=length)
+        for b in range(hidden.shape[0])
+    ]) / (k * k)
+    mask = jnp.zeros((hidden.shape[0], length),
+                     bool).at[jnp.arange(hidden.shape[0])[:, None],
+                              idx].set(True)
+    return pooled, mask
+
+
+def _pool_by_positions_reference(hidden, pos, length):
+    """The reference one-hot matmul, for the equivalence check only."""
+    k = int((hidden.shape[1] // length)**0.5)
+    clamped = jnp.clip(pos, 0, None)
+    max_x = clamped[..., 0].max(axis=-1, keepdims=True) + 1
+    kernel_idxs = clamped // k
+    idx = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+    weights = jax.nn.one_hot(idx, length, dtype=jnp.float32) / (k * k)
+    pooled = jnp.einsum("bnl,bnh->blh", weights, hidden)
+    mask = jnp.logical_not((weights == 0).all(axis=1))
+    return pooled, mask
+
+
+class _Pooler(_Mod):
+
+    def forward(self, hidden_states, pixel_position_ids, padding_positions,
+                output_length):
+        hidden_states = jnp.where(padding_positions[..., None], 0.0,
+                                  hidden_states)
+        if hidden_states.shape[1] == output_length:
+            return hidden_states, jnp.logical_not(padding_positions)
+        return _pool_by_positions(hidden_states, pixel_position_ids,
+                                  output_length)
+
+
+class _PooledTower(_Tower):
+
+    def __init__(self, encoder):
+        super().__init__(encoder)
+        self.pooler = _Pooler()
+        self._children["pooler"] = self.pooler
+
+
+class _FakeGemma4Pooled(_FakeGemma4):
+    """vllm gemma4_mm.py Gemma4ForConditionalGeneration._process_image_input:
+    encode the padded patches, pool per image to shape[1] // k^2 slots, drop
+    the invalid slots, project the packed rows for every image at once."""
+
+    def __init__(self, encoder=None):
+        super().__init__(encoder)
+        self.vision_tower = _PooledTower(encoder or JittableModule(_Encoder()))
+
+    def _process_image_input(self, image_input):
+        vt = self.vision_tower
+        valid_states, valid_lens = [], []
+        for pv, pp in zip(image_input["pixel_values"],
+                          image_input["pixel_position_ids"]):
+            pad = jnp.all(pp == -1, axis=-1)
+            inputs_embeds = vt.patch_embedder(pv[None], pp[None], pad[None])
+            hidden = vt.encoder(inputs_embeds=inputs_embeds,
+                                attention_mask=~pad[None],
+                                pixel_position_ids=pp[None]).last_hidden_state
+            output_length = hidden.shape[1] // (POOL_K**2)
+            pooled, valid_mask = vt.pooler(
+                hidden_states=hidden,
+                pixel_position_ids=pp[None],
+                padding_positions=pad[None],
+                output_length=output_length,
+            )
+            packed = pooled[valid_mask]
+            valid_states.append(packed)
+            valid_lens.append(int(packed.shape[0]))
+        flat = jnp.concatenate(valid_states, axis=0)
+        proj = self.embed_vision(inputs_embeds=flat[None])[0]
+        out, offset = [], 0
+        for n in valid_lens:
+            out.append(proj[offset:offset + n])
+            offset += n
+        return out
+
+
+def _e4b_image(cols, rows):
+    """One image the way the HF Gemma4 image processor emits it: real (x, y)
+    patch positions row-major, right-padded to MAX_PATCHES with (-1, -1)."""
+    ys, xs = jnp.meshgrid(jnp.arange(rows), jnp.arange(cols), indexing="ij")
+    real = jnp.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1)
+    pad = jnp.full((MAX_PATCHES - real.shape[0], 2), -1, real.dtype)
+    pos = jnp.concatenate([real, pad], axis=0).astype(jnp.int32)
+    pv = jnp.asarray(
+        _RNG.standard_normal((MAX_PATCHES, PP)).astype(np.float32))
+    return pv, pos
+
+
+def test_segment_form_matches_the_reference_one_hot_matmul():
+    pv, pos = _e4b_image(9, 6)
+    pos = pos[:54][None]
+    hidden = jnp.asarray(_RNG.standard_normal((1, 54, H)), jnp.float32)
+    got_pooled, got_mask = _pool_by_positions(hidden, pos, 6)
+    want_pooled, want_mask = _pool_by_positions_reference(hidden, pos, 6)
+    assert np.array_equal(np.asarray(got_mask), np.asarray(want_mask))
+    np.testing.assert_allclose(np.asarray(got_pooled),
+                               np.asarray(want_pooled),
+                               rtol=1e-5,
+                               atol=1e-5)
+
+
+@pytest.mark.parametrize("name,cols,rows,soft", E4B_GRIDS)
+def test_pooler_buffer_is_1120_slots_and_the_valid_count_is_the_answer(
+        name, cols, rows, soft):
+    """The torchax call path, at the real scale. 10080 padded patches pool
+    to a 1120-slot buffer for EVERY image; the number of valid slots -- and
+    so the number of embeddings the projector and the LM see -- is 1092 or
+    1104 depending on the grid. 1120 is the buffer, not the answer."""
+    pv, pos = _e4b_image(cols, rows)
+    hidden = jnp.asarray(_RNG.standard_normal((1, MAX_PATCHES, H)),
+                         jnp.float32)
+    pad = jnp.all(pos == -1, axis=-1)[None]
+    pooled, valid_mask = _Pooler()(hidden_states=hidden,
+                                   pixel_position_ids=pos[None],
+                                   padding_positions=pad,
+                                   output_length=MAX_PATCHES // POOL_K**2)
+    assert pooled.shape == (1, MAX_SOFT_TOKENS, H), name
+    assert int(valid_mask.sum()) == soft, name
+    assert pooled[valid_mask].shape == (soft, H), name
+
+
+def test_line_reports_the_padded_pooler_buffer_and_the_valid_soft_tokens():
+    """``tower`` is the pooler's (1, 1120, H) buffer -- the same tensor at
+    the same point the flax path reports -- and ``soft_tokens`` is the 1092
+    valid rows the projector and the language model actually get."""
+    model = _FakeGemma4Pooled()
+    log = []
+    assert _install(model, log) == [
+        "vision_tower.encoder",
+        "vision_tower.pooler",
+        "embed_vision",
+        "_process_image_input",
+        "encoder_cudagraph_forward",
+    ]
+    pv, pos = _e4b_image(126, 78)
+    out = model._process_image_input({
+        "pixel_values": [pv],
+        "pixel_position_ids": [pos]
+    })
+    jax.block_until_ready(out)
+    assert len(log) == 1, log
+    f = _fields(log[0])
+    assert f["tower.shape"] == f"(1,{MAX_SOFT_TOKENS},{H})"
+    assert f["soft_tokens"] == "1092"
+    assert f["proj.shape"] == f"(1,1092,{D})"
+    assert f["pv.shape"] == f"({MAX_PATCHES},{PP})"
+    assert out[0].shape == (1092, D)
+
+
+def test_tower_stats_skip_the_invalid_pooler_slots():
+    """The mask has to travel with the buffer: the 28 slots that are not
+    valid for this grid must not enter the statistics, or the torchax and
+    flax lines describe different elements again."""
+
+    class _SpikedPooler(_Pooler):
+
+        def forward(self, hidden_states, pixel_position_ids, padding_positions,
+                    output_length):
+            pooled, mask = super().forward(hidden_states, pixel_position_ids,
+                                           padding_positions, output_length)
+            return jnp.where(mask[..., None], pooled, 1e9), mask
+
+    model = _FakeGemma4Pooled()
+    model.vision_tower.pooler = _SpikedPooler()
+    log = []
+    _install(model, log)
+    pv, pos = _e4b_image(126, 78)
+    jax.block_until_ready(
+        model._process_image_input({
+            "pixel_values": [pv],
+            "pixel_position_ids": [pos]
+        }))
+    f = _fields(log[0])
+    assert f["tower.shape"] == f"(1,{MAX_SOFT_TOKENS},{H})"
+    assert float(f["tower.maxabs"]) < 1e6, f["tower.maxabs"]
+
+
+def test_pooler_hook_leaves_the_embeddings_unchanged():
+    pv, pos = _e4b_image(126, 78)
+    images = {"pixel_values": [pv], "pixel_position_ids": [pos]}
+    want = _FakeGemma4Pooled()._process_image_input(images)
+    hooked = _FakeGemma4Pooled()
+    _install(hooked, [])
+    got = hooked._process_image_input(images)
+    assert len(got) == len(want)
+    for g, w in zip(got, want):
+        assert np.array_equal(np.asarray(g), np.asarray(w))
+
+
+def test_tower_without_a_pooler_still_reports_the_projector_input():
+    """Towers with no pooler to hook (the Unified patcher's shape) keep the
+    old fallback rather than losing the field."""
+    model = _FakeGemma4()
+    assert not hasattr(model.vision_tower, "pooler")
+    log = []
+    assert "vision_tower.pooler" not in _install(model, log)
+    jax.block_until_ready(model._process_image_input(_images()))
+    f = _fields(log[0])
+    assert f["tower.shape"] == f"2x(1,4,{H})"

@@ -66,6 +66,7 @@ RUN set -e; \
     grep -q "debug_owners" "$TI_DIR/runner/multimodal_manager.py"; \
     test -f "$TI_DIR/models/common/mm_debug_stats.py"; \
     test -f "$TI_DIR/models/vllm/experimental/mm_debug_patch.py"; \
+    grep -q "vision_tower.pooler" "$TI_DIR/models/vllm/experimental/mm_debug_patch.py"; \
     python3 -c "import ast,glob; [ast.parse(open(p).read()) for p in glob.glob('/workspace/tpu_inference/tpu_inference/**/*.py', recursive=True)]"; \
     python3 -c "import tpu_inference.kernels.ragged_paged_attention.v3.kernel; print('kernel module imports OK')"; \
     echo "P6 PATCHES APPLIED AND VERIFIED"
