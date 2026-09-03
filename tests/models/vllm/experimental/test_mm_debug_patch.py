@@ -782,7 +782,10 @@ class _LayeredEncoder(_Mod):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, inputs_embeds, attention_mask, pixel_position_ids=None,
+    def forward(self,
+                inputs_embeds,
+                attention_mask,
+                pixel_position_ids=None,
                 **kwargs):
         hidden = inputs_embeds
         for layer in self.layers:
@@ -830,7 +833,7 @@ def test_per_layer_on_emits_a_second_line_with_every_layer():
 
 def test_per_layer_hooks_leave_the_encoder_output_unchanged():
     """The hooks record; they must not alter what the tower returns."""
-    images = _images()   # _RNG advances per call, so build the input ONCE
+    images = _images()  # _RNG advances per call, so build the input ONCE
     clean = _layered_model()._process_image_input(images)
     hooked_model = _layered_model()
     PATCH.install_mm_debug(hooked_model,
@@ -872,8 +875,9 @@ def test_the_flax_tower_emits_the_same_two_names_under_the_same_flag():
     assert "layer_sink" in flax_src and "attn_sink" in flax_src
     # ... and the sinks stay None with the flag off, so the jaxpr is unchanged.
     tree = ast.parse(flax_src)
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "_new_layer_sinks")
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_new_layer_sinks")
     body = ast.unparse(fn)
     assert "envs.PIECES_MM_DEBUG and envs.PIECES_MM_DEBUG_LAYERS" in body
     assert "return (None, None)" in body

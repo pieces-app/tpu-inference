@@ -143,7 +143,8 @@ def fp32_logit_attention(
             if mask.dtype == torch.bool:
                 scores = torch.where(
                     mask, scores,
-                    torch.full_like(scores, torch.finfo(torch.float32).min))
+                    torch.full_like(scores,
+                                    torch.finfo(torch.float32).min))
             else:
                 scores = scores + mask.float()
         probs = torch.softmax(scores, dim=-1).to(value.dtype)
