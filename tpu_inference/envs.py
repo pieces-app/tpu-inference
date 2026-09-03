@@ -309,6 +309,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # behaviour. Set 0 for weight-only quantization -- the experiment that
     # separates "int8 weights hurt" from "int8 activations hurt" (measured
     # 2026-09-02: int8 W8A8 capped 13/69 requests vs bf16's 5).
+    # Honoured by the dense stack (layers/common/linear.py) and by the
+    # GMM_TP/GMM_EP MoE expert path (layers/common/fused_moe_gmm.py
+    # gmm_wrapper). The FUSED_MOE and MEGABLX_GMM backends never quantize
+    # activations, so the switch is a no-op there; the experimental fused
+    # reduce-scatter kernel (USE_GMM_FUSED_RS_KERNEL) always does and
+    # refuses TPU_ONLINE_QUANT_ACT=0 rather than mislabel the arm.
     "TPU_ONLINE_QUANT_ACT":
     env_bool("TPU_ONLINE_QUANT_ACT", default=True),
     # Specify block quantization size

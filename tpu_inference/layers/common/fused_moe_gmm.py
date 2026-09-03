@@ -107,7 +107,40 @@ def gmm_wrapper(lhs,
                 group_sizes,
                 group_offset,
                 fuse_act=None,
-                preferred_element_type=None):
+                preferred_element_type=None,
+                maybe_quantize_lhs: bool = True):
+    # TPU_ONLINE_QUANT_ACT=0 forces weight-only quantization (W8A16) on the
+    # experts -- the same switch, the same idiom, as the dense stack
+    # (layers/common/linear.py, sharded_quantized_matmul).
+    #
+    # Until this line the switch never reached the MoE path: gmm_v2 was
+    # called without maybe_quantize_lhs, so it took the kernel default (True)
+    # and quantized the expert activations to the weight dtype inside the
+    # kernel. On the 26B-A4B that made every "int8" arm W8A8 on the experts
+    # -- the bulk of the model's bytes -- while the dense stack of the same
+    # process honoured the flag, so a lane labelled W8A16 would have served
+    # a mixed configuration under a clean label (the exact mislabelled-arm
+    # failure the evidence gates exist to prevent).
+    #
+    # The kernel already has the weight-only mode: with maybe_quantize_lhs=
+    # False, make_gmm_configs leaves lhs_cfgs.quant_dtype=None and the
+    # inner kernel takes its "Unquantized matmul path" -- lhs stays in its
+    # own dtype, the int8 tile is widened to that dtype in VMEM, the MXU
+    # accumulates in f32, and the per-channel scale is applied after the
+    # matmul (kernels/megablox/gmm_v2.py mirrors the tokamax source). That
+    # is the same arithmetic as xla_quantized_matmul's W8A16 branch, so no
+    # XLA fallback is needed here; the GMM backends have none.
+    #
+    # Callers that pass False are already weight-only and are unaffected.
+    if maybe_quantize_lhs and not envs.TPU_ONLINE_QUANT_ACT:
+        maybe_quantize_lhs = False
+        # Engagement marker for the evidence gates: W8A16 on the experts
+        # leaves no other trace in a boot log (the weight requant line is
+        # printed for W8A8 too), so name it once.
+        logger.info_once(
+            "TPU_ONLINE_QUANT_ACT=0: MoE experts serving weight-only "
+            "(activations stay %s; gmm_v2 maybe_quantize_lhs=False)",
+            lhs.dtype)
     gmm_res = gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -118,6 +151,7 @@ def gmm_wrapper(lhs,
         zero_initialize=False,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
+        maybe_quantize_lhs=maybe_quantize_lhs,
     )
     return gmm_res
 
@@ -592,6 +626,19 @@ def fused_moe_func(
     """
 
     if use_ep and use_gmm_fused_rs_kernel:
+        if not envs.TPU_ONLINE_QUANT_ACT:
+            # The fused reduce-scatter kernel builds its own GmmConfigs
+            # (kernels/experimental/fused_moe/gmm_fused_rs_nodedup.py) and
+            # quantizes the expert activations whenever the weights carry a
+            # scale; it exposes no maybe_quantize_lhs to forward the switch
+            # to. Refuse here, before the kernel is imported, rather than
+            # serve W8A8 experts under a W8A16 label.
+            raise NotImplementedError(
+                "TPU_ONLINE_QUANT_ACT=0 (weight-only quantization) is not "
+                "implemented for USE_GMM_FUSED_RS_KERNEL=1: the fused "
+                "reduce-scatter MoE kernel always quantizes the expert "
+                "activations. Unset USE_GMM_FUSED_RS_KERNEL to take the "
+                "gmm_v2 path, which honours the switch.")
         from tpu_inference.kernels.experimental.fused_moe.fused_moe_rs import \
             fused_moe_func_rs
         logger.info("fused_moe_rs kernel in use")
