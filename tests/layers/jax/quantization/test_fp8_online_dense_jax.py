@@ -68,11 +68,12 @@ def test_requant_scale_is_amax_over_448_per_output_channel():
     """axis=0 on an [in, out] kernel => one scale per OUTPUT channel."""
     jnp = _jnp()
     import jax
-    w = (jax.random.normal(jax.random.PRNGKey(0), (128, 64)) * 3.0
-         ).astype(jnp.bfloat16)
+    w = (jax.random.normal(jax.random.PRNGKey(0),
+                           (128, 64)) * 3.0).astype(jnp.bfloat16)
     quantize_tensor = _quantize_tensor()
     w_q, w_s = quantize_tensor(jnp.float8_e4m3fn, w, axis=0)
-    assert w_s.shape[-1] == 64, f"expected per-OUT scale (64,), got {w_s.shape}"
+    assert w_s.shape[
+        -1] == 64, f"expected per-OUT scale (64,), got {w_s.shape}"
     amax = jnp.max(jnp.abs(w.astype(jnp.float32)), axis=0)
     assert float(jnp.max(jnp.abs(w_s.reshape(-1) - amax / E4M3_MAX))) < 1e-3
 
@@ -80,8 +81,8 @@ def test_requant_scale_is_amax_over_448_per_output_channel():
 def test_requant_round_trip_within_e4m3_tolerance():
     jnp = _jnp()
     import jax
-    w = (jax.random.normal(jax.random.PRNGKey(1), (256, 32)) * 5.0
-         ).astype(jnp.bfloat16)
+    w = (jax.random.normal(jax.random.PRNGKey(1),
+                           (256, 32)) * 5.0).astype(jnp.bfloat16)
     quantize_tensor = _quantize_tensor()
     w_q, w_s = quantize_tensor(jnp.float8_e4m3fn, w, axis=0)
     rt = w_q.astype(jnp.float32) * w_s.reshape(1, -1)
@@ -96,8 +97,7 @@ def test_dispatch_requires_the_env_flag_and_refuses_cleanly():
     assert "VLLM_FP8_ONLINE_DENSE" in src, "dispatch never consults the flag"
     assert "Fp8OnlineConfig" in src
     tree = ast.parse(src)
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
               and n.name == "get_tpu_quantization_config")
     body = ast.get_source_segment(src, fn) or ""
     flag_at = body.find("VLLM_FP8_ONLINE_DENSE")
@@ -116,9 +116,12 @@ def test_dispatch_branch_requires_empty_checkpoint_quant_config():
     """Never hijack a genuinely fp8-serialized checkpoint."""
     src = DISPATCH.read_text()
     tree = ast.parse(src)
-    hits = [n for n in ast.walk(tree) if isinstance(n, ast.If)
-            and "hg_quant_config" in (ast.get_source_segment(src, n.test) or "")
-            and "FP8" in (ast.get_source_segment(src, n.test) or "")]
+    hits = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.If) and "hg_quant_config" in (
+            ast.get_source_segment(src, n.test) or "") and "FP8" in (
+                ast.get_source_segment(src, n.test) or "")
+    ]
     assert hits, ("the online branch must be conditioned on BOTH "
                   "quantization==FP8 and an EMPTY checkpoint quant config")
 
@@ -219,10 +222,11 @@ def test_env_var_is_inherited_by_engine_workers():
     src = PLATFORM.read_text()
     tree = ast.parse(src)
     for n in ast.walk(tree):
-        if (isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "")
-                == "additional_env_vars"):
-            names = [e.value for e in n.value.elts
-                     if isinstance(e, ast.Constant)]
+        if (isinstance(n, ast.AnnAssign)
+                and getattr(n.target, "id", "") == "additional_env_vars"):
+            names = [
+                e.value for e in n.value.elts if isinstance(e, ast.Constant)
+            ]
             assert "VLLM_FP8_ONLINE_DENSE" in names, (
                 "workers would not see the flag; the pod env alone is not "
                 "enough (the dispatch runs in the worker)")
@@ -242,8 +246,10 @@ def test_no_class_is_defined_before_its_base_in_the_same_module():
     A source-reading suite needs at least one order/importability guard.
     """
     tree = ast.parse(FP8.read_text())
-    order = {n.name: i for i, n in enumerate(tree.body)
-             if isinstance(n, ast.ClassDef)}
+    order = {
+        n.name: i
+        for i, n in enumerate(tree.body) if isinstance(n, ast.ClassDef)
+    }
     violations = []
     for node in tree.body:
         if not isinstance(node, ast.ClassDef):
@@ -251,10 +257,11 @@ def test_no_class_is_defined_before_its_base_in_the_same_module():
         for base in node.bases:
             name = base.id if isinstance(base, ast.Name) else None
             if name in order and order[name] > order[node.name]:
-                violations.append(f"{node.name} defined before its base {name}")
+                violations.append(
+                    f"{node.name} defined before its base {name}")
     assert not violations, (
-        "class(es) defined before their base -> NameError at import: "
-        + "; ".join(violations))
+        "class(es) defined before their base -> NameError at import: " +
+        "; ".join(violations))
 
 
 def test_module_body_has_no_forward_references_to_later_definitions():
@@ -268,9 +275,11 @@ def test_module_body_has_no_forward_references_to_later_definitions():
             defined_at[node.name] = i
     problems = []
     for i, node in enumerate(tree.body):
-        if isinstance(node, ast.Assign):  # module-level constant built from a call
+        if isinstance(node,
+                      ast.Assign):  # module-level constant built from a call
             for sub in ast.walk(node):
-                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                if (isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Name)
                         and defined_at.get(sub.func.id, -1) > i):
                     problems.append(f"module-level call to {sub.func.id} "
                                     f"before its definition")
@@ -293,7 +302,8 @@ def test_multimodal_projections_are_excluded_from_online_fp8():
     """
     src = FP8.read_text()
     cls = _cls(ast.parse(src), "Fp8OnlineConfig")
-    body = _code_only(ast.get_source_segment(src, _meth(cls, "get_quant_method")) or "")
+    body = _code_only(
+        ast.get_source_segment(src, _meth(cls, "get_quant_method")) or "")
     for token in ("vision", "audio", "multi_modal", "router"):
         assert token in body, (
             f"the flax online config does not skip {token!r} layers -- "
@@ -304,17 +314,22 @@ def test_multimodal_projections_are_excluded_from_online_fp8():
 def test_torchax_lane_has_the_same_exclusion():
     """The torchax method is what 12B/Unified actually reaches today, so the
     exclusion must exist on BOTH lanes or the panel dies again."""
-    p = (ROOT / "tpu_inference" / "layers" / "vllm" / "quantization" / "fp8.py")
+    p = (ROOT / "tpu_inference" / "layers" / "vllm" / "quantization" /
+         "fp8.py")
     src = p.read_text()
     assert "_ONLINE_FP8_SKIP_SUBSTRINGS" in src, (
         "torchax lane has no skip list; it dispatched the online method to a "
         "vision projection on hardware")
     tree = ast.parse(src)
-    assigns = [n for n in tree.body if isinstance(n, ast.Assign)
-               and any(getattr(t, "id", "") == "_ONLINE_FP8_SKIP_SUBSTRINGS"
-                       for t in n.targets)]
+    assigns = [
+        n for n in tree.body if isinstance(n, ast.Assign) and any(
+            getattr(t, "id", "") == "_ONLINE_FP8_SKIP_SUBSTRINGS"
+            for t in n.targets)
+    ]
     assert assigns, "skip list is not a module-level constant"
-    tokens = [e.value for e in assigns[0].value.elts if isinstance(e, ast.Constant)]
+    tokens = [
+        e.value for e in assigns[0].value.elts if isinstance(e, ast.Constant)
+    ]
     for token in ("vision", "audio_tower", "multi_modal", "router"):
         assert any(token in t for t in tokens), f"skip list misses {token!r}"
     # and the dispatch must consult it
@@ -339,7 +354,8 @@ def test_excluded_layers_return_unquantized_not_the_failclosed_raise():
     keep this layer in bf16". Order matters: the exclusion branch must
     return BEFORE the raise.
     """
-    p = (ROOT / "tpu_inference" / "layers" / "vllm" / "quantization" / "fp8.py")
+    p = (ROOT / "tpu_inference" / "layers" / "vllm" / "quantization" /
+         "fp8.py")
     src = p.read_text()
     tree = ast.parse(src)
     gq = None

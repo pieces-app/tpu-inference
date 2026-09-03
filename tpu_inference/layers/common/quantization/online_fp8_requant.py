@@ -68,9 +68,8 @@ def _announce(dtype, why):
     _ANNOUNCED.add(key)
     try:
         from tpu_inference.logger import init_logger
-        init_logger(__name__).info(
-            "online quant dtype: %s (%s=%s)", key[0], ONLINE_QUANT_DTYPE_ENV,
-            why)
+        init_logger(__name__).info("online quant dtype: %s (%s=%s)", key[0],
+                                   ONLINE_QUANT_DTYPE_ENV, why)
     except Exception:  # noqa: BLE001
         pass
 
@@ -148,6 +147,7 @@ def online_fp8_requant_per_channel(weight_in_out, dtype=None):
     w_q = scaled.astype(dtype)
     return w_q, jnp.squeeze(scale, axis=0)
 
+
 # Dtypes the TORCHAX path can carry. That path round-trips the quantized array
 # back through `torch_view()` -> `torchax.ops.mappings.j2t_dtype`, which needs a
 # real torch dtype. `float8_e4m3b11fnuz` is a JAX/ml_dtypes type with NO torch
@@ -160,8 +160,7 @@ def online_fp8_requant_per_channel(weight_in_out, dtype=None):
 # The flax/nnx path never converts to torch, so it is NOT restricted by this.
 # Hence a per-path check rather than removing the dtype outright: it stays a
 # legitimate option for the 26B, where v6e ingests it natively.
-TORCHAX_REPRESENTABLE = frozenset(
-    {"float8_e4m3fn", "float8_e5m2", "int8"})
+TORCHAX_REPRESENTABLE = frozenset({"float8_e4m3fn", "float8_e5m2", "int8"})
 
 
 def assert_torchax_representable(dtype):

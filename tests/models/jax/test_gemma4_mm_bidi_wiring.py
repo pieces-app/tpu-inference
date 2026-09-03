@@ -21,8 +21,7 @@ GEMMA4_MM = ROOT / "tpu_inference" / "models" / "jax" / "gemma4_mm.py"
 
 def _attention_calls(tree):
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "attention"):
             yield node
 
@@ -57,8 +56,7 @@ def test_mm_bidi_ranges_is_gated_to_sliding_window_layers():
             continue
         body_ok = (isinstance(v.body, ast.Call)
                    and isinstance(v.body.func, ast.Name)
-                   and v.body.func.id == "getattr"
-                   and len(v.body.args) == 3
+                   and v.body.func.id == "getattr" and len(v.body.args) == 3
                    and isinstance(v.body.args[1], ast.Constant)
                    and v.body.args[1].value == "mm_bidi_ranges")
         test_ok = (isinstance(v.test, ast.Compare)
@@ -105,8 +103,7 @@ def test_wired_file_is_on_the_target_archs_execution_path():
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
             continue
         t = node.targets[0]
-        if (isinstance(t, ast.Subscript)
-                and isinstance(t.value, ast.Name)
+        if (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
                 and t.value.id == "_MODEL_REGISTRY"
                 and isinstance(t.slice, ast.Constant)
                 and t.slice.value == "Gemma4ForConditionalGeneration"
@@ -138,12 +135,10 @@ def test_wired_file_is_on_the_target_archs_execution_path():
         "gemma4_mm.py no longer imports Gemma4Model from models.jax.gemma4 "
         "-- the wired call site may be dead code for the mm arch")
     composed = any(
-        isinstance(node, ast.Assign) and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Attribute)
-        and node.targets[0].attr == "language_model"
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "Gemma4Model"
+        isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(
+            node.targets[0], ast.Attribute) and node.targets[0].attr ==
+        "language_model" and isinstance(node.value, ast.Call) and isinstance(
+            node.value.func, ast.Name) and node.value.func.id == "Gemma4Model"
         for node in ast.walk(mm_tree))
     assert composed, (
         "gemma4_mm no longer builds language_model = Gemma4Model(...) -- "

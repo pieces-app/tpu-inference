@@ -58,8 +58,8 @@ def upstream_rows(batch_req_ids, struct_ids, spec_tokens, grammar_bitmask,
         if (logit_idx := struct_out_req_batch_indices.get(req_id)) is not None:
             for i in range(1 + k):
                 bitmask_index = logit_idx + i
-                sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index
-                                                                + i]
+                sorted_bitmask[bitmask_index] = grammar_bitmask[
+                    cumulative_index + i]
                 out_indices.append(bitmask_index)
         cumulative_index += 1 + k
     return sorted_bitmask, out_indices
@@ -105,7 +105,9 @@ def _random_case(rng, allow_spec=True):
         g = f"ghost-{rng.randint(0, 999)}"
         ghosts.append(g)
         if kmax and rng.random() < 0.5:
-            spec_tokens[g] = [rng.randint(0, 99) for _ in range(rng.randint(1, kmax))]
+            spec_tokens[g] = [
+                rng.randint(0, 99) for _ in range(rng.randint(1, kmax))
+            ]
     struct_ids = struct_ids + ghosts
     rng.shuffle(struct_ids)  # scheduler order is NOT sorted (#1563)
     total = sum(1 + len(spec_tokens.get(r, ())) for r in struct_ids)
@@ -115,7 +117,6 @@ def _random_case(rng, allow_spec=True):
     needed = sum(1 + len(spec_tokens.get(r, ())) for r in batch)
     padded = needed + rng.randint(0, 5)  # runner pads to a bucket
     return batch, struct_ids, spec_tokens, grammar_bitmask, needed, padded
-
 
 
 def _nondegenerate_case(rng, **kw):
@@ -145,7 +146,8 @@ def _nondegenerate_case(rng, **kw):
 @pytest.mark.parametrize("seed", range(300))
 def test_matches_upstream_apply_grammar_bitmask(seed):
     rng = random.Random(seed)
-    batch, struct_ids, spec_tokens, gb, needed, padded = _nondegenerate_case(rng)
+    batch, struct_ids, spec_tokens, gb, needed, padded = _nondegenerate_case(
+        rng)
 
     oracle, out_indices = upstream_rows(batch, struct_ids, spec_tokens, gb,
                                         padded)
@@ -153,8 +155,8 @@ def test_matches_upstream_apply_grammar_bitmask(seed):
     dst_bitmask = np.zeros((padded, VOCAB_WORDS), dtype=np.int32)
     dst_require = np.zeros((padded, 1), dtype=np.bool_)
     written = rows.scatter_grammar_bitmask(struct_ids, gb, spec_tokens,
-                                          [batch], padded, dst_bitmask,
-                                          dst_require)
+                                           [batch], padded, dst_bitmask,
+                                           dst_require)
 
     assert sorted(written) == sorted(out_indices)
     assert len(set(written)) == len(written), "row written twice"
@@ -180,7 +182,7 @@ def test_k0_is_byte_identical_to_pre_fix_algorithm(seed):
         dst_bitmask = np.zeros((padded, VOCAB_WORDS), dtype=np.int32)
         dst_require = np.zeros((padded, 1), dtype=np.bool_)
         rows.scatter_grammar_bitmask(struct_ids, gb, spec_tokens, [batch],
-                                    padded, dst_bitmask, dst_require)
+                                     padded, dst_bitmask, dst_require)
         assert dst_bitmask.tobytes() == old_bitmask.tobytes()
         assert dst_require.tobytes() == old_require.tobytes()
 
@@ -193,7 +195,8 @@ def test_row_p_verifies_draft_p_and_bonus_is_last():
     batch = ["A", "B"]
     struct_ids = ["B", "A"]
     spec = {"A": [7, 8]}
-    gb = np.array([[100], [200], [201], [202]], dtype=np.int32)  # B, A0, A1, Abonus
+    gb = np.array([[100], [200], [201], [202]],
+                  dtype=np.int32)  # B, A0, A1, Abonus
     dst = np.zeros((8, 1), dtype=np.int32)
     req = np.zeros((8, 1), dtype=np.bool_)
     rows.scatter_grammar_bitmask(struct_ids, gb, spec, [batch], 8, dst, req)
@@ -206,11 +209,12 @@ def test_request_without_grammar_still_offsets_by_1_plus_k():
     # following request's logits rows (mirrors utils.py L117-119).
     batch = ["A", "NOGRAMMAR", "C"]
     spec = {"A": [1], "NOGRAMMAR": [1, 2, 3], "C": [5, 6]}
-    gb = np.array([[1], [2], [3], [4], [5]], dtype=np.int32)  # A: 2 rows, C: 3 rows
+    gb = np.array([[1], [2], [3], [4], [5]],
+                  dtype=np.int32)  # A: 2 rows, C: 3 rows
     dst = np.zeros((16, 1), dtype=np.int32)
     req = np.zeros((16, 1), dtype=np.bool_)
     written = rows.scatter_grammar_bitmask(["A", "C"], gb, spec, [batch], 16,
-                                          dst, req)
+                                           dst, req)
     assert written == [0, 1, 6, 7, 8]
     assert dst[[0, 1, 6, 7, 8], 0].tolist() == [1, 2, 3, 4, 5]
 
@@ -223,7 +227,7 @@ def test_dp_ranks_are_offset_by_padded_rows_per_rank():
     dst = np.zeros((8, 1), dtype=np.int32)
     req = np.zeros((8, 1), dtype=np.bool_)
     written = rows.scatter_grammar_bitmask(["A", "B", "C"], gb, spec, ranks,
-                                          padded_per_rank, dst, req)
+                                           padded_per_rank, dst, req)
     assert written == [0, 1, 2, 4, 5, 6]
     assert dst[:, 0].tolist() == [10, 11, 12, 0, 20, 30, 31, 0]
 
@@ -235,4 +239,4 @@ def test_rank_overflow_and_short_bitmask_raise():
     req = np.zeros((8, 1), dtype=np.bool_)
     with pytest.raises(ValueError):
         rows.scatter_grammar_bitmask(["A"], np.zeros((1, 1), np.int32),
-                                    {"A": [1]}, [["A"]], 8, dst, req)
+                                     {"A": [1]}, [["A"]], 8, dst, req)

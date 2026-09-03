@@ -543,8 +543,8 @@ def attention(
     # context parallelism): a non-None operand here would mean the mask is
     # being dropped silently on the CP path.
     if mm_bidi_ranges is not None and (
-        ('dcp' in mesh.shape and mesh.shape['dcp'] > 1)
-            or ('pcp' in mesh.shape and mesh.shape['pcp'] > 1)):
+        ('dcp' in mesh.shape and mesh.shape['dcp'] > 1) or
+        ('pcp' in mesh.shape and mesh.shape['pcp'] > 1)):
         raise NotImplementedError(
             "mm_bidi_ranges (PrefixLM blockwise attention) is not supported "
             "with DCP/PCP context parallelism; TPURunner._init_mm_bidi "

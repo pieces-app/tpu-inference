@@ -173,7 +173,8 @@ def quantize_array(
     # (rounding ties); the f32-multiply variant reaches the XLA path's 0.0086
     # and is the follow-up once get_vmem_limit accounts for it.
     # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
-    scale = jnp.transpose(x_abs_max.astype(jnp.float32) / jnp.float32(dtype_max))
+    scale = jnp.transpose(
+        x_abs_max.astype(jnp.float32) / jnp.float32(dtype_max))
     scale_inv = jnp.nan_to_num(1 / scale, dtype_max)
     y = x * scale_inv.astype(x.dtype)
     if not is_float:

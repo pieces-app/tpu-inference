@@ -46,13 +46,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.multimodal.inputs import (MultiModalBatchedField,
-                                    MultiModalFeatureSpec,
-                                    MultiModalFieldElem, MultiModalKwargsItem,
-                                    PlaceholderRange)
-
 import vllm.multimodal.utils as mm_utils
 import vllm.v1.core.sched.output as sched_output
+from vllm.multimodal.inputs import (MultiModalBatchedField,
+                                    MultiModalFeatureSpec, MultiModalFieldElem,
+                                    MultiModalKwargsItem, PlaceholderRange)
+
 from tpu_inference.core.sched.utils import (
     _keep_mm_data, patch_vllm_mm_data_strip_for_preemption)
 from tpu_inference.runner.multimodal_manager import MultiModalManager
@@ -114,7 +113,7 @@ def _admit(num_computed_tokens: int):
     mm_features (vllm/v1/core/sched/output.py NewRequestData.from_request)."""
     return sched_output.NewRequestData.from_request(
         _request(num_computed_tokens),
-        block_ids=([1, 2, 3],),
+        block_ids=([1, 2, 3], ),
     )
 
 

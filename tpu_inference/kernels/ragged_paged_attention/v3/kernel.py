@@ -1663,7 +1663,8 @@ def ragged_paged_attention(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     mm_bidi_ranges: jax.Array
-    | None = None,  # i32[max_num_seqs, 2] (start, end) PrefixLM blockwise range per seq; (0, 0) = none
+    |
+    None = None,  # i32[max_num_seqs, 2] (start, end) PrefixLM blockwise range per seq; (0, 0) = none
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
@@ -1935,8 +1936,10 @@ def ragged_paged_attention(
             input_output_aliases={
                 # q and kv_cache follow the scalar prefetch operands, so
                 # their operand indices shift when mm_bidi_ranges is present.
-                len(scalar_prefetches): 0,
-                len(scalar_prefetches) + 2: 1,
+                len(scalar_prefetches):
+                0,
+                len(scalar_prefetches) + 2:
+                1,
             },
             name=scope_name,
         )

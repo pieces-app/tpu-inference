@@ -4,7 +4,8 @@
 # self._elem, which View lacks -> AttributeError('View' has no '_elem') ->
 # EngineDeadError on every image request (measured 2026-08-24 22:28 UTC).
 # Fix: materialize Views via View.jax() (torchax view.py:371) before indexing.
-import pathlib, glob
+import glob
+import pathlib
 
 candidates = glob.glob("/usr/local/lib/python3*/site-packages/torchax/ops/jtorch.py") \
     or glob.glob("/usr/lib/python3*/site-packages/torchax/ops/jtorch.py")
@@ -20,5 +21,6 @@ assert old in s, "torchax getitem pattern not found — version drift, re-inspec
 p.write_text(s.replace(old, new, 1))
 pyc = p.parent / "__pycache__"
 if pyc.exists():
-    import shutil; shutil.rmtree(pyc)
+    import shutil
+    shutil.rmtree(pyc)
 print(f"p3 torchax patch applied to {p}")

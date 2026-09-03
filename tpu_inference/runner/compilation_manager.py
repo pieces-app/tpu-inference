@@ -476,8 +476,7 @@ class CompilationManager:
         # metadata pytree must match the runtime shape (`_prepare_inputs`
         # always populates the field for mm-bidi models, (0, 0) = causal),
         # or every real step would recompile against a mismatched signature.
-        mm_bidi_ranges = self._dummy_mm_bidi_ranges(
-            metadata_attn_sharding)
+        mm_bidi_ranges = self._dummy_mm_bidi_ranges(metadata_attn_sharding)
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
@@ -2053,7 +2052,8 @@ class CompilationManager:
                             request_distribution=request_distribution,
                             mamba_state_indices=mamba_state_indices,
                             padded_num_reqs=num_reqs,
-                            mm_bidi_ranges=self._dummy_mm_bidi_ranges(dp_sharding),
+                            mm_bidi_ranges=self._dummy_mm_bidi_ranges(
+                                dp_sharding),
                         ) for gid in range(
                             len(self.runner.kv_cache_config.kv_cache_groups))),
                     layer_names_per_group=tuple(

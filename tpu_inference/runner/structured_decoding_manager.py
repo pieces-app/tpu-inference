@@ -22,7 +22,8 @@ from tpu_inference.utils import device_array
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
-    from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
+    from vllm.v1.core.sched.output import \
+        SchedulerOutput as VllmSchedulerOutput
 
     from tpu_inference.runner.tpu_runner import TPUModelRunner
 
@@ -142,9 +143,8 @@ class StructuredDecodingManager:
 
         (require_structured_out_cpu,
          grammar_bitmask_cpu, structured_decode_arange) = device_array(
-             self.runner.mesh,
-             (require_cpu[:num_rows], bitmask_cpu[:num_rows],
-              self.runner.structured_decode_arange))
+             self.runner.mesh, (require_cpu[:num_rows], bitmask_cpu[:num_rows],
+                                self.runner.structured_decode_arange))
 
         return (require_structured_out_cpu, grammar_bitmask_cpu,
                 structured_decode_arange)

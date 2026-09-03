@@ -94,16 +94,18 @@ def test_the_recompute_is_derived_from_sharding_not_a_literal():
     body = ast.get_source_segment(src, fn) or ""
 
     # the assigned value must come from the mesh helper, not a constant
-    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
-               and any(isinstance(t, ast.Attribute) and t.attr == "n_shards"
-                       for t in n.targets)]
+    assigns = [
+        n for n in ast.walk(fn) if isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Attribute) and t.attr == "n_shards"
+            for t in n.targets)
+    ]
     assert assigns, "n_shards is never assigned"
     call_src = ast.get_source_segment(src, assigns[-1]) or ""
     assert "get_mesh_shape_product" in call_src, (
         f"n_shards must come from the active mesh, got: {call_src.strip()!r}")
     assert not any(isinstance(assigns[-1].value, c)
                    for c in (ast.Constant, )), (
-        "n_shards must not be a hardcoded constant")
+                       "n_shards must not be a hardcoded constant")
     # and the axis it asks about must trace to a sharding, somewhere in __init__
     assert ("weight_sharding" in body or "out_features_sharding" in body), (
         "the recompute must derive its axis from the layer's sharding")

@@ -98,7 +98,7 @@ visual-memory workload) — both proof points PASSED the guard:**
    the screenshot+schema request completes (`finish_reason=stop`), first
    post-restart single 59.8 s, warm singles 10.97 s / 9.10 s with
    byte-identical 1,189-token outputs; valid JSON, `schema_version='vm1'`
-   + instruction canary correct; quality harness: parse/schema 1.0,
+   - instruction canary correct; quality harness: parse/schema 1.0,
    21/22 deterministic checks (sole miss: resolved-absolute-date, a
    model-quality item), ANLS 0.682, tier-2 macro-F1 0.754. Engine
    survived everything — zero restarts.

@@ -65,8 +65,7 @@ def test_aprime_fast_leg_absent():
         f"a' fast-leg signature(s) present in linear.py: {hits}. a' is "
         f"supposed to be reverted (issue #157); it diverges on TPU. If this "
         f"is a deliberate re-land, the OD-TPU refmatch arm must be re-run "
-        f"and BENCH_RESULTS updated before it lands."
-    )
+        f"and BENCH_RESULTS updated before it lands.")
 
 
 def test_f32_leg_restored_and_unconditional():
@@ -75,5 +74,4 @@ def test_f32_leg_restored_and_unconditional():
     # The 2D-scale branch must not fork on the activation dtype any more:
     # exactly the `if w_scale.dtype == x.dtype:` split a' introduced.
     assert "if w_scale.dtype == x.dtype:" not in src, (
-        "the a' activation-dtype fast-leg branch is back"
-    )
+        "the a' activation-dtype fast-leg branch is back")

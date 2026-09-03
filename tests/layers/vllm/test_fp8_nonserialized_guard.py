@@ -45,7 +45,6 @@ GUARD_PHRASES = (
     "compressed-tensors",
 )
 
-
 # ---------------------------------------------------------------------------
 # Behavioral tests: exercise the real dispatch. Require the fork's full
 # stack (vllm, jax, torchax), as tests/layers/vllm/test_fp8.py does; skip
@@ -127,10 +126,10 @@ def test_ignored_layers_still_skip_before_the_guard(stack, serialized):
 
 def _linear_case_body() -> list[ast.stmt]:
     tree = ast.parse(FP8_PATH.read_text())
-    cls = next(node for node in tree.body
-               if isinstance(node, ast.ClassDef) and node.name == "VllmFp8Config")
-    fn = next(node for node in cls.body
-              if isinstance(node, ast.FunctionDef)
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "VllmFp8Config")
+    fn = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
               and node.name == "get_quant_method")
     match_stmt = next(node for node in ast.walk(fn)
                       if isinstance(node, ast.Match))
@@ -139,11 +138,12 @@ def _linear_case_body() -> list[ast.stmt]:
         if not isinstance(pattern, ast.MatchClass):
             continue
         cls_node = pattern.cls
-        name = (cls_node.attr if isinstance(cls_node, ast.Attribute)
-                else getattr(cls_node, "id", None))
+        name = (cls_node.attr if isinstance(cls_node, ast.Attribute) else
+                getattr(cls_node, "id", None))
         if name == "LinearBase":
             return case.body
-    raise AssertionError("LinearBase dispatch arm not found in get_quant_method")
+    raise AssertionError(
+        "LinearBase dispatch arm not found in get_quant_method")
 
 
 def _guard_raise(body: list[ast.stmt]) -> ast.Raise:

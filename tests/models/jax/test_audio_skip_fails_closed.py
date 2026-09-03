@@ -100,7 +100,9 @@ def _load_weights_fn_with_audio_guard():
     tree = ast.parse(MM.read_text())
     for fn in ast.walk(tree):
         if isinstance(fn, ast.FunctionDef) and fn.name == "load_weights":
-            if any(isinstance(n, ast.Name) and n.id == "audio_cfg" for n in ast.walk(fn)):
+            if any(
+                    isinstance(n, ast.Name) and n.id == "audio_cfg"
+                    for n in ast.walk(fn)):
                 return fn
     raise AssertionError("no load_weights binds audio_cfg")
 
@@ -112,19 +114,28 @@ def test_the_guard_is_a_real_if_with_the_right_polarity_and_a_raise():
     (`envs.ALLOW_AUDIO_WEIGHT_SKIP` without `not`), or a removed raise."""
     import ast
     fn = _load_weights_fn_with_audio_guard()
-    binds = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
-             and any(isinstance(t, ast.Name) and t.id == "audio_cfg" for t in n.targets)]
+    binds = [
+        n for n in ast.walk(fn) if isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "audio_cfg" for t in n.targets)
+    ]
     assert len(binds) == 1 and isinstance(binds[0].value, ast.Call), (
-        "audio_cfg must be bound exactly once, from a call (getattr on the config), not a constant")
+        "audio_cfg must be bound exactly once, from a call (getattr on the config), not a constant"
+    )
     guards = []
     for node in ast.walk(fn):
-        if not isinstance(node, ast.If) or not isinstance(node.test, ast.BoolOp) or not isinstance(node.test.op, ast.And):
+        if not isinstance(node, ast.If) or not isinstance(
+                node.test, ast.BoolOp) or not isinstance(
+                    node.test.op, ast.And):
             continue
         ops = node.test.values
-        has_cfg = any(isinstance(o, ast.Compare) and isinstance(o.left, ast.Name) and o.left.id == "audio_cfg"
-                      and any(isinstance(c, ast.IsNot) for c in o.ops) for o in ops)
-        has_hatch = any(isinstance(o, ast.UnaryOp) and isinstance(o.op, ast.Not)
-                        and isinstance(o.operand, ast.Attribute) and o.operand.attr == "ALLOW_AUDIO_WEIGHT_SKIP" for o in ops)
+        has_cfg = any(
+            isinstance(o, ast.Compare) and isinstance(o.left, ast.Name)
+            and o.left.id == "audio_cfg" and any(
+                isinstance(c, ast.IsNot) for c in o.ops) for o in ops)
+        has_hatch = any(
+            isinstance(o, ast.UnaryOp) and isinstance(o.op, ast.Not)
+            and isinstance(o.operand, ast.Attribute)
+            and o.operand.attr == "ALLOW_AUDIO_WEIGHT_SKIP" for o in ops)
         raises = any(isinstance(n, ast.Raise) for n in node.body)
         if has_cfg and has_hatch:
             guards.append(raises)

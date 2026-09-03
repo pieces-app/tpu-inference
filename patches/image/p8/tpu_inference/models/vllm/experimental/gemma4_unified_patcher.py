@@ -112,7 +112,8 @@ def apply_gemma4_unified_patches(vllm_model: nn.Module) -> None:
         if not isinstance(norm, nn.LayerNorm):
             logger.warning(
                 "[gemma4-unified-patch] %s is not an nn.LayerNorm (%s); "
-                "skipping fp32 statistics for it.", attr, type(norm).__name__)
+                "skipping fp32 statistics for it.", attr,
+                type(norm).__name__)
             continue
         norm.forward = MethodType(_f32_layer_norm_forward, norm)
         patched.append(attr)

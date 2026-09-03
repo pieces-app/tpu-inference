@@ -49,8 +49,7 @@ def test_sharded_quantized_matmul_pads_batch_dims_like_its_sibling():
     """
     src = LINEAR.read_text()
     tree = ast.parse(src)
-    fn = next((n for n in ast.walk(tree)
-               if isinstance(n, ast.FunctionDef)
+    fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
                and n.name == "sharded_quantized_matmul"), None)
     assert fn is not None, "sharded_quantized_matmul not found"
     body = ast.get_source_segment(src, fn) or ""
@@ -142,8 +141,10 @@ def test_rank3_sharded_result_equals_the_rank2_flattened_result(tp):
                                     flat.astype(jnp.float32)))
         print("RESULT", ok, same)
     ''')
-    r = subprocess.run([sys.executable, "-c", script], capture_output=True,
-                       text=True, timeout=600)
+    r = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True,
+                       text=True,
+                       timeout=600)
     if "RESULT" not in r.stdout:
         # Deliberately NOT a skip. A skip here is a false green -- the whole
         # point of this test is a wrong ANSWER, so "the repro did not run" must
@@ -159,8 +160,8 @@ def test_rank3_sharded_result_equals_the_rank2_flattened_result(tp):
 
 
 # ------------------------------------------------------------------ finding 2
-@pytest.mark.parametrize("cls", ["Fp8TensorwiseLinearMethod",
-                                 "Fp8BlockwiseLinearMethod"])
+@pytest.mark.parametrize(
+    "cls", ["Fp8TensorwiseLinearMethod", "Fp8BlockwiseLinearMethod"])
 def test_apply_jax_restores_one_axis_per_contracting_axis(cls):
     """`x.shape[:-1]` is only right when there is exactly ONE contracting axis.
 
@@ -174,7 +175,8 @@ def test_apply_jax_restores_one_axis_per_contracting_axis(cls):
                  if isinstance(n, ast.ClassDef) and n.name == cls), None)
     assert node is not None, f"{cls} not found"
     fn = next((f for f in node.body
-               if isinstance(f, ast.FunctionDef) and f.name == "apply_jax"), None)
+               if isinstance(f, ast.FunctionDef) and f.name == "apply_jax"),
+              None)
     assert fn is not None, f"{cls}.apply_jax not found"
     body = ast.get_source_segment(src, fn) or ""
 

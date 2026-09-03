@@ -28,10 +28,13 @@ def test_get_quant_method_calls_the_guard_on_the_selected_dtype():
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "assert_torchax_representable"):
-            arg_is_dtype_call = (node.args and isinstance(node.args[0], ast.Call)
+            arg_is_dtype_call = (node.args
+                                 and isinstance(node.args[0], ast.Call)
                                  and isinstance(node.args[0].func, ast.Name)
-                                 and node.args[0].func.id == "online_quant_dtype")
+                                 and node.args[0].func.id
+                                 == "online_quant_dtype")
             hits.append((enclosing.get(id(node), []), arg_is_dtype_call))
     assert hits, "assert_torchax_representable is never called in the vllm fp8 path"
     assert any("get_quant_method" in fns and ok for fns, ok in hits), (
-        f"the guard is not called on online_quant_dtype() inside get_quant_method: {hits}")
+        f"the guard is not called on online_quant_dtype() inside get_quant_method: {hits}"
+    )

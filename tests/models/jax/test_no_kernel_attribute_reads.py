@@ -34,7 +34,8 @@ def _aliasing_classes():
         for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
             src = ast.unparse(cls)
             if "self.weight = self.kernel" in src:
-                out.append((f.name, cls.name, "delattr(self, 'kernel')" in src))
+                out.append((f.name, cls.name, "delattr(self, 'kernel')"
+                            in src))
     return out
 
 
@@ -45,7 +46,8 @@ def test_the_aliasing_classes_are_known_and_delete_kernel():
         assert deletes, (
             f"{fname}::{cls} aliases weight = kernel but does NOT delattr kernel. "
             "Mixed contracts across wrappers are exactly how gemma4_unified.py:406 "
-            "was written against the wrong one; either delete there too or update this test.")
+            "was written against the wrong one; either delete there too or update this test."
+        )
 
 
 def test_jax_einsum_really_has_weight_and_not_kernel():
@@ -54,8 +56,12 @@ def test_jax_einsum_really_has_weight_and_not_kernel():
     pytest.importorskip("flax")
     jax = pytest.importorskip("jax")
     from flax import nnx
-    m = nnx.Einsum(einsum_str="bd,dh->bh", kernel_shape=(4, 8), rngs=nnx.Rngs(0))
-    assert hasattr(m, "kernel"), "upstream nnx.Einsum no longer names it kernel; this test's premise moved"
+    m = nnx.Einsum(einsum_str="bd,dh->bh",
+                   kernel_shape=(4, 8),
+                   rngs=nnx.Rngs(0))
+    assert hasattr(
+        m, "kernel"
+    ), "upstream nnx.Einsum no longer names it kernel; this test's premise moved"
     # Our wrapper renames it. Reproduce the two lines the wrapper runs.
     m.weight = m.kernel
     delattr(m, "kernel")
@@ -75,7 +81,8 @@ def _kernel_attribute_reads(path):
                     assigned.add(id(t))
     hits = []
     for n in ast.walk(tree):
-        if isinstance(n, ast.Attribute) and n.attr == "kernel" and id(n) not in assigned:
+        if isinstance(n, ast.Attribute) and n.attr == "kernel" and id(
+                n) not in assigned:
             # the wrapper's own `self.weight = self.kernel` read is legitimate
             if isinstance(n.value, ast.Name) and n.value.id == "self":
                 continue
@@ -91,4 +98,5 @@ def test_no_module_reads_dot_kernel_off_a_wrapper():
             bad[str(f.relative_to(ROOT))] = hits
     assert not bad, (
         "`.kernel` is read as an attribute here, but the wrappers delete it "
-        f"(AttributeError at runtime, on whichever path first reaches it): {bad}")
+        f"(AttributeError at runtime, on whichever path first reaches it): {bad}"
+    )

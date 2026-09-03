@@ -116,8 +116,7 @@ def quantize_on_host(dtype, weight: jax.Array, axis: int = 0):
 
 
 def place_host_quantized(param, weight: jax.Array, *, mesh: Mesh,
-                         put: Callable[[jax.Array, tuple],
-                                       jax.Array]) -> bool:
+                         put: Callable[[jax.Array, tuple], jax.Array]) -> bool:
     """Honour a HostQuantRequest on `param` for the host array `weight`.
 
     Returns False -- touching nothing -- when the Param carries no request,

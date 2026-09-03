@@ -2,25 +2,23 @@
 CPU JAX in bf16 (the TPU-serving execution semantics) and diff against the
 f32 torch eager reference. venv2 (torch 2.10 / torchvision 0.25 / torchax
 0.0.13 / transformers 5.10.4 — the tpu-inference image's pins)."""
+import os
+
 import numpy as np
 import torch
 from PIL import Image
 
-import os
 CKPT = os.environ["GEMMA4_CKPT"]
 IMG = __import__("os").environ["GEMMA4_IMAGE"]
 MAX_SOFT = 1120
 
 from safetensors import safe_open
-from transformers.models.gemma4_unified.configuration_gemma4_unified import (
-    Gemma4UnifiedConfig,
-)
-from transformers.models.gemma4_unified.image_processing_gemma4_unified import (
-    Gemma4UnifiedImageProcessor,
-)
-from transformers.models.gemma4_unified.modeling_gemma4_unified import (
-    Gemma4UnifiedVisionEmbedder,
-)
+from transformers.models.gemma4_unified.configuration_gemma4_unified import \
+    Gemma4UnifiedConfig
+from transformers.models.gemma4_unified.image_processing_gemma4_unified import \
+    Gemma4UnifiedImageProcessor
+from transformers.models.gemma4_unified.modeling_gemma4_unified import \
+    Gemma4UnifiedVisionEmbedder
 
 cfg = Gemma4UnifiedConfig.from_pretrained(CKPT)
 
@@ -86,19 +84,25 @@ def main():
     pv_j, pos_j = pv.to("jax"), pos.to("jax")
     with torch.no_grad():
         arm = stages(ve16, pv_j, pos_j)
-    arm = {k: torch.from_numpy(np.asarray(v.jax()).astype(np.float32))
-           for k, v in arm.items()}
+    arm = {
+        k: torch.from_numpy(np.asarray(v.jax()).astype(np.float32))
+        for k, v in arm.items()
+    }
     torchax.disable_globally()
 
-    print(f"{'stage':<12}{'max|d|':>12}{'mean|d|':>12}{'rel-mean':>12}{'cosine':>10}")
+    print(
+        f"{'stage':<12}{'max|d|':>12}{'mean|d|':>12}{'rel-mean':>12}{'cosine':>10}"
+    )
     for k in ref:
         a = ref[k].float().numpy()[0][valid_mask]
         b = arm[k].float().numpy()[0][valid_mask]
         d = np.abs(a - b)
         rel = d.mean() / (np.abs(a).mean() + 1e-12)
-        cos = float((a * b).sum() /
-                    (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
-        print(f"{k:<12}{d.max():>12.3e}{d.mean():>12.3e}{rel:>12.3e}{cos:>10.6f}")
+        cos = float(
+            (a * b).sum() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+        print(
+            f"{k:<12}{d.max():>12.3e}{d.mean():>12.3e}{rel:>12.3e}{cos:>10.6f}"
+        )
 
     # processor parity across transformers versions (5.10.4 here vs 5.16.1
     # in the reference venv): dump S0 checksum

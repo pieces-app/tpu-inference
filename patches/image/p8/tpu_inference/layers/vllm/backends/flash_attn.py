@@ -275,8 +275,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 # layers stay purely causal.
                 mm_bidi_ranges = (getattr(attn_metadata, "mm_bidi_ranges",
                                           None)
-                                  if self.sliding_window is not None else
-                                  None)
+                                  if self.sliding_window is not None else None)
 
                 new_kv_cache, outputs = _jax_attn_func(
                     kv_cache,

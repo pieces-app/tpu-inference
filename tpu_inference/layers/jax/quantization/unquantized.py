@@ -218,8 +218,7 @@ class UnquantizedFusedMoEMethod(QuantizeMethodBase, FusedMoEMethodBase):
         # green. (Found in review of the #2568 carry; inherited upstream.)
         staged = [
             name for name in ("kernel_gating_EDF", "kernel_up_proj_EDF",
-                              "kernel_down_proj_EFD")
-            if hasattr(layer, name)
+                              "kernel_down_proj_EFD") if hasattr(layer, name)
             and _param_is_staged_on_host(getattr(layer, name))
         ]
         if staged and layer.moe_backend not in (MoEBackend.GMM_EP,

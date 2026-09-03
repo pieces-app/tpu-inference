@@ -72,8 +72,16 @@ def _dense_oracle(q, k, v, kv_len, q_len, sm_scale, sliding_window, blk):
     return np.einsum("hqk,khd->qhd", p, v.astype(np.float32))
 
 
-def _run_kernel(q, k, v, kv_len, mm, *, sliding_window, page_size=16,
-                pages_per_seq=16, max_num_seqs=1):
+def _run_kernel(q,
+                k,
+                v,
+                kv_len,
+                mm,
+                *,
+                sliding_window,
+                page_size=16,
+                pages_per_seq=16,
+                max_num_seqs=1):
     from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
         ragged_paged_attention
 
@@ -105,10 +113,10 @@ def _run_kernel(q, k, v, kv_len, mm, *, sliding_window, page_size=16,
 @pytest.mark.parametrize(
     "blk",
     [
-        (0, 0),        # sentinel -> pure causal
-        (16, 80),      # block spans multiple bq/bkv blocks (KV extension)
-        (8, 120),      # block wider than the sliding window
-        (96, 128),     # block at the tail
+        (0, 0),  # sentinel -> pure causal
+        (16, 80),  # block spans multiple bq/bkv blocks (KV extension)
+        (8, 120),  # block wider than the sliding window
+        (96, 128),  # block at the tail
     ],
 )
 def test_kernel_matches_dense_oracle(sliding_window, blk):
@@ -120,7 +128,11 @@ def test_kernel_matches_dense_oracle(sliding_window, blk):
     k = rng.standard_normal((q_len, num_heads, head_dim)).astype(np.float32)
     v = rng.standard_normal((q_len, num_heads, head_dim)).astype(np.float32)
 
-    got = _run_kernel(q, k, v, kv_len, np.array([blk], np.int32),
+    got = _run_kernel(q,
+                      k,
+                      v,
+                      kv_len,
+                      np.array([blk], np.int32),
                       sliding_window=sliding_window)
     want = _dense_oracle(q, k, v, kv_len, q_len, head_dim**-0.5,
                          sliding_window, blk)
@@ -131,8 +143,7 @@ def test_kernel_matches_dense_oracle(sliding_window, blk):
 
 
 @pytest.mark.parametrize("sliding_window", [None, 32])
-def test_zero_range_operand_is_bitwise_identical_to_no_operand(
-        sliding_window):
+def test_zero_range_operand_is_bitwise_identical_to_no_operand(sliding_window):
     """Static shim + aliasing-index shift must not perturb anything.
 
     A zero (0, 0) range is semantically a no-op, so passing the operand
@@ -147,9 +158,12 @@ def test_zero_range_operand_is_bitwise_identical_to_no_operand(
     k = rng.standard_normal((q_len, num_heads, head_dim)).astype(np.float32)
     v = rng.standard_normal((q_len, num_heads, head_dim)).astype(np.float32)
 
-    without = _run_kernel(q, k, v, kv_len, None,
-                          sliding_window=sliding_window)
-    with_zero = _run_kernel(q, k, v, kv_len, np.array([[0, 0]], np.int32),
+    without = _run_kernel(q, k, v, kv_len, None, sliding_window=sliding_window)
+    with_zero = _run_kernel(q,
+                            k,
+                            v,
+                            kv_len,
+                            np.array([[0, 0]], np.int32),
                             sliding_window=sliding_window)
     np.testing.assert_array_equal(without, with_zero)
 
@@ -164,7 +178,11 @@ def test_block_actually_changes_in_block_tokens_only():
     v = rng.standard_normal((q_len, num_heads, head_dim)).astype(np.float32)
 
     causal = _run_kernel(q, k, v, kv_len, None, sliding_window=64)
-    bidi = _run_kernel(q, k, v, kv_len, np.array([[16, 80]], np.int32),
+    bidi = _run_kernel(q,
+                       k,
+                       v,
+                       kv_len,
+                       np.array([[16, 80]], np.int32),
                        sliding_window=64)
 
     # Inside the block, queries gain forward context -> must differ.

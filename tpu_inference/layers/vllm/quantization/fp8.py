@@ -47,8 +47,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
 from tpu_inference.layers.common.quant_methods import FP8
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.quantization.online_fp8_requant import (
-    assert_torchax_representable, online_quant_dtype,
-    online_fp8_requant_per_channel)
+    assert_torchax_representable, online_fp8_requant_per_channel,
+    online_quant_dtype)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)

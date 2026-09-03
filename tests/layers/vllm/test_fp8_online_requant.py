@@ -72,4 +72,3 @@ def test_no_empty_scale_ever_created():
         "dtype-derived helper or, historically, the e4m3 literal")
     assert "jnp.empty" not in src and "np.empty" not in src, (
         "no uninitialized scale may be allocated on any path")
-

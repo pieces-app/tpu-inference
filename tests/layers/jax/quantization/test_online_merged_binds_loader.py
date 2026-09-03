@@ -23,11 +23,13 @@ FP8 = ROOT / "tpu_inference" / "layers" / "jax" / "quantization" / "fp8.py"
 
 
 def _create_weights_src():
-    src = FP8.read_text(); tree = ast.parse(src)
+    src = FP8.read_text()
+    tree = ast.parse(src)
     for c in ast.walk(tree):
         if isinstance(c, ast.ClassDef) and c.name == "Fp8OnlineLinearMethod":
             for f in c.body:
-                if isinstance(f, ast.FunctionDef) and f.name == "create_weights_jax":
+                if isinstance(
+                        f, ast.FunctionDef) and f.name == "create_weights_jax":
                     return ast.get_source_segment(src, f)
     pytest.fail("Fp8OnlineLinearMethod.create_weights_jax not found")
 

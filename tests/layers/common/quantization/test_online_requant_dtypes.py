@@ -32,7 +32,10 @@ def _weight():
 
 
 @pytest.mark.parametrize("name", [
-    "float8_e4m3fn", "float8_e4m3b11fnuz", "float8_e5m2", "int8",
+    "float8_e4m3fn",
+    "float8_e4m3b11fnuz",
+    "float8_e5m2",
+    "int8",
 ])
 def test_every_dtype_round_trips_within_its_own_resolution(name):
     import jax.numpy as jnp
@@ -91,8 +94,9 @@ def test_int8_resolves_weights_better_than_e4m3fn():
 
     def rel(dtype):
         w_q, s = r.online_fp8_requant_per_channel(w, dtype=dtype)
-        return float(jnp.max(jnp.abs(w_q.astype(jnp.float32) * s[None, :] - w))
-                     / jnp.max(jnp.abs(w)))
+        return float(
+            jnp.max(jnp.abs(w_q.astype(jnp.float32) * s[None, :] - w)) /
+            jnp.max(jnp.abs(w)))
 
     assert rel(jnp.int8) < rel(jnp.float8_e4m3fn) / 2.0
 
