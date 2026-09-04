@@ -86,10 +86,18 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
    TP=4). Expert-parallel collectives scale with TP while the per-expert work does not, so a
    quantized MoE spread over eight chips is nearly all overhead. Quantization should be
    chosen per (model, chip count), not per model.
-11. **P0 has no answer for the 26B or the 31B.** Every `MODEL_IMPL_TYPE=vllm` lane in the
-   harness is a 12B, so the native-vs-fallback comparison exists for the 12B (1/4/8 chips),
-   E4B and E2B and has never been run for the MoE 26B — the north-star model — or the 31B.
-   Whether the MoE serves under torchax at all is itself unmeasured.
+11. **P0 on the 26B: ANSWERED, and the answer is parity — the MoE does serve under torchax.**
+   `eval-26b-tp4-torchax` (a one-variable twin of `eval-26b-tp4-bf16`) ran clean on four chips:
+   1453 / 2220 req/hr, 0 % degenerate, 151 tok/s (`20260904T200743Z-eval-26b-tp4-torchax`),
+   against the native twin's 1375 / 2160 — torchax nominally +5.7 % / +2.8 %, which is inside
+   this model's own pin-to-pin spread, so it is parity and a same-pin control is queued rather
+   than a claimed reversal. Native still owns the 26B in production for two reasons that do not
+   depend on this number: MTP runs only on native, and the best batch config (native W8A16 +
+   MoE int8, 1851 / 2588) is 27 % above this cell. **The 31B on torchax remains unmeasured.**
+   Worth noting for anyone tuning the fallback path: on the E4B the native margin WIDENS under
+   quantization — 1.39× / 1.62× at W8A16 versus 1.24× / 1.45× in bf16
+   (`20260904T195625Z-eval-e4b-torchax-int8-w8a16`) — so the paths diverge most where the model
+   is least bandwidth-bound.
 
 ## Harness lessons that affect anyone benchmarking this fork
 
