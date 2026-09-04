@@ -94,10 +94,16 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
    than a claimed reversal. Native still owns the 26B in production for two reasons that do not
    depend on this number: MTP runs only on native, and the best batch config (native W8A16 +
    MoE int8, 1851 / 2588) is 27 % above this cell. **The 31B on torchax remains unmeasured.**
-   Worth noting for anyone tuning the fallback path: on the E4B the native margin WIDENS under
-   quantization — 1.39× / 1.62× at W8A16 versus 1.24× / 1.45× in bf16
-   (`20260904T195625Z-eval-e4b-torchax-int8-w8a16`) — so the paths diverge most where the model
-   is least bandwidth-bound.
+13. **Quantization is nearly worthless on the torchax path, and that is where the two paths
+   diverge.** Same lane, same chip, same pin, W8A16 vs bf16: the native E2B gains +11 % / +33 %
+   (3040 / 3968 → 3380 / 5296) while the torchax E2B gains **+2 % / +2 %** (1875 / 2179 →
+   1912 / 2228, `20260904T203117Z-eval-e2b-torchax-int8-w8a16`); the E4B shows the same shape
+   (+27 % / +17 % native, +14 % / +5 % torchax). So the P0 margin WIDENS under quantization —
+   E2B 1.62× / 1.82× in bf16 becomes **1.77× / 2.38×** at W8A16, the widest in the matrix, and
+   E4B 1.24× / 1.45× becomes 1.39× / 1.62×. Reading: whatever the fallback path spends per
+   step is not weight traffic, so shrinking the weights buys it almost nothing. Two consequences
+   — quantizing a torchax deployment is close to pointless, and any profile of the torchax gap
+   should look at per-step dispatch, not memory bandwidth.
 
 ## Harness lessons that affect anyone benchmarking this fork
 
