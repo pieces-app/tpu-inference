@@ -145,17 +145,20 @@ def test_offset_matches_the_jittable_module_call_contract():
     the module's first positional forward parameter is at index 2.
     """
 
-    def functional_call(method_or_name, params, buffers, *args, **kwargs):
-        return method_or_name, params, buffers, args, kwargs
-
-    bound = inspect.signature(functional_call).parameters
-    leading = [
-        name for name, parameter in bound.items()
-        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    ]
-    # method_or_name is bound away by functools.partial before jitting.
-    assert leading == ["method_or_name", "params", "buffers"]
-    assert MM.JITTABLE_MODULE_POSITIONAL_OFFSET == len(leading) - 1
+    # AUDIT 2026-09-03: this used to define a local `functional_call`, read
+    # its own signature back with `inspect`, and assert
+    #     leading == ["method_or_name", "params", "buffers"]
+    # -- a tautology about a function the test had just written three lines
+    # above. It said nothing about torchax. The only load-bearing line was the
+    # offset itself, kept below; the REAL signature is checked in
+    # test_the_real_jittable_module_signature_matches (torch-only, skipped on
+    # this gate -- see the module docstring).
+    assert MM.JITTABLE_MODULE_POSITIONAL_OFFSET == 2, (
+        "JittableModule.jittable_call builds jitted(self.params, "
+        "self.buffers, *args) over partial(self.functional_call, "
+        "method_name), so the module's first positional forward parameter is "
+        "at index 2. A wrong offset makes every static-arg index name the "
+        "wrong parameter.")
 
 
 # ------------------------------------------------------------- behavioural

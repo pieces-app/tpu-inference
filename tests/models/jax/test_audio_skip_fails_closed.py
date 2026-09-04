@@ -40,7 +40,7 @@ MM = ROOT / "tpu_inference" / "models" / "jax" / "gemma4_mm.py"
 ENVS = ROOT / "tpu_inference" / "envs.py"
 
 
-def _load_weights_src():
+def _load_weights_fn():
     src = MM.read_text()
     tree = ast.parse(src)
     for cls in ast.walk(tree):
@@ -48,8 +48,12 @@ def _load_weights_src():
                 and cls.name == "Gemma4ForConditionalGeneration"):
             for f in cls.body:
                 if isinstance(f, ast.FunctionDef) and f.name == "load_weights":
-                    return ast.get_source_segment(src, f) or ""
+                    return f
     pytest.fail("Gemma4ForConditionalGeneration.load_weights not found")
+
+
+def _load_weights_src():
+    return ast.unparse(_load_weights_fn())
 
 
 def test_the_skip_still_exists():
@@ -61,20 +65,40 @@ def test_the_skip_still_exists():
 
 
 def test_load_refuses_when_the_checkpoint_declares_audio():
-    body = _load_weights_src()
-    assert "audio_config" in body, (
+    """AUDIT 2026-09-03: this used to index into `ast.get_source_segment(...)`,
+    which INCLUDES comments. Measured offsets in that text: the first
+    "audio_config" was at 930 -- inside the comment block "26B-A4B declares
+    `audio_config: null` ..." -- while the code that binds it is at 935. So
+    both the presence assertion and the `i_cfg < i_raise < i_loader` ordering
+    were satisfied by prose: deleting the `audio_cfg = getattr(...)` binding
+    while leaving the comment and any unrelated `raise` kept it green.
+    Assert on AST line numbers, where only code counts.
+    """
+    fn = _load_weights_fn()
+    reads = [
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "getattr"
+        and len(n.args) > 1 and isinstance(n.args[1], ast.Constant)
+        and n.args[1].value == "audio_config"
+    ]
+    assert reads, (
         "load_weights never consults audio_config, so it cannot tell a "
         "checkpoint with no audio (26B, correct to skip) from one with 752 "
         "audio tensors (E4B, catastrophic to skip)")
-    assert "raise" in body, (
+    raises = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Raise)]
+    assert raises, (
         "load_weights must REFUSE when the config declares audio it cannot "
         "serve; skipping silently discards the modality")
-    # the refusal must be reachable BEFORE the loader runs
-    i_cfg, i_raise = body.index("audio_config"), body.index("raise")
-    i_loader = body.index("JaxAutoWeightsLoader")
-    assert i_cfg < i_raise < i_loader, (
-        "the audio check must run BEFORE JaxAutoWeightsLoader, or the weights "
-        "are already dropped by the time it fires")
+    loaders = [
+        n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+        and "JaxAutoWeightsLoader" in ast.unparse(n.func)
+    ]
+    assert loaders, "load_weights no longer calls JaxAutoWeightsLoader"
+    assert min(reads) < min(raises) < min(loaders), (
+        f"the audio check must run BEFORE JaxAutoWeightsLoader, or the "
+        f"weights are already dropped by the time it fires "
+        f"(audio_config@{min(reads)}, raise@{min(raises)}, "
+        f"loader@{min(loaders)})")
 
 
 def test_there_is_a_stated_escape_hatch():
@@ -82,8 +106,14 @@ def test_there_is_a_stated_escape_hatch():
     assert "ALLOW_AUDIO_WEIGHT_SKIP" in body, (
         "text+vision from an audio-capable checkpoint is legitimate; it needs "
         "an opt-in rather than being impossible")
-    assert "ALLOW_AUDIO_WEIGHT_SKIP" in ENVS.read_text(), (
-        "the escape hatch must be a declared env var, not an undeclared read")
+    # AUDIT 2026-09-03: a bare substring would be satisfied by the name
+    # appearing only in a comment. Pin the registration itself.
+    import re
+    assert re.search(
+        r'"ALLOW_AUDIO_WEIGHT_SKIP":\s*\n?\s*env_bool\(',
+        ENVS.read_text()), ("the escape hatch must be a REGISTERED env var "
+                            "(env_bool in environment_variables), not an "
+                            "undeclared read or a mention in a comment")
 
 
 def test_the_hatch_defaults_to_refusing():

@@ -284,6 +284,15 @@ def _measure():
         w_s = h.adopt_host_quant_scale(param)
         assert w_s is not None and w_s.dtype == jnp.float32 and w_s.sharding.spec == P(
             *sspec), key
+        # AUDIT 2026-09-03: adopt_host_quant_scale documents that it CLEARS
+        # the parked reference, and nothing checked it. Measured: deleting
+        # `param.set_metadata(HOST_QUANT_SCALE, None)` from the leaf left the
+        # whole gate green, while a second reference to every weight scale
+        # stayed pinned on the Param for the life of the model -- the exact
+        # class of leak this change exists to remove.
+        assert h.adopt_host_quant_scale(param) is None, (
+            f"{key}: the parked scale was not cleared on adoption; a second "
+            f"reference to every scale survives for the life of the model")
         # the post-fix process_weights_after_loading: same buffers, fresh Params
         delattr(block, name)
         setattr(block, name, nnx.Param(placed))
@@ -402,9 +411,14 @@ def test_host_side_staging_is_one_kernel():
     jax.Array and is not counted.)"""
     r = _result()
     bound = r["bf16_largest"] + r["int8_largest"] + r["scale_largest"]
-    assert 0 < r["after"]["host_peak"] <= bound, (
-        f"host peak {r['after']['host_peak']} B exceeds one kernel's staging {bound} B"
-    )
+    # AUDIT 2026-09-03: the lower half used to be `0 < ...`, which is
+    # trivially true whenever anything at all is staged. The real floor is one
+    # bf16 kernel: a run that stages LESS than that is not host-quantizing at
+    # all, which is the silent fallback this suite exists to detect.
+    assert r["bf16_largest"] <= r["after"]["host_peak"] <= bound, (
+        f"host peak {r['after']['host_peak']} B is not one kernel's staging "
+        f"({r['bf16_largest']}..{bound} B): below the floor means no bf16 "
+        f"kernel was staged on the host, above the ceiling means two were")
 
 
 def test_host_quantized_kernels_are_bit_identical_to_the_device_path():

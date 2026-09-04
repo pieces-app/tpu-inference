@@ -81,7 +81,19 @@ def test_create_weights_requests_host_quant_with_the_apply_paths_layout():
         "the per-OUTPUT scale follows the OUT axis; [0] is the Fp8Tensorwise wart of sharding it along the INPUT axis"
     )
     assert "if not self.batch_features:" in body, "batched kernels keep the fail-closed refusal in process_weights"
-    assert "layer" not in call, (
+    # AUDIT 2026-09-03: `assert "layer" not in call` used to run against
+    # `call`, which is not the call -- it is everything from
+    # "HostQuantRequest(" to the END of the method. That passes today only
+    # because the request happens to be the last statement. Measured false
+    # positive: appending a perfectly correct
+    # `layer.weight.set_metadata('_online', True)` after the request turned it
+    # RED. Scope the check to the actual call node.
+    req = next((n for n in ast.walk(ast.parse(FP8.read_text()))
+                if isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) == "HostQuantRequest"), None)
+    assert req is not None, "HostQuantRequest(...) call node not found"
+    captured = {x.id for x in ast.walk(req) if isinstance(x, ast.Name)}
+    assert "layer" not in captured, (
         "the request must not capture the layer: nnx.eval_shape re-merges the abstract model into NEW "
         "module objects, so a layer captured at construction is stale by load time"
     )
@@ -91,8 +103,7 @@ def test_the_request_rides_on_param_metadata_not_on_the_layer():
     src = LEAF.read_text()
     assert 'HOST_QUANT_REQUEST = "_online_host_quant"' in src
     assert 'HOST_QUANT_SCALE = "_online_host_quant_scale"' in src
-    fields = _fn(LEAF, "__init__", "HostQuantRequest"
-                 ) if False else None  # dataclass: no __init__ in source
+    # (a dataclass: there is no __init__ in the source to inspect)
     cls = next(n for n in ast.walk(ast.parse(src))
                if isinstance(n, ast.ClassDef) and n.name == "HostQuantRequest")
     names = [n.target.id for n in cls.body if isinstance(n, ast.AnnAssign)]
@@ -117,6 +128,29 @@ def test_process_weights_adopts_the_parked_scale_before_any_device_requant():
     # the guards the device path had stay in front of both branches
     assert body.index("_is_loaded") < adopt_at and body.index(
         "batch_features") < adopt_at
+    # AUDIT 2026-09-03: everything above asserts the CONTENT of the adopt
+    # branch, not the condition that reaches it. Measured: changing
+    # `if w_s is not None:` to `if False:` -- which sends every checkpoint
+    # back to the pre-fix on-mesh requant while leaving all this text in
+    # place -- kept the whole gate green. Pin the guard itself.
+    meth = next(
+        f for c in ast.walk(ast.parse(FP8.read_text()))
+        if isinstance(c, ast.ClassDef) and c.name == "Fp8OnlineLinearMethod"
+        for f in c.body if isinstance(f, ast.FunctionDef)
+        and f.name == "process_weights_after_loading")
+    guard = next((n for n in ast.walk(meth)
+                  if isinstance(n, ast.If) and "w_s" in ast.unparse(n.test)),
+                 None)
+    assert guard is not None, "no `w_s` guard in process_weights_after_loading"
+    assert ast.unparse(guard.test) == "w_s is not None", (
+        f"the adopt branch is guarded by {ast.unparse(guard.test)!r}; "
+        f"anything that cannot be true sends every checkpoint back to the "
+        f"on-mesh requant that put the whole bf16 model on one chip")
+    assert any(
+        isinstance(s, ast.Return) and getattr(s.value, "value", None) is True
+        for s in guard.body), (
+            "the adopt branch must RETURN True; falling through re-runs the "
+            "device requant on an already-quantized kernel")
 
 
 def test_engagement_marker_is_emitted_on_both_paths():

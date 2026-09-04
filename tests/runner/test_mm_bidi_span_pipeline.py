@@ -364,13 +364,40 @@ def test_both_paths_read_mm_bidi_ranges_under_the_sliding_window_gate(path):
     reads the operand unconditionally would make global layers bidirectional
     over the image.
     """
+    # AUDIT 2026-09-03: this was two unrelated substrings anywhere in a
+    # 1000+ line file plus a 300-CHARACTER PROXIMITY WINDOW around
+    # `src.index(...)` -- which takes only the FIRST occurrence. It holds
+    # today because each file has exactly one quoted "mm_bidi_ranges", but a
+    # second read site added anywhere later is unchecked and the test stays
+    # green. Walk every read instead.
+    import ast as _ast
     src = path.read_text()
-    assert 'getattr(' in src and 'mm_bidi_ranges' in src
-    idx = src.index('"mm_bidi_ranges"')
-    window = src[idx:idx + 300]
-    assert "self.sliding_window is not None" in window, (
-        f"{path.name} must gate the blockwise operand on the layer being a "
-        "sliding-window layer")
+    tree = _ast.parse(src)
+    parents = {}
+    for node in _ast.walk(tree):
+        for child in _ast.iter_child_nodes(node):
+            parents[child] = node
+    reads = [
+        n for n in _ast.walk(tree)
+        if isinstance(n, _ast.Call) and _ast.unparse(n.func) == "getattr"
+        and len(n.args) > 1 and isinstance(n.args[1], _ast.Constant)
+        and n.args[1].value == "mm_bidi_ranges"
+    ]
+    assert reads, f"{path.name} never reads mm_bidi_ranges via getattr"
+    for read in reads:
+        gated, node = False, read
+        while node in parents:
+            node = parents[node]
+            if isinstance(
+                    node,
+                (_ast.IfExp, _ast.If)) and ("self.sliding_window is not None"
+                                            in _ast.unparse(node.test)):
+                gated = True
+                break
+        assert gated, (
+            f"{path.name}: an mm_bidi_ranges read at line {read.lineno} is "
+            f"not gated on the layer being a sliding-window layer -- a "
+            f"full-attention layer would go bidirectional over the image")
 
 
 def test_the_runner_walks_the_rows_even_when_the_feature_is_off():

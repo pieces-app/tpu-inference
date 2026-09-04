@@ -39,10 +39,22 @@ def test_fallback_mask_uses_all_but_the_feature_dim():
 @pytest.mark.parametrize("shape", [(2, 37, 640), (37, 640)])
 def test_the_rule_gives_the_gatherable_shape(shape):
     """Behavioural: apply the exact rule to both ranks and run the gather the
-    model performs after its own expand_dims."""
+    model performs after its own expand_dims.
+
+    AUDIT 2026-09-03: this used to RETYPE the rule as a literal
+    `jnp.ones(feats.shape[:-1], dtype=bool)`, so it reached no production
+    code at all -- `_parse_and_validate_audio_input` could be deleted outright
+    and it stayed green. It asserted a property of `jnp` indexing, not of the
+    fix. Evaluate the expression the SOURCE actually contains instead, so the
+    test fails when production's rule changes.
+    """
     jnp = pytest.importorskip("jax").numpy
     feats = jnp.zeros(shape, jnp.bfloat16)
-    mask = jnp.ones(feats.shape[:-1], dtype=bool)
+    mask = eval(  # noqa: S307 -- the expression comes from the shipped source
+        _fallback_expr(), {
+            "jnp": jnp,
+            "bool": bool
+        }, {"feats": feats})
     if feats.ndim == 2:
         feats = jnp.expand_dims(feats, 0)
         mask = jnp.expand_dims(mask, 0)
@@ -54,12 +66,18 @@ def test_the_rule_gives_the_gatherable_shape(shape):
 
 def test_the_old_rule_breaks_rank_2():
     """Negative control for the property, not for the code: shape[:2] on a
-    rank-2 input yields a mask the gather cannot use."""
+    rank-2 input yields a mask the gather cannot use.
+
+    AUDIT 2026-09-03: `pytest.raises(Exception)` was wide enough that a
+    NameError or a typo in the test body would have satisfied it. Pin the
+    IndexError and its message so this control proves the gather rejects the
+    MASK SHAPE, not that some line happened to throw.
+    """
     jnp = pytest.importorskip("jax").numpy
     feats = jnp.zeros((37, 640), jnp.bfloat16)
     mask = jnp.ones(feats.shape[:2], dtype=bool)  # the old rule
     feats = jnp.expand_dims(feats, 0)
     mask = jnp.expand_dims(mask, 0)
     emb = jnp.zeros((1, 37, 3840), jnp.bfloat16)
-    with pytest.raises(Exception):
+    with pytest.raises(IndexError, match="boolean index did not match"):
         _ = emb[0][mask[0]]

@@ -87,8 +87,22 @@ def test_requant_round_trip_within_e4m3_tolerance():
     w_q, w_s = quantize_tensor(jnp.float8_e4m3fn, w, axis=0)
     rt = w_q.astype(jnp.float32) * w_s.reshape(1, -1)
     ref = w.astype(jnp.float32)
-    rel = jnp.max(jnp.abs(rt - ref) / (jnp.abs(ref) + 1e-6))
-    assert float(rel) < 0.15, f"e4m3 round-trip too lossy: {float(rel)}"
+    # AUDIT 2026-09-03: `rel < 0.15` on plain Gaussian columns is 2.4x the
+    # measured 0.0635 and, worse, cannot separate per-CHANNEL from per-TENSOR
+    # (a per-tensor scale on this data measures 0.0815 and passed). One
+    # low-amplitude column makes the distinction visible (per-tensor: 0.8224),
+    # and an explicit finiteness check rejects a divisor large enough to
+    # overflow e4m3 to NaN -- which makes the ratio -inf and pass any bound.
+    w = w.at[:, 0].multiply(1e-3)
+    w_q, w_s = quantize_tensor(jnp.float8_e4m3fn, w, axis=0)
+    rt = w_q.astype(jnp.float32) * w_s.reshape(1, -1)
+    ref = w.astype(jnp.float32)
+    assert bool(jnp.all(
+        jnp.isfinite(rt))), "quantized weights overflowed to NaN"
+    rel = float(jnp.max(jnp.abs(rt - ref) / (jnp.abs(ref) + 1e-6)))
+    assert rel < 0.08, (
+        f"e4m3 round-trip too lossy: {rel} (this code 0.0635; per-tensor 0.8224)"
+    )
 
 
 # ------------------------------------------------------- F2 dispatch gate
@@ -198,23 +212,53 @@ def test_requant_does_not_build_a_sharding_from_the_always_none_mesh():
 
 
 def test_experts_and_router_are_not_online_quantized():
+    """AUDIT 2026-09-03: both assertions used to be substring matches on the
+    UNSTRIPPED source segment, and both were vacuous. Measured:
+      * deleting the ENTIRE experts branch (`if isinstance(layer, (
+        JaxRoutedExperts, JaxMoE)): return UnquantizedFusedMoEMethod(layer)`)
+        still passed, because the method's own local import line keeps the
+        name "UnquantizedFusedMoEMethod" alive in the text;
+      * deleting "router" from the skip tuple still passed, because the
+        explanatory comment above it mentions the router.
+    Assert the RETURN and the tuple ELEMENTS as AST instead: an import of a
+    name is not a dispatch, and a comment is not a skip entry.
+    """
     src = FP8.read_text()
     cls = _cls(ast.parse(src), "Fp8OnlineConfig")
     assert cls is not None
     gqm = _meth(cls, "get_quant_method")
-    body = ast.get_source_segment(src, gqm) or ""
-    assert "UnquantizedFusedMoEMethod" in body, (
-        "experts stay on the orthogonal MOE_REQUANTIZE path")
-    assert "router" in body and "UnquantizedLinearMethod" in body, (
-        "the router must stay bf16 -- routing quality is disproportionately "
-        "sensitive and there is no HBM payoff")
+    assert gqm is not None, "Fp8OnlineConfig.get_quant_method not found"
+    assert [
+        n for n in ast.walk(gqm)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None) == "UnquantizedFusedMoEMethod"
+    ], ("experts must RETURN UnquantizedFusedMoEMethod -- an import of the "
+        "name is not a dispatch. They stay on the orthogonal MOE_REQUANTIZE "
+        "path; online-quantizing them too would double-quantize.")
+    assert [
+        n for n in ast.walk(gqm)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None) == "UnquantizedLinearMethod"
+    ], "the skipped layers must RETURN UnquantizedLinearMethod"
+    skips = [
+        e.value for n in ast.walk(gqm) if isinstance(n, ast.Tuple)
+        for e in n.elts
+        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+    ]
+    assert "router" in skips, (
+        f"'router' is not an element of the skip tuple ({skips}) -- the "
+        f"router must stay bf16: routing quality is disproportionately "
+        f"sensitive and there is no HBM payoff")
 
 
-def test_engagement_marker_is_logged():
-    """The lane tooling greps this line as one half of the engagement proof
-    (bank writes are the other half). A silent method = a vacuous panel."""
-    src = FP8.read_text()
-    assert "VLLM_FP8_ONLINE_DENSE=1: serving dense on-the-fly" in src
+# AUDIT 2026-09-03: `test_engagement_marker_is_logged` stood here. It asserted
+# the marker substring appears anywhere in fp8.py, which is a strict subset of
+# tests/layers/jax/quantization/test_online_host_quant_wiring.py::
+# test_engagement_marker_is_emitted_on_both_paths -- that one pins the same
+# literal AND the `_ONLINE_DENSE_MARKER = (` binding AND
+# `body.count("logger.info_once(_ONLINE_DENSE_MARKER)") == 2`, so it fails on
+# everything this one failed on and more. Removed as a duplicate rather than
+# left as a second, weaker guard on the same fact.
 
 
 # ------------------------------------------------------------- F4 platform

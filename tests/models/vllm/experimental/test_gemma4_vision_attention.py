@@ -125,7 +125,11 @@ def _attention(q, k, v, mask, score_dtype, out_dtype, chunk=0):
         s = jnp.einsum("bhqd,bhkd->bhqk", q[:, :,
                                             start:stop].astype(score_dtype),
                        k.astype(score_dtype))
-        s = jnp.where(m[:, :, start:stop, :], s,
+        # Mirror the shipped guard (gemma4_vision_attention.py: `if
+        # mask.shape[-2] != 1: mask = mask[:, :, start:stop, :]`): a mask that
+        # is broadcast down the query axis must NOT be sliced.
+        mb = m if m.shape[-2] == 1 else m[:, :, start:stop, :]
+        s = jnp.where(mb, s,
                       jnp.asarray(jnp.finfo(score_dtype).min, score_dtype))
         p = jax.nn.softmax(s, axis=-1).astype(out_dtype)
         parts.append(jnp.einsum("bhqk,bhkd->bhqd", p, v))
@@ -183,12 +187,72 @@ def test_fp32_scores_reach_full_bf16_accuracy(n_query, n_pad):
 
 @pytest.mark.parametrize("chunk", [128, 512, 0])
 def test_query_chunking_does_not_change_the_answer(chunk):
-    """PIECES_GEMMA4_VISION_ATTN_CHUNK is a memory knob, not a numeric one."""
+    """PIECES_GEMMA4_VISION_ATTN_CHUNK is a memory knob, not a numeric one.
+
+    AUDIT 2026-09-03: this used the padding mask from `_inputs`, which is
+    broadcast CONSTANT down the query axis, so slicing it was a no-op and
+    `dense == blocked` held by construction of the helper. It said nothing
+    about chunking. Both mask shapes are covered below: one that varies per
+    query row (so the slice is load-bearing) and one already broadcast to
+    shape[-2] == 1 (which must NOT be sliced) -- the two branches of the
+    shipped guard, pinned structurally in
+    `test_the_chunked_mask_is_sliced_only_when_it_has_real_query_rows`.
+    """
     jnp = pytest.importorskip("jax.numpy")
-    q, k, v, mask, _ = _inputs(1008, 24)
-    dense = _attention(q, k, v, mask, jnp.float32, jnp.bfloat16, chunk=0)
-    blocked = _attention(q, k, v, mask, jnp.float32, jnp.bfloat16, chunk=chunk)
-    assert np.array_equal(dense, blocked)
+    q, k, v, _, _ = _inputs(1008, 24)
+    n = q.shape[-2]
+    rng = np.random.default_rng(11)
+    # (a) a per-query-row mask: slicing it wrong misaligns every block
+    varying = rng.random((1, 1, n, n)) > 0.25
+    varying[..., 0] = True  # never leave a row with an empty softmax
+    dense = _attention(q, k, v, varying, jnp.float32, jnp.bfloat16, chunk=0)
+    blocked = _attention(q,
+                         k,
+                         v,
+                         varying,
+                         jnp.float32,
+                         jnp.bfloat16,
+                         chunk=chunk)
+    assert np.array_equal(
+        dense,
+        blocked), ("chunking changed the answer on a query-varying mask")
+    # (b) a broadcast mask (shape[-2] == 1): slicing it at all is wrong
+    bcast = np.ones((1, 1, 1, n), bool)
+    bcast[..., n - 24:] = False
+    dense_b = _attention(q, k, v, bcast, jnp.float32, jnp.bfloat16, chunk=0)
+    blocked_b = _attention(q,
+                           k,
+                           v,
+                           bcast,
+                           jnp.float32,
+                           jnp.bfloat16,
+                           chunk=chunk)
+    assert np.array_equal(
+        dense_b,
+        blocked_b), ("chunking changed the answer on a query-broadcast mask")
+
+
+def test_the_chunked_mask_is_sliced_only_when_it_has_real_query_rows():
+    """The guard M8 broke: `if mask.shape[-2] != 1: mask = mask[..., s:e, :]`.
+
+    AUDIT 2026-09-03: inverting this comparison to `== 1` -- which slices a
+    broadcast mask (wrong axis length) and leaves a full mask unsliced (every
+    block after the first reads the wrong query rows) -- left all 21 tests in
+    this file green, because the module imports torch and nothing here
+    executes it. Pin the comparison.
+    """
+    fn = _fn(ast.parse(PATCH.read_text()), "fp32_logit_attention")
+    guard = next(
+        (n for n in ast.walk(fn)
+         if isinstance(n, ast.If) and "shape[-2]" in ast.unparse(n.test)),
+        None)
+    assert guard is not None, "the chunked-mask shape guard is gone"
+    assert ast.unparse(guard.test) == "mask.shape[-2] != 1", (
+        f"the guard is {ast.unparse(guard.test)!r}: a query-broadcast mask "
+        f"must be left alone and a full mask must be sliced, not the reverse")
+    assert "mask[:, :, start:stop, :]" in ast.unparse(
+        guard.body[0]), (f"the guarded body does not slice the query axis: "
+                         f"{ast.unparse(guard.body[0])!r}")
 
 
 def test_padded_keys_are_excluded_and_padded_queries_still_attend():
@@ -239,10 +303,27 @@ def test_the_softmax_runs_on_the_fp32_scores_and_only_probs_are_cast_down():
 
 
 def test_the_bool_mask_keeps_where_true():
-    """A bool mask is True = attend; inverting it would mask everything."""
-    src = _src(PATCH, "fp32_logit_attention")
-    assert "torch.where(\n                    mask, scores," in src.replace(
-        "\r\n", "\n")
+    """A bool mask is True = attend; inverting it would mask everything.
+
+    AUDIT 2026-09-03: this pinned 20 characters of INDENTATION
+    (`"torch.where(\n                    mask, scores,"`). PR #59 was a
+    yapf/isort pass over exactly this file, so a reflow turns it red with no
+    behaviour change, while a polarity flip that happens to reformat slips
+    through. Assert the call's arguments instead.
+    """
+    fn = _fn(ast.parse(PATCH.read_text()), "fp32_logit_attention")
+    w = next(
+        (n for n in ast.walk(fn)
+         if isinstance(n, ast.Call) and ast.unparse(n.func) == "torch.where"),
+        None)
+    assert w is not None, "the bool-mask torch.where is gone"
+    assert ast.unparse(w.args[0]) == "mask", (
+        f"the where condition is {ast.unparse(w.args[0])!r}; `~mask` or an "
+        f"inverted comparison masks everything the model should attend to")
+    assert ast.unparse(w.args[1]) == "scores"
+    assert "torch.finfo(torch.float32).min" in ast.unparse(
+        w.args[2]), (f"masked positions must go to -inf-for-f32, got "
+                     f"{ast.unparse(w.args[2])!r}")
 
 
 def test_gqa_is_refused_rather_than_silently_mis_attended():

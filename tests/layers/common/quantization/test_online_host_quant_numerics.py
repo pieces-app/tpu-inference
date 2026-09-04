@@ -123,11 +123,52 @@ def test_three_d_kernel_is_flattened_exactly_as_the_device_path_did():
     assert np.array_equal(_bits(h.adopt_host_quant_scale(p)), _bits(e_s))
 
 
-def test_quantize_on_host_is_quantize_tensor_jitted_not_a_second_implementation(
-):
-    src = LEAF.read_text()
-    assert "jax.jit(quantize_tensor" in src, "the host path must jit the shipped primitive"
-    assert "def quantize_tensor" not in src, "a re-implementation could drift from the device path"
+def test_place_host_quantized_routes_through_the_jitted_primitive(monkeypatch):
+    """AUDIT 2026-09-03: this replaces a pair of source-string assertions
+    (`"jax.jit(quantize_tensor" in src` and `"def quantize_tensor" not in src`)
+    that could not fail. The first proved only that the LINE exists, not that
+    it is on the call path; the second is a negative that holds for almost any
+    file. Verified vacuous: with a second, bf16-reduced implementation inlined
+    into `place_host_quantized` and the jitted `_quantize` left defined but
+    unused, both assertions still passed.
+
+    `_quantize` is a module global, so intercepting it proves the routing.
+    """
+    import jax.numpy as jnp
+    q, h = _leaves()
+    seen = []
+    real = h._quantize
+    monkeypatch.setattr(h, "_quantize", lambda *a:
+                        (seen.append(a), real(*a))[1])
+    p = _Param()
+    w = _bf16_weight((64, 32), 9)
+    h.request_host_quant(
+        p, h.HostQuantRequest(jnp.int8, (64, 32), (None, None), (None, )))
+    assert h.place_host_quantized(p, w, mesh=_NOWHERE, put=_IDENTITY_PUT)
+    assert len(seen) == 1, (
+        f"place_host_quantized called the jitted primitive {len(seen)} times; "
+        "a second implementation inlined here would drift from the device path"
+    )
+    assert seen[0][0] is jnp.int8, (
+        f"the jitted primitive was called with {seen[0][0]!r}, not the "
+        "requested dtype")
+
+
+def test_quantize_on_host_agrees_with_the_eager_device_path():
+    """`quantize_on_host` is named in this file's docstring and in the leaf's
+    as part of the covered surface, but AUDIT 2026-09-03 found nothing called
+    it -- not this suite, not production (weight_utils calls
+    place_host_quantized; fp8.py calls request_host_quant/adopt). Cover it
+    directly rather than leave a named-but-unexercised entry point.
+    """
+    import jax.numpy as jnp
+    q, h = _leaves()
+    w = _bf16_weight((128, 64), 11)
+    for dtype in (jnp.int8, jnp.float8_e4m3fn):
+        got_q, got_s = h.quantize_on_host(dtype, w)
+        exp_q, exp_s = q.quantize_tensor(dtype, w, 0, None)
+        assert np.array_equal(_bits(got_q), _bits(exp_q)), dtype
+        assert np.array_equal(_bits(got_s), _bits(exp_s)), dtype
 
 
 def test_specs_reach_put_verbatim_weight_then_scale():

@@ -125,6 +125,63 @@ def test_w8a16_and_w8a8_differ_only_by_activation_rounding():
     assert d < 5e-2, f"W8A8 and W8A16 diverge by {d}: one path is wrong, not merely rounded"
 
 
+def test_env_actually_reaches_the_dense_sharded_matmul():
+    """BEHAVIOURAL proof that TPU_ONLINE_QUANT_ACT reaches the matmul.
+
+    AUDIT 2026-09-03: the structural test below was the ONLY gate coverage
+    for the dense switch, and it is a source-string match. Two measured
+    holes it could not see:
+      * deleting the guard from sharded_quantized_matmul turned ONLY that
+        one substring test red -- the two numeric tests in this file pass
+        `quantize_activation=` explicitly, so they never consult the env;
+      * keeping the asserted text verbatim while hardcoding
+        `quantize_activation=True` at both call sites -- i.e. ACT=0 silently
+        serving W8A8 -- left all five tests green. That is the mislabelled-arm
+        failure the MoE twin (test_moe_w8a16_switch.py) has a behavioural
+        test for and the dense side did not.
+
+    One forced CPU device is enough: the switch is a host-side branch, and
+    the assertion is an exact bit comparison against the two explicit modes.
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+    w, w_q, w_s = _quant_w()
+    x = jax.random.normal(jax.random.PRNGKey(0), (8, 64)).astype(jnp.bfloat16)
+    mesh = Mesh(
+        np.array(jax.devices()[:1]).reshape(1, 1), ("ATTN_DATA", "model"))
+
+    m0 = _mod(quant_act=False)
+    with jax.set_mesh(mesh):
+        got0 = m0.sharded_quantized_matmul(x,
+                                           w_q,
+                                           w_s,
+                                           P(None, "model"),
+                                           mesh=mesh)
+    w8a16 = m0.xla_quantized_matmul(x, w_q, w_s, quantize_activation=False)
+    w8a8 = m0.xla_quantized_matmul(x, w_q, w_s, quantize_activation=True)
+    # The control: the two modes must actually differ, or nothing below binds.
+    assert not np.array_equal(np.asarray(w8a16), np.asarray(w8a8)), (
+        "W8A16 and W8A8 are bit-identical on this input: the assertions "
+        "below cannot distinguish anything")
+    assert np.array_equal(np.asarray(got0), np.asarray(w8a16)), (
+        "TPU_ONLINE_QUANT_ACT=0 did not reach the matmul: the sharded path "
+        "still quantized the activations (a lane labelled W8A16 would serve "
+        "W8A8)")
+
+    m1 = _mod(quant_act=True)
+    with jax.set_mesh(mesh):
+        got1 = m1.sharded_quantized_matmul(x,
+                                           w_q,
+                                           w_s,
+                                           P(None, "model"),
+                                           mesh=mesh)
+    assert np.array_equal(np.asarray(got1), np.asarray(w8a8)), (
+        "the default (TPU_ONLINE_QUANT_ACT=1) stopped quantizing activations")
+
+
 def test_env_flips_the_sharded_default_without_touching_explicit_callers():
     src = LEAF.read_text()
     i = src.index("def sharded_quantized_matmul")
@@ -135,17 +192,54 @@ def test_env_flips_the_sharded_default_without_touching_explicit_callers():
             "the batched path hardcoded itemsize>1 and ignored the env")
 
 
+def test_the_env_defaults_to_w8a8_in_the_shipped_envs_module():
+    """AUDIT 2026-09-03: nothing pinned the shipped default. Measured:
+    flipping `env_bool("TPU_ONLINE_QUANT_ACT", default=True)` to
+    `default=False` left all 309 gate tests green -- every unset deployment
+    would silently switch from W8A8 to W8A16, which is a different arm of the
+    quality matrix under an unchanged label. The whole switch exists to keep
+    those two arms distinguishable, so the default is part of the contract.
+
+    True == W8A8 == the historical behaviour; ACT=0 is the opt-in experiment.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_w8a16_envs", ROOT / "tpu_inference" / "envs.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.TPU_ONLINE_QUANT_ACT is True, (
+        "the shipped default must be W8A8 (the historical behaviour); "
+        "weight-only is the opt-in experiment")
+
+
 def test_env_is_forwarded_to_ray_workers():
+    # AUDIT 2026-09-03: this was a raw `plat[i:i+1500]` substring window. The
+    # list currently spans ~1100 chars, so the window already overruns into
+    # the next method: a few more entries and the names fall OUT of it (false
+    # red), while the same name quoted in a nearby comment satisfies it
+    # (false green). Parse the actual list instead.
+    import ast
     plat = (ROOT / "tpu_inference" / "platforms" /
             "tpu_platform.py").read_text()
-    i = plat.index("additional_env_vars")
-    block = plat[i:i + 1500]
-    assert '"TPU_ONLINE_QUANT_DTYPE"' in block, (
-        "TPU_ONLINE_QUANT_DTYPE missing from the Ray passthrough: a multi-host int8 lane would serve fp8 on the workers (ti #29)"
-    )
-    assert '"TPU_ONLINE_QUANT_ACT"' in block, (
-        "a multi-host Ray run would silently fall back to W8A8 while the lane said W8A16 (the ti #29 shape)"
-    )
+    tree = ast.parse(plat)
+    node = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, (ast.Assign, ast.AnnAssign)) and any(
+             getattr(tg, "id", None) == "additional_env_vars" for tg in
+             ([n.target] if isinstance(n, ast.AnnAssign) else n.targets))),
+        None)
+    assert node is not None, "additional_env_vars not found in tpu_platform.py"
+    names = {
+        e.value
+        for e in ast.walk(node.value)
+        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+    }
+    assert "TPU_ONLINE_QUANT_DTYPE" in names, (
+        f"TPU_ONLINE_QUANT_DTYPE missing from the Ray passthrough: a "
+        f"multi-host int8 lane would serve fp8 on the workers (ti #29). "
+        f"Got: {sorted(names)}")
+    assert "TPU_ONLINE_QUANT_ACT" in names, (
+        f"a multi-host Ray run would silently fall back to W8A8 while the "
+        f"lane said W8A16 (the ti #29 shape). Got: {sorted(names)}")
 
 
 def test_both_w8a16_implementations_agree():

@@ -24,8 +24,8 @@ importable (skipped on the CPU gate).
 """
 
 import ast
-import importlib.util
 import pathlib
+import types
 
 import numpy as np
 import pytest
@@ -41,9 +41,24 @@ STATS_SRC = ROOT / "tpu_inference" / "models" / "common" / "mm_debug_stats.py"
 
 
 def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """Compile the source directly -- NOT `spec_from_file_location`.
+
+    AUDIT 2026-09-03: this file is the largest in the gate and the one whose
+    negative controls matter most, and it used the loader that its own
+    siblings (tests/runner/test_mm_bidi_span_pipeline.py,
+    tests/models/vllm/experimental/test_gemma4_ple_reference_parity.py)
+    document as having produced a FALSE-GREEN control: the bytecode cache is
+    keyed on (mtime, size), so two equal-length edits inside one filesystem
+    timestamp tick hand back the STALE .pyc. Verified live: running this file
+    creates
+    tpu_inference/models/vllm/experimental/__pycache__/mm_debug_patch*.pyc,
+    and a same-size source edit with the mtime preserved was NOT picked up.
+    exec(compile(...)) never consults the cache.
+    """
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(  # noqa: S102 -- the source is a file in this repo
+        compile(path.read_text(), str(path), "exec"), module.__dict__)
     return module
 
 
@@ -862,8 +877,17 @@ def test_per_layer_hooks_reach_inside_a_jittable_module():
 
 
 def test_the_patcher_passes_the_layers_flag_through():
-    src = PATCHER_SRC.read_text()
-    assert "per_layer=envs.PIECES_MM_DEBUG_LAYERS" in src
+    # AUDIT 2026-09-03: a bare substring anywhere in the file, with no check
+    # that it is the install_mm_debug call's keyword. Resolve the call.
+    tree = ast.parse(PATCHER_SRC.read_text())
+    call = next((n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and ast.unparse(n.func).endswith("install_mm_debug")), None)
+    assert call is not None, "install_mm_debug is never called by the patcher"
+    kw = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert kw.get("per_layer") == "envs.PIECES_MM_DEBUG_LAYERS", (
+        f"install_mm_debug's per_layer is {kw.get('per_layer')!r}; the "
+        f"torchax lane would ignore PIECES_MM_DEBUG_LAYERS and the two towers "
+        f"could not be diffed layer by layer")
 
 
 def test_the_flax_tower_emits_the_same_two_names_under_the_same_flag():
@@ -871,7 +895,21 @@ def test_the_flax_tower_emits_the_same_two_names_under_the_same_flag():
     flax_src = (ROOT / "tpu_inference" / "models" / "jax" /
                 "gemma4_mm.py").read_text()
     assert "envs.PIECES_MM_DEBUG_LAYERS" in flax_src
-    assert 'f"A{index}"' in flax_src or '"A"' in flax_src
+    # AUDIT 2026-09-03: this was
+    #     assert 'f"A{index}"' in flax_src or '"A"' in flax_src
+    # -- `f"A{index}"` occurs ZERO times in gemma4_mm.py, so the disjunction
+    # was carried entirely by the 3-character fallback `'"A"'`, and the stated
+    # claim (the flax tower emits A<i>/L<i> names) was untested. Assert the
+    # actual key construction in _vision_layer_tensors.
+    names_fn = next(n for n in ast.walk(ast.parse(flax_src))
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_vision_layer_tensors")
+    names_body = ast.unparse(names_fn)
+    assert "('A', attn_sink)" in names_body and "('L', layer_sink)" in names_body, (
+        f"the flax tower's A/L prefixes are not bound to the attention and "
+        f"layer sinks: {names_body}")
+    assert 'f"{prefix}{index}"' in names_body or "f'{prefix}{index}'" in names_body, (
+        f"the flax tower does not build A<i>/L<i> keys: {names_body}")
     assert "layer_sink" in flax_src and "attn_sink" in flax_src
     # ... and the sinks stay None with the flag off, so the jaxpr is unchanged.
     tree = ast.parse(flax_src)

@@ -551,7 +551,32 @@ def test_the_pcp_cache_page_ladder_is_a_separate_uncovered_gap():
     pcp_text = _run([TEXT_PRIMER], pcp_runner, _Envs())
     pcp_embeds = _run([EMBEDS_PRIMER], pcp_runner, _Envs())
     assert {c[3] for c in pcp_text.compiled} == {0, 1, 2}
-    assert {c[3] for c in pcp_embeds.compiled} == {0}
+    # AUDIT 2026-09-03: `assert {c[3] for c in pcp_embeds.compiled} == {0}`
+    # stood here, i.e. the test asserted THE DEFECT IS STILL PRESENT.
+    # Measured: wrapping the embeds primer's helper call in
+    # `self._pcp_cache_page_buckets()` -- the obvious fix -- turned this test
+    # RED. A test that fails when the bug it documents is fixed is a tax on
+    # the next change, and it gets "fixed" by deleting the line rather than
+    # reading it. Assert the invariant that holds in BOTH states instead, and
+    # move the gap itself to an xfail that goes green on its own when closed.
+    assert {c[3]
+            for c in pcp_embeds.compiled} <= {c[3]
+                                              for c in pcp_text.compiled
+                                              }, ("the embeds primer covers a "
+                                                  "cache-page bucket the text "
+                                                  "primer does not")
     # the (num_tokens, num_reqs) grid -- what this change is about -- still
     # matches even there.
     assert pcp_embeds.grid() == pcp_text.grid()
+
+
+@pytest.mark.xfail(
+    reason="the embeds primer takes _precompile_backbone_helper's "
+    "pcp_cache_pages=0 default instead of walking _pcp_cache_page_buckets(); "
+    "a distinct defect on a distinct axis, left for its own change",
+    strict=False)
+def test_the_embeds_primer_walks_the_pcp_cache_page_ladder_too():
+    """The gap above, as a test that turns green when the gap is closed."""
+    pcp_runner = _Runner(prefill_cp_size=4)
+    pcp_embeds = _run([EMBEDS_PRIMER], pcp_runner, _Envs())
+    assert {c[3] for c in pcp_embeds.compiled} == {0, 1, 2}
