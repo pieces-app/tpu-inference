@@ -78,6 +78,14 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
    26B: TP=4 1394 / 1941 at 483 tok/s vs TP=8 1052 / 1565 at 242 tok/s. The verify step's
    collectives scale with TP while the draft window does not, so speculative decoding should
    be gated off (or k reduced) above TP=4 unless a measurement says otherwise.
+12. **Quantization stops paying at TP=8, and on the MoE it turns sharply negative.** 26B
+   W8A16 dense + int8 experts: TP=4 1851 / 2588 vs TP=8 1116 / 2029 — **−40 % / −22 %**, the
+   largest chip-count penalty measured, and at TP=8 it is 8 % BELOW plain eight-chip bf16
+   (`20260904T193324Z-eval-26b-tp8-q-int8-w8a16`). The 31B shows the same shape more gently
+   (int8 1339 / 1875 vs bf16 1347 / 1885 at TP=8, a dead heat, where int8 led by 29 % at
+   TP=4). Expert-parallel collectives scale with TP while the per-expert work does not, so a
+   quantized MoE spread over eight chips is nearly all overhead. Quantization should be
+   chosen per (model, chip count), not per model.
 11. **P0 has no answer for the 26B or the 31B.** Every `MODEL_IMPL_TYPE=vllm` lane in the
    harness is a 12B, so the native-vs-fallback comparison exists for the 12B (1/4/8 chips),
    E4B and E2B and has never been run for the MoE 26B — the north-star model — or the 31B.
