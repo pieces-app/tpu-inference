@@ -35,7 +35,7 @@ Fix: drop the buffer and compute PLE *inside* the jitted forward from
 is a pure embedding lookup and reproduces the reference computation exactly:
 ``embed_input_ids`` masks multimodal placeholder positions to token 0 before
 calling ``get_per_layer_inputs``; those positions are exactly the ones whose
-``input_ids`` equal the image/audio placeholder token ids, so masking by
+``input_ids`` equal the image/video/audio placeholder token ids, so masking by
 token id is equivalent.
 """
 
@@ -82,34 +82,45 @@ def _ple_forward(
     #   per_layer_inputs = self.per_layer_embeddings[:inputs_embeds.shape[0]]
     #   (guarded on per_layer_embeddings/inputs_embeds not None).
     # Here PLE is computed inline instead, under the same
-    # `inputs_embeds is not None` guard (input_ids, or zeros when the runner
-    # withheld them, replaces the buffer as the data source).
+    # `inputs_embeds is not None` guard: `input_ids` -- which the runner now
+    # passes on multimodal steps as well -- replaces the buffer as the data
+    # source.
     per_layer_inputs = None
     if inputs_embeds is not None:
-        # THE GUARD USED TO REQUIRE input_ids TOO, and that made this whole
-        # block dead on exactly the steps it was written for. The runner
-        # hands the model EITHER input_ids OR inputs_embeds, never both
-        # (tpu_runner._get_input_ids_embeds): a step carrying image
-        # embeddings passes inputs_embeds and input_ids=None, a text step
-        # passes input_ids and inputs_embeds=None. So `both non-None` never
-        # held, per_layer_inputs was always None here, and on image steps
-        # Gemma4SelfDecoderLayers.forward then ran
-        # project_per_layer_inputs(hidden_states, None), which returns the
-        # PROJECTION TRACK ALONE (vllm/model_executor/models/gemma4.py) --
-        # the per-layer embedding track was dropped for the entire image
-        # prompt. Text steps were never affected: with inputs_embeds None the
-        # language model recomputes both tracks from input_ids itself.
+        # The runner passes BOTH operands on a multimodal step
+        # (tpu_runner._get_input_ids_embeds): `inputs_embeds` is the merged
+        # residual stream, `input_ids` the prompt's token ids with the image
+        # placeholder ids still in place. So the branch below is the
+        # production path and the PLE id-track is computed from the REAL
+        # per-token ids, matching the reference.
         #
-        # The flax path reaches the same missing-ids case and synthesises
-        # zeros (models/jax/gemma4.py, Gemma4Model.compute_per_layer_inputs),
-        # so take the same fallback and the two paths compute the same
-        # per-layer inputs on an image prefill.
+        # It has not always been. Two defects, in order:
+        #   1. this guard used to read `inputs_embeds is not None and
+        #      input_ids is not None`, and the runner passed exactly one of
+        #      the two, so the whole block was dead: image steps ran
+        #      project_per_layer_inputs(hidden_states, None), which returns
+        #      the PROJECTION TRACK ALONE
+        #      (vllm/model_executor/models/gemma4.py), and the id-track was
+        #      absent for the entire image prompt (fixed by PR #60);
+        #   2. even with the guard split, the runner still withheld
+        #      input_ids, so this path and the flax one both fell back to
+        #      slot 0 for EVERY position, text included -- the id-track was
+        #      present but constant. Fixed here, by passing the ids.
+        # Text steps were never affected by either: with inputs_embeds None
+        # the language model recomputes both tracks from input_ids itself.
         if input_ids is not None:
-            # [new — replaces upstream embed_input_ids' is_multimodal mask]
+            # [new -- replaces upstream embed_input_ids' is_multimodal mask]
             # Upstream masks multimodal placeholder positions to token 0 via
             # the is_multimodal tensor, which forward does not receive. Those
-            # positions hold the image/audio placeholder token ids, so masking
-            # by token id selects the same positions.
+            # positions hold the image/video/audio placeholder token ids, so
+            # masking by token id selects the same positions.
+            #
+            # Slot 0 is the reference's answer for those positions too:
+            # transformers rewrites them to `text_config.pad_token_id`, which
+            # is 0 for every Gemma-4 config
+            # (transformers/models/gemma4/configuration_gemma4.py), before
+            # the embed_tokens_per_layer lookup
+            # (modeling_gemma4.py, Gemma4Model.forward).
             ple_input_ids = input_ids
             for token_id in self._tpu_ple_mask_token_ids:
                 ple_input_ids = torch.where(
@@ -118,6 +129,14 @@ def _ple_forward(
                     ple_input_ids,
                 )
         else:
+            # Defensive fallback for a caller that has no ids: every lookup
+            # hits slot 0, keeping the shape but dropping the id-track's
+            # information for the whole sequence. No production caller
+            # reaches it any more (the runner passes the ids and both
+            # backbone primers build a dummy int32[T]); the flax path keeps
+            # the same fallback for the same reason
+            # (models/jax/gemma4.py, Gemma4Model.compute_per_layer_inputs).
+            #
             # positions is (num_tokens,), or (3, num_tokens) under mRoPE;
             # either way its last axis is the padded token count, which is
             # inputs_embeds.shape[0]. Deriving the zeros from an argument
@@ -158,8 +177,13 @@ def apply_gemma4_mm_patches(vllm_model: nn.Module) -> None:
     # the plain CPU tensor under torchax.
     vllm_model.per_layer_embeddings = None
 
+    # Every placeholder id upstream would have masked via is_multimodal.
+    # transformers masks image | video | audio
+    # (modeling_gemma4.py, Gemma4Model.get_placeholder_mask), so all three
+    # are collected here; a config that does not define one simply
+    # contributes no torch.where.
     mask_token_ids = []
-    for attr in ("image_token_id", "audio_token_id"):
+    for attr in ("image_token_id", "video_token_id", "audio_token_id"):
         token_id = getattr(vllm_model.config, attr, None)
         if token_id is not None:
             mask_token_ids.append(token_id)

@@ -797,6 +797,23 @@ class CompilationManager:
 
                     inputs_embeds = self._create_dummy_tensor(
                         (num_tokens, h_size), dtype, sharding=sharding)
+                # The multimodal step carries the token ids ALONGSIDE the
+                # merged embeddings (runner._get_input_ids_embeds), so this
+                # primer must carry them too: `None` and an int32[num_tokens]
+                # are different jit signatures, and a primer that leaves it
+                # None primes a graph the runtime can never hit -- the same
+                # failure mode as the mm_bidi_ranges dummy above (silent
+                # precompile success, then a full model compile inside the
+                # serving loop, or ForbidCompile).
+                #
+                # Built exactly like the text-only primer's (same shape,
+                # dtype and BATCH sharding as `metadata["input_ids"]` in
+                # `_prepare_inputs`), because the runtime array is the same
+                # buffer on both step kinds.
+                ids_sharding = NamedSharding(
+                    self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH))
+                input_ids = self._create_dummy_tensor((num_tokens, ),
+                                                      jnp.int32, ids_sharding)
                 if self.runner.uses_mrope:
                     mrope_sharding = NamedSharding(
                         self.runner.mesh,
@@ -826,7 +843,7 @@ class CompilationManager:
                     intermediate_tensors = None
                 self._precompile_backbone_helper(
                     f"worker{self.runner.rank} backbone with embeds",
-                    input_ids=None,
+                    input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,

@@ -936,24 +936,35 @@ class Gemma4Model(JaxModule):
         pp rank).
 
         Args:
-          input_ids: [T] token ids. Real inference always provides this;
-            the precompile path
-            (compilation_manager._precompile_backbone_with_inputs_embeds)
-            passes None. In that case we synthesize zeros so the JIT trace
-            shape matches real inference — the precompile output is
-            discarded.
+          input_ids: [T] token ids, placeholder ids included. Every step of
+            real inference provides this, TEXT AND MULTIMODAL ALIKE: the
+            runner hands the model the ids alongside the merged embeddings
+            (tpu_runner._get_input_ids_embeds), and both backbone primers
+            build one. The None branch below is a defensive fallback for a
+            caller that has no ids at all; it is not a production path, and
+            it costs the id-track for the whole prompt when taken.
           inputs_embeds: [T, H] post-scaling residual stream (already
             multiplied by embedding_scale + multimodal-merged).
           is_multimodal: [T] bool. Multimodal positions are masked to
-            slot 0 in the embed_tokens_per_layer lookup.
+            slot 0 in the embed_tokens_per_layer lookup — which is what the
+            reference does: transformers rewrites those positions to
+            `text_config.pad_token_id` (0 for every Gemma-4 config,
+            transformers/models/gemma4/configuration_gemma4.py) before the
+            lookup (modeling_gemma4.py, Gemma4Model.forward), and vLLM's GPU
+            path masks them with torch.zeros_like
+            (models/gemma4_mm.py, embed_input_ids).
         """
         if (self.hidden_size_per_layer_input == 0
                 or self.embed_tokens_per_layer is None):
             return None
         if input_ids is None:
-            # Precompile path with inputs_embeds-only entry. Zeros produce
-            # a shape-identical compute (all PLE lookups hit slot 0) so the
-            # JIT cache key matches the real-inference trace.
+            # Defensive fallback for a caller with no ids: all PLE lookups
+            # hit slot 0, which keeps the shape (and so the JIT cache key)
+            # but drops the id-track's information for the whole sequence.
+            # No production caller reaches this any more — the runner passes
+            # the ids on multimodal steps too, and both backbone primers
+            # build a dummy int32[T] — so a hit here means the id-track is
+            # silently degenerate.
             input_ids = jnp.zeros((inputs_embeds.shape[0], ), dtype=jnp.int32)
         T = input_ids.shape[0]
         L = self.num_hidden_layers

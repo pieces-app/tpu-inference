@@ -1426,10 +1426,21 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
         layer_name_to_kv_cache = dict(
             _layer_name_to_kv_cache) if _layer_name_to_kv_cache else None
 
-        # PLE multimodal mask: mark image-token positions
-        # so embed_tokens_per_layer redirects them to slot 0. None when not
-        # PLE-active or first rank where input_ids isn't reliable. Cheap to
-        # always compute; the PLE compute path is the only consumer.
+        # PLE multimodal mask: mark image-token positions so
+        # embed_tokens_per_layer redirects them to slot 0, which is the
+        # reference's behaviour at placeholder positions (transformers
+        # rewrites them to pad_token_id == 0 before the lookup).
+        #
+        # input_ids is now non-None on an IMAGE step too -- the runner passes
+        # the ids alongside the merged embeddings -- so every text position
+        # gets its real per-token id-track and only the placeholder span
+        # falls back to slot 0. Before that it was None here on every image
+        # step and the whole prompt collapsed to slot 0.
+        #
+        # image_token_id is the only placeholder this class can produce:
+        # embed_input_ids merges exactly [self.image_token_id] and audio is
+        # refused at the API (require_audio_disabled_at_api), so there is no
+        # audio/video placeholder to mask.
         is_multimodal = (input_ids == self.image_token_id
                          ) if input_ids is not None else None
 

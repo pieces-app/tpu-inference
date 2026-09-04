@@ -1729,20 +1729,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # For text-only model, this does nothing. It will input the input_ids and
         # leave the embedding job inside the forward pass
         #
-        # NOTE: mm models feed embeds to the forward pass (model_input_ids is
-        # None there), but the raw token ids stay live: spec decode extracts
-        # scheduled draft ids from them (_extract_draft_token_ids) and the
-        # drafter (eagle3/mtp/dflash) consumes them in prepare_inputs.
-        # Rebinding to `input_ids` here used to null the buffer and kill the
-        # engine on mm+spec-decode steps (assert at tpu_runner.py:2116 in the
-        # deployed wheel, measured 2026-08-27).
+        # NOTE: mm models feed embeds to the forward pass, AND the token ids
+        # alongside them (see _get_input_ids_embeds). The separate name is
+        # still required: spec decode extracts scheduled draft ids from the
+        # raw buffer (_extract_draft_token_ids) and the drafter
+        # (eagle3/mtp/dflash) consumes it in prepare_inputs, so rebinding to
+        # `input_ids` here used to null the buffer and kill the engine on
+        # mm+spec-decode steps (assert at tpu_runner.py:2116 in the deployed
+        # wheel, measured 2026-08-27).
         model_input_ids, inputs_embeds = self._get_input_ids_embeds(
             input_ids, mm_embeds, is_mm_embed)
 
         lora_metadata = self.lora_utils.extract_lora_metadata()
         # TODO: make _get_input_ids_embeds within this context
-        # NOTE: right now, mm model will use embeddings as the input,
-        # but text-only model will use input_ids
+        # NOTE: right now, mm model will use embeddings as the residual
+        # stream (plus the ids, for PLE), but text-only model will use
+        # input_ids alone
         with self.maybe_forbid_compile:
             # attn_metadata=None (and no num_tokens) is intentional: vLLM's
             # set_forward_context only builds DP metadata when
@@ -1755,8 +1757,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     self.vllm_config,
             ), self.maybe_get_kv_connector_output(
                     scheduler_output) as kv_connector_output:
-                # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
-                # but one of them would be `None`
+                # NOTE(Wenlong): It takes both `input_ids` and
+                # `inputs_embeds`. `inputs_embeds` is None on a text step;
+                # `input_ids` is always present (a multimodal step needs it
+                # for Gemma-4's per-layer-embedding id-track).
                 (self.kv_caches, hidden_states, aux_hidden_states,
                  expert_indices) = self.model_fn(
                      self.state_leaves,
@@ -3324,6 +3328,36 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _get_input_ids_embeds(self, input_ids: jax.Array,
                               mm_embeds: list[jax.Array] | None,
                               is_mm_embed: jax.Array | None):
+        """The `(input_ids, inputs_embeds)` pair handed to the model forward.
+
+        A multimodal step returns BOTH: `inputs_embeds` carries the merged
+        residual stream (text embeddings with the encoder output scattered
+        into the placeholder slots) and `input_ids` carries the prompt's
+        token ids, placeholder ids included.
+
+        Passing the ids too is what lets Gemma-4 E2B/E4B compute the real
+        per-token PLE id-track on an image step. Both Gemma-4 paths derive
+        that track from `input_ids` and mask the placeholder positions to
+        slot 0 (models/jax/gemma4.py compute_per_layer_inputs;
+        models/vllm/experimental/gemma4_mm_patcher.py _ple_forward), which is
+        what the reference does -- transformers rewrites the placeholder ids
+        to `text_config.pad_token_id` (== 0 for every Gemma-4 config) before
+        the `embed_tokens_per_layer` lookup, and vLLM's GPU path masks them
+        with `torch.zeros_like`. Withholding the ids here made both paths
+        fall back to slot 0 for the WHOLE prompt, text positions included.
+
+        Models that do not read `input_ids` when `inputs_embeds` is set are
+        unaffected: every model's forward takes `inputs_embeds` first (see
+        e.g. models/jax/qwen2.py, models/jax/deepseek_v3.py), so the extra
+        operand is dead there and XLA drops it.
+
+        The pytree/aval signature is what makes this safe to change: text
+        steps stay `(ids, None)` and multimodal steps move from
+        `(None, embeds)` to `(ids, embeds)` -- one shape per step kind, both
+        static across the run, each primed by its own backbone primer
+        (compilation_manager._precompile_backbone_text_only and
+        _precompile_backbone_with_inputs_embeds respectively).
+        """
         # Prevent the cost of calling additional function.
         if self.is_multimodal_model and mm_embeds is not None:
             assert self.embed_input_ids_fn is not None
@@ -3333,7 +3367,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mm_embeds,
                 is_multimodal=is_mm_embed,
             )
-            return None, inputs_embeds
+            return input_ids, inputs_embeds
         else:
             return input_ids, None
 
