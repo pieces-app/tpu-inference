@@ -593,6 +593,20 @@ def _subtract_num_rejected_tokens_fn(seq_lens: jax.Array, positions: jax.Array,
     return seq_lens, positions
 
 
+def _resumed_req_ids(scheduler_output) -> frozenset[str]:
+    """Request ids the scheduler resumed from preemption in this step.
+
+    `update_states` rebuilds their persistent-batch rows from real token ids,
+    so none of their scheduled tokens is an async placeholder. A scheduler
+    output (or a test double) without the field means nothing was resumed.
+    """
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    ids = getattr(cached, "resumed_req_ids", None)
+    if not isinstance(ids, (set, frozenset, list, tuple)):
+        return frozenset()
+    return frozenset(ids)
+
+
 def _jax_logprobs_materialize(
         logprobs_tensors: LogprobsTensors,
         logits_indices_selector: Optional[List[int]] = None,
@@ -1507,7 +1521,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 expert_indices, full_hidden_states, full_logits, req_ids_dp,
                 padded_num_scheduled_tokens_per_dp_rank)
 
-    def _modify_prev_results(self):
+    def _modify_prev_results(self,
+                             resumed_req_ids: frozenset[str] = frozenset()):
+        """Write the previous step's sampled tokens over the placeholders.
+
+        `resumed_req_ids`: requests the scheduler resumed from preemption in
+        the CURRENT step. `update_states` already rebuilt their rows from real
+        token ids (no placeholders left), and the scheduler discards output
+        that was in flight for a request it resumes in the same step, so
+        nothing may be written into them here.
+        """
         # If copy to host has not been done, we just wait.
         # device_get should return immediately as we have scheduled it in previous function call.
         assert self._pre_async_results is not None, "When we call _modify_prev_results(), self._pre_async_results should already exist"
@@ -1535,6 +1558,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             for pre_req_idx, req_state, _ in pre_request_seq_lens:
                 req_id = pre_req_ids[pre_req_idx]
                 if req_id not in self.input_batch.req_id_to_index:
+                    continue
+                if req_id in resumed_req_ids:
+                    # Row rebuilt from real tokens by a same-step resume.
                     continue
                 req_idx = self.input_batch.req_id_to_index[req_id]
 
@@ -1572,6 +1598,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # If request not active in the *current* batch (e.g. finished or evicted), skip it.
             req_id = pre_req_ids[pre_req_idx]
             if req_id not in self.input_batch.req_id_to_index:
+                continue
+            if req_id in resumed_req_ids:
+                # Preempted and resumed in the same step: the row now holds
+                # real token ids (no placeholders), and the scheduler dropped
+                # this in-flight output. Writing it here would overwrite the
+                # last 1 + K real tokens of the rebuilt history.
                 continue
 
             req_idx = self.input_batch.req_id_to_index[req_id]
@@ -1644,12 +1676,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     req_state.req_id] = logits_indices_selector[req_idx]
 
         if spec_decode_metadata is not None:
+            # `spec_decode_next_tokens` is laid out per DP rank
+            # ([max_num_reqs_per_rank * (K + 1)] each), so the index must be
+            # the request's position in `spec_decode_metadata.req_ids_dp`.
+            # Only the requests that received placeholders above belong in
+            # the map. `req_ids_dp` covers the whole batch, including the
+            # discarded rows (a partial prefill, or a request resumed after
+            # preemption that is still recomputing its own tokens): those
+            # rows hold real token ids, got no placeholders, and the next
+            # step's substitution must leave them alone. Mapping them is
+            # what tripped the `<= K + 1` assertion on a 60-token recompute
+            # chunk (eval-26b-1chip-mtp, 2026-09-04).
+            placeholder_req_ids = set(placeholder_req_id_to_index)
             placeholder_req_id_to_index.clear()
             for rank in range(self.dp_size):
                 for i, req_id in enumerate(
                         spec_decode_metadata.req_ids_dp[rank]):
-                    placeholder_req_id_to_index[req_id] = i + rank * (
-                        self.max_num_reqs // self.dp_size)
+                    if req_id in placeholder_req_ids:
+                        placeholder_req_id_to_index[req_id] = i + rank * (
+                            self.max_num_reqs // self.dp_size)
 
         return placeholder_req_id_to_index
 
@@ -1874,7 +1919,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         scheduler_output: "VllmSchedulerOutput",
     ) -> ModelRunnerOutput | None:
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
-            self._modify_prev_results()
+            self._modify_prev_results(_resumed_req_ids(scheduler_output))
 
         (
             input_ids,
@@ -2284,7 +2329,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if self.scheduler_config.async_scheduling:
             # Get previous results from TPU and replace the placeholder.
             if self._pre_async_results is not None:
-                self._modify_prev_results()
+                self._modify_prev_results(_resumed_req_ids(scheduler_output))
 
             # Set placeholder for next tokens that is not yet generated
             placeholder_req_id_to_index: dict[
@@ -2604,13 +2649,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 tokens_indices_selector, max_num_reqs_per_dp_rank)
 
     def _prepare_async_token_substitution_indices(
-            self, req_ids_dp, scheduled_tokens_per_dp_rank,
-            padded_num_scheduled_tokens_per_dp_rank, dp_size):
-        """Prepare token substitution indices for async scheduling."""
+        self,
+        req_ids_dp,
+        scheduled_tokens_per_dp_rank,
+        padded_num_scheduled_tokens_per_dp_rank,
+        dp_size,
+        resumed_req_ids: frozenset[str] = frozenset()):
+        """Prepare token substitution indices for async scheduling.
+
+        A request's scheduled slice is substituted from the previous step's
+        on-device results only when that slice IS the placeholder slice the
+        previous step appended for it (`_update_placeholder`): the request is
+        in `placeholder_req_id_to_index`, it was not resumed from preemption
+        in this step (`update_states` rebuilt that row from real token ids),
+        and it is past its prompt. Every other slice holds real token ids
+        that came from `token_ids_cpu` and must be fed as they are.
+        """
         # For input_ids substitution.
         token_in_tpu_cur_input_indices_dp = {}
         token_in_tpu_pre_next_tokens_indices_dp = {}
         spec_decode_enabled = (self.speculative_config is not None)
+        placeholder_req_id_to_index = (
+            self._pre_async_results.placeholder_req_id_to_index)
 
         for dp_rank in range(dp_size):
             token_in_tpu_cur_input_indices_dp[dp_rank] = []
@@ -2627,43 +2687,75 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             acc_cur_len = token_offset
 
             for i, req_id in enumerate(req_ids_dp[dp_rank]):
-                acc_cur_len += num_scheduled_tokens_per_req[i]
+                num_scheduled = num_scheduled_tokens_per_req[i]
+                acc_cur_len += num_scheduled
+
+                if req_id not in placeholder_req_id_to_index:
+                    # No placeholders were appended for this request in the
+                    # previous step (new, or its sampled token was discarded
+                    # because it had not reached its frontier: a prefill
+                    # chunk, or a resumed request recomputing its own
+                    # already-generated tokens).
+                    continue
+
+                if req_id in resumed_req_ids:
+                    # Preempted and resumed in this step. `update_states`
+                    # removed the row and re-added it from real token ids;
+                    # the placeholders the previous step appended are gone
+                    # and the scheduled slice is a recompute of real tokens,
+                    # whatever its length (1 with a full prefix-cache hit).
+                    continue
 
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 is_prefill = self.input_batch.num_computed_tokens_cpu[
                     req_idx] < self.input_batch.num_prompt_tokens[req_idx]
-
-                # We need an explicit `is_prefill` check here because of preemption.
-                # If a request is preempted and immediately resumed, it goes back to
-                # the prefill stage. However, its `req_id` might still be in
-                # `_pre_async_results.placeholder_req_id_to_index` from the previous step.
-                # Without this check, we would incorrectly perform token substitution
-                # for a resumed prefill request.
                 if is_prefill:
-                    # Skip substitution for prefill requests (including chunked prefill)
-                    continue
-
-                if req_id not in self._pre_async_results.placeholder_req_id_to_index:
+                    # Still inside the prompt (a resumed request recomputing
+                    # its prompt): real token ids, not placeholders.
                     continue
 
                 if not spec_decode_enabled:
                     # Treat as normal decode: substitute 1 token
-                    assert num_scheduled_tokens_per_req[i] == 1, (
-                        f"Expected 1 token for normal decode request {req_id}, "
-                        f"but got {num_scheduled_tokens_per_req[i]}")
+                    if num_scheduled != 1:
+                        raise RuntimeError(
+                            "async token substitution: request "
+                            f"{req_id} is mapped to placeholder slot "
+                            f"{placeholder_req_id_to_index[req_id]} but its "
+                            f"scheduled slice is {num_scheduled} tokens, not "
+                            "1 (num_computed_tokens="
+                            f"{self.input_batch.num_computed_tokens_cpu[req_idx]}, "
+                            f"num_prompt_tokens="
+                            f"{self.input_batch.num_prompt_tokens[req_idx]}, "
+                            f"num_tokens_no_spec="
+                            f"{self.input_batch.num_tokens_no_spec[req_idx]}). "
+                            "The placeholder bookkeeping and the scheduler "
+                            "disagree about this request.")
                     token_in_tpu_cur_input_indices_list.append(acc_cur_len - 1)
                     token_in_tpu_pre_next_tokens_indices_list.append(
-                        self._pre_async_results.
                         placeholder_req_id_to_index[req_id])
                 else:
                     max_num_spec_tokens = self.speculative_config.num_speculative_tokens
-                    assert num_scheduled_tokens_per_req[
-                        i] <= max_num_spec_tokens + 1
-                    idx = self._pre_async_results.placeholder_req_id_to_index[
-                        req_id]
+                    if num_scheduled > max_num_spec_tokens + 1:
+                        # A frontier slice is 1 sampled token + at most K
+                        # drafts. Anything longer cannot be all placeholders.
+                        raise RuntimeError(
+                            "async token substitution: request "
+                            f"{req_id} is mapped to placeholder slot "
+                            f"{placeholder_req_id_to_index[req_id]} but its "
+                            f"scheduled slice is {num_scheduled} tokens, more "
+                            f"than 1 + num_speculative_tokens="
+                            f"{max_num_spec_tokens} (num_computed_tokens="
+                            f"{self.input_batch.num_computed_tokens_cpu[req_idx]}, "
+                            f"num_prompt_tokens="
+                            f"{self.input_batch.num_prompt_tokens[req_idx]}, "
+                            f"num_tokens_no_spec="
+                            f"{self.input_batch.num_tokens_no_spec[req_idx]}). "
+                            "The placeholder bookkeeping and the scheduler "
+                            "disagree about this request.")
+                    idx = placeholder_req_id_to_index[req_id]
 
-                    base_offset = acc_cur_len - num_scheduled_tokens_per_req[i]
-                    for j in range(num_scheduled_tokens_per_req[i]):
+                    base_offset = acc_cur_len - num_scheduled
+                    for j in range(num_scheduled):
                         token_in_tpu_cur_input_indices_list.append(
                             base_offset + j)
                         token_in_tpu_pre_next_tokens_indices_list.append(
@@ -2721,14 +2813,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 next_tokens_in_tpu, placeholder_num)
         return input
 
-    def _subtract_num_rejected_tokens(self, seq_lens, positions, req_ids_dp,
-                                      scheduled_tokens_per_dp_rank):
+    def _subtract_num_rejected_tokens(
+        self,
+        seq_lens,
+        positions,
+        req_ids_dp,
+        scheduled_tokens_per_dp_rank,
+        resumed_req_ids: frozenset[str] = frozenset()):
         """Apply rejection-count subtraction to seq_lens and positions if needed.
 
         `num_computed_tokens_cpu` was advanced on the host assuming every
         speculatively proposed token from the previous step was accepted. Here
         we subtract the actual rejection counts on TPU for the requests that
         ran spec decoding in the previous step.
+
+        A request resumed from preemption in this step is skipped: the
+        scheduler reset its `num_computed_tokens`, so the host value carries
+        no optimistic acceptance to correct, and its positions are a recompute
+        of real tokens.
         """
         assert self._pre_async_results is not None
         assert self._pre_async_results.spec_decode_num_rejected_tokens is not None
@@ -2746,6 +2848,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 acc_cur_len += scheduled_tokens_cur_rank[i]
 
                 if req_id not in self._pre_async_results.placeholder_req_id_to_index:
+                    continue
+                if req_id in resumed_req_ids:
                     continue
 
                 idx = self._pre_async_results.placeholder_req_id_to_index[
@@ -2803,6 +2907,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             num_draft_tokens[req_idx] = len(draft_token_ids)
         token_in_tpu_cur_input_indices_dp = {}
         token_in_tpu_pre_next_tokens_indices_dp = {}
+        # Rows `update_states` rebuilt from real token ids in this step.
+        resumed_req_ids = _resumed_req_ids(scheduler_output)
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
             # If async previous results exists, we will prepare for the token substitution here
             # The actual substitution will be performed in tpu during later parts of this function.
@@ -2810,8 +2916,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 token_in_tpu_cur_input_indices_dp,
                 token_in_tpu_pre_next_tokens_indices_dp,
             ) = self._prepare_async_token_substitution_indices(
-                req_ids_dp, scheduled_tokens_per_dp_rank,
-                padded_num_scheduled_tokens_per_dp_rank, dp_size)
+                req_ids_dp,
+                scheduled_tokens_per_dp_rank,
+                padded_num_scheduled_tokens_per_dp_rank,
+                dp_size,
+                resumed_req_ids=resumed_req_ids)
 
         self.device_buffer.reset()
 
@@ -3221,7 +3330,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # actual rejection counts from `seq_lens` and `positions` on TPU.
         if self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
             seq_lens, positions = self._subtract_num_rejected_tokens(
-                seq_lens, positions, req_ids_dp, scheduled_tokens_per_dp_rank)
+                seq_lens,
+                positions,
+                req_ids_dp,
+                scheduled_tokens_per_dp_rank,
+                resumed_req_ids=resumed_req_ids)
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(

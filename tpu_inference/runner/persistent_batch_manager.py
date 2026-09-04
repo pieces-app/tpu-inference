@@ -262,6 +262,23 @@ class PersistentBatchManager:
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
+                #
+                # Under async scheduling the runner's copy of the output
+                # history is not trustworthy here: `_modify_prev_results`
+                # skips a request that has left the batch, so the tokens
+                # sampled by the step in flight at preemption were never
+                # written and the placeholder zeros `_update_placeholder`
+                # appended stayed behind. The scheduler did deliver those
+                # tokens (AsyncScheduler._update_request_with_output,
+                # is_stale) and sends the full token list for a request it
+                # did not schedule in the previous step; take the outputs
+                # from it so the recompute feeds the real ids.
+                all_token_ids = getattr(req_data, "all_token_ids", None)
+                if isinstance(all_token_ids, dict) and num_output_tokens > 0:
+                    token_ids = all_token_ids.get(req_id)
+                    if token_ids is not None:
+                        req_state.output_token_ids = list(
+                            token_ids[req_state.num_prompt_tokens:])
                 req_ids_to_add.append(req_id)
                 continue
 
