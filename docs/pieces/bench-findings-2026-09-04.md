@@ -29,8 +29,11 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
    W8A16 (bf16 activations) at every chip count and W8A8 loses to bf16 on eight chips
    (1148 / 1932 vs 1469 / 2166; `20260904T154952Z-eval-12b-tp8-native-int8`); the E4B is
    8-11 % faster with W8A8 (`20260904T042733Z-eval-e4b-int8` vs `20260904T054235Z-eval-e4b-int8-w8a16`);
-   the 26B needs W8A16 + MoE int8. Today the choice is a lane env (`TPU_ONLINE_QUANT_ACT`);
-   a model-family default (or a startup pick from the projection shapes) would remove a foot-gun.
+   the 26B needs W8A16 + MoE int8. Direct eight-chip measurement (added 18:27Z):
+   12B W8A16 at TP=8 is 1349 / 2363 against W8A8's 1148 / 1932 — **+18 % / +22 %** —
+   and beats eight-chip bf16 by 9 % at C=16 (`20260904T172328Z-eval-12b-tp8-native-int8-w8a16`).
+   Today the choice is a lane env (`TPU_ONLINE_QUANT_ACT`); a model-family default
+   (or a startup pick from the projection shapes) would remove a foot-gun.
 2. **torchax int8 (W8A8) 12B produces degenerate answers** where the native path does not:
    3 % at TP=8 (`20260904T161636Z-eval-12b-tp8-q-int8`, native twin 0 %). Worth a differential
    on the torchax online-quant path's output distribution before it is used for anything.
@@ -48,9 +51,14 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
 6. **MTP and int8 do not stack at batch on the MoE 26B (TP=4) or the E2B**; they do on the
    12B and E4B. On the 26B the verify step re-runs the full MoE for k+1 tokens per request;
    a MoE-aware verify (shared routing across the draft window) is the obvious lever.
-7. **31B int8 W8A8 at TP=4 read 9 % / 19 % below the 09-02 pin** (1377 / 1794 vs 1521 / 2202;
-   `20260904T102424Z-eval-31b-native-int8-tp4`). One run; a same-pin repeat is queued (Y11).
-   If it reproduces, bisect between pins e2cb0302 and f7cb94c4 (#51 changed the quant path).
+7. **CONFIRMED REGRESSION: 31B int8 W8A8 at TP=4 lost ~20 % of its C=16 throughput after
+   pin `e2cb0302`.** Three samples, two pins: C=16 2202 (09-02, `e2cb0302`) → 1794 (pr57
+   `f7cb94c4`, `20260904T102424Z`) → 1758 (pr64 `9142cdc6`, `20260904T174145Z`), with capped
+   counts flat (0 / 2 / 2 of 69) and 0 % degenerate throughout; C=8 over the same three is
+   1521 / 1377 / 1470, i.e. noise. A C=16-only, ~20 % loss that reproduces across two later
+   pins wants a bisect between `e2cb0302` and `f7cb94c4`; #51 (host-side online quantization)
+   rewrote the path this lane uses and is the prime suspect. The 31B has no W8A16 lane, so
+   whether the winning dtype elsewhere would recover it is untested.
 8. **Quantized 26B on one chip: C=16 throughput tracks how many JSON answers fail to stop**
    (capped at 4096 tokens): fp8 e4m3fn 6-9 capped, e4m3b11 8-13, int8 12-14, per 69, with
    0-1 % degenerate. A stop-token/quality check on quantized experts would settle whether
@@ -59,6 +67,16 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
    E4B-class budget) ~ four chips 1399 / 2015 ~ eight chips 1469 / 2166; 26B four chips
    1375 / 2160 > eight chips 1215 / 2070. More chips buy single-stream latency (with MTP)
    and context headroom only. Serving should scale by replicas, not by TP, for these models.
+10. **MTP is a loss on eight chips for both models measured there.** 12B production config
+   (W8A16 + MTP): TP=4 1878 / 2532 at 394 tok/s vs TP=8 1236 / 1752 at 195 tok/s — −34 % / −31 %
+   at batch AND half the single-stream speed (`20260904T174929Z-eval-12b-tp8-native-mtp-int8-w8a16`);
+   26B: TP=4 1394 / 1941 at 483 tok/s vs TP=8 1052 / 1565 at 242 tok/s. The verify step's
+   collectives scale with TP while the draft window does not, so speculative decoding should
+   be gated off (or k reduced) above TP=4 unless a measurement says otherwise.
+11. **P0 has no answer for the 26B or the 31B.** Every `MODEL_IMPL_TYPE=vllm` lane in the
+   harness is a 12B, so the native-vs-fallback comparison exists for the 12B (1/4/8 chips),
+   E4B and E2B and has never been run for the MoE 26B — the north-star model — or the 31B.
+   Whether the MoE serves under torchax at all is itself unmeasured.
 
 ## Harness lessons that affect anyone benchmarking this fork
 
