@@ -63,10 +63,15 @@ the only path with MTP on the 12B. MTP + JSON: zero grammar rejections on every 
    (capped at 4096 tokens): fp8 e4m3fn 6-9 capped, e4m3b11 8-13, int8 12-14, per 69, with
    0-1 % degenerate. A stop-token/quality check on quantized experts would settle whether
    this is quantization noise or a real stopping regression.
-9. **Chip count is flat for batch throughput at 16 seats**: 12B one chip 1396 / 1975 (bf16
-   E4B-class budget) ~ four chips 1399 / 2015 ~ eight chips 1469 / 2166; 26B four chips
-   1375 / 2160 > eight chips 1215 / 2070. More chips buy single-stream latency (with MTP)
-   and context headroom only. Serving should scale by replicas, not by TP, for these models.
+9. **Chip count is flat for batch throughput at 16 seats — until the model stops fitting
+   comfortably.** 12B: one chip 1396 / 1975 ~ four 1399 / 2015 ~ eight 1469 / 2166; 26B-A4B:
+   four 1375 / 2160 > eight 1215 / 2070. But the **31B dense gains from eight chips: 1347 / 1885
+   vs 1067 / 1607 at TP=4, +26 % / +17 %** (`20260904T183043Z-eval-31b-tp8-native-bf16`), and at
+   TP=8 its int8 is a dead heat with bf16 (1339 / 1875 vs 1347 / 1885), where at TP=4 int8 led by
+   29 % at C=8. Reading: ~62 GB of bf16 weights leave the 31B bandwidth-bound on four chips, so
+   the eighth chip pays for its collectives and simultaneously removes the reason to quantize.
+   Guidance is therefore per-model, not global: scale by replicas for the 12B / 26B / E4B / E2B,
+   and give the 31B eight chips in bf16.
 10. **MTP is a loss on eight chips for both models measured there.** 12B production config
    (W8A16 + MTP): TP=4 1878 / 2532 at 394 tok/s vs TP=8 1236 / 1752 at 195 tok/s — −34 % / −31 %
    at batch AND half the single-stream speed (`20260904T174929Z-eval-12b-tp8-native-mtp-int8-w8a16`);
