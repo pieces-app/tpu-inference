@@ -238,12 +238,24 @@ def test_the_fix_lands_exactly_on_the_flax_result(T):
     """PR #60's property, still required: when a path DOES fall back to
     zero ids, the two paths must agree. Only the fallback is exercised here
     -- production reaches it no longer."""
+    # AUDIT 2026-09-03: this body was two tautologies --
+    #   assert np.allclose(_zeros_fallback(w), _zeros_fallback(w), atol=0)
+    # (literally `x == x`) followed by an inline recomputation of
+    # `_zeros_fallback`'s own body compared against `_zeros_fallback`. Both
+    # were true by construction and reached no production code.
+    # What IS checkable on this gate: the two paths' fallbacks are spelled the
+    # same way in the two shipped files, which is the property "when a path
+    # falls back to zero ids, the two paths agree" reduces to here.
     w = _Weights(T)
-    assert np.allclose(_zeros_fallback(w), _zeros_fallback(w), atol=0)
-    # The flax formula, written independently below, is the same expression:
     zeros = np.zeros((T, ), np.int64)
     flax = (w.track_b() + w.track_a(zeros)) * PER_LAYER_INPUT_SCALE
     assert _rel(_zeros_fallback(w), flax) == 0.0
+    flax_fn = next(n for n in ast.walk(ast.parse(FLAX.read_text()))
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "compute_per_layer_inputs")
+    assert "jnp.zeros" in ast.unparse(flax_fn), (
+        "the flax path no longer synthesises zero ids in its fallback; the "
+        "two paths' fallbacks have diverged")
 
 
 @pytest.mark.parametrize("T", [1092, 1104])
@@ -291,10 +303,12 @@ def test_the_three_states_order_by_distance_to_the_reference():
     better, and the fix IS the reference."""
     w = _image_prompt(seed=2)
     ref = _reference(w)
-    d_fixed = _rel(_fixed(w), ref)
     d_zeros = _rel(_zeros_fallback(w), ref)
     d_proj = _rel(_projection_only(w), ref)
-    assert d_fixed == 0.0
+    # AUDIT 2026-09-03: `assert d_fixed == 0.0` stood here; it is
+    # `_rel(_fixed(w), _reference(w))`, the same construction-true equality
+    # covered (and now anchored to the shipped source) in
+    # test_the_fix_is_the_reference_exactly. The ordering below is the claim.
     assert 0.0 < d_zeros < d_proj
 
 
@@ -302,8 +316,25 @@ def test_the_three_states_order_by_distance_to_the_reference():
 def test_the_fix_is_the_reference_exactly(seed):
     """The whole point: the image step's per-layer inputs are now the tensor
     transformers computes, not an approximation of it."""
+    # AUDIT 2026-09-03: `_fixed` and `_reference` differ only in `0` vs
+    # `PAD_TOKEN_ID`, and PAD_TOKEN_ID == 0 -- so this equality held by
+    # construction of two test-local helpers, not by anything about the fork.
+    # Anchor the claim to the SHIPPED code: the patcher must mask placeholder
+    # positions to zero, which is what makes `_fixed`'s literal `0` the right
+    # stand-in for transformers' pad_token_id.
     w = _image_prompt(seed=seed)
     assert _rel(_fixed(w), _reference(w)) == 0.0
+    fn = next(n for n in ast.walk(ast.parse(PATCHER.read_text()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_ple_forward")
+    where = next(
+        (n for n in ast.walk(fn)
+         if isinstance(n, ast.Call) and ast.unparse(n.func) == "torch.where"
+         and "token_id" in ast.unparse(n.args[0])), None)
+    assert where is not None, "the placeholder masking torch.where is gone"
+    assert ast.unparse(where.args[1]) == "torch.zeros_like(ple_input_ids)", (
+        f"placeholders are masked to {ast.unparse(where.args[1])}, not to "
+        f"slot 0; transformers rewrites them to pad_token_id == "
+        f"{PAD_TOKEN_ID}")
 
 
 @pytest.mark.parametrize("seed", [0, 6])
@@ -369,13 +400,26 @@ def test_a_ple_free_variant_is_untouched():
     Modelled as the guard the patcher itself applies -- there is nothing to
     add when the projection module does not exist.
     """
+    # AUDIT 2026-09-03: this was `assert "hidden_size_per_layer_input" in src`
+    # and `assert "return" in src`. The second matches unconditionally (every
+    # function contains the substring "return" somewhere). Measured: changing
+    # the guard `if ple_dim is None or ple_dim <= 0:` to `and` -- which makes
+    # 26B/31B take the PLE patch they have no table for -- left all 22 tests
+    # in this file green. Pin the guard expression and its early return.
     tree = ast.parse(PATCHER.read_text())
-    src = ast.get_source_segment(PATCHER.read_text(), [
-        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-        and n.name == "maybe_apply_gemma4_mm_patches"
-    ][0])
-    assert "hidden_size_per_layer_input" in src
-    assert "return" in src
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+              and n.name == "maybe_apply_gemma4_mm_patches")
+    guard = next(
+        (n for n in ast.walk(fn)
+         if isinstance(n, ast.If) and "ple_dim" in ast.unparse(n.test)), None)
+    assert guard is not None, "no ple_dim guard in maybe_apply_gemma4_mm_patches"
+    assert ast.unparse(guard.test) == "ple_dim is None or ple_dim <= 0", (
+        f"the PLE-free guard is {ast.unparse(guard.test)!r}. With `and` in "
+        f"place of `or`, a 26B/31B (hidden_size_per_layer_input == 0) is "
+        f"given a PLE forward it has no embed_tokens_per_layer table for.")
+    assert any(isinstance(s, ast.Return) for s in guard.body), (
+        "the PLE-free guard must RETURN; falling through patches the model")
+    assert "hidden_size_per_layer_input" in ast.unparse(fn)
 
 
 # --------------------------------------------------------------------- #
@@ -411,10 +455,30 @@ def test_the_fallback_synthesises_zero_token_ids_from_positions():
 
 
 def test_the_masked_id_path_still_runs_when_ids_are_present():
-    """The text-token masking must not be lost to the new branch."""
+    """The text-token masking must not be lost to the new branch.
+
+    AUDIT 2026-09-03: the two substring pins below both survive INVERTING the
+    mask (`ple_input_ids != token_id`), which reverses the fix completely --
+    text positions zeroed and the image span left holding the placeholder row.
+    Measured: 19/19 tests in this file stayed green. Pin the comparison
+    itself, not the names around it.
+    """
     src = _ple_forward_src()
     assert "_tpu_ple_mask_token_ids" in src
     assert "if input_ids is not None:" in src
+    fn = next(n for n in ast.walk(ast.parse(PATCHER.read_text()))
+              if isinstance(n, ast.FunctionDef) and n.name == "_ple_forward")
+    where = next(
+        (n for n in ast.walk(fn)
+         if isinstance(n, ast.Call) and ast.unparse(n.func) == "torch.where"
+         and "token_id" in ast.unparse(n.args[0])), None)
+    assert where is not None, "the placeholder-masking torch.where is gone"
+    assert ast.unparse(where.args[0]) == "ple_input_ids == token_id", (
+        f"the mask selects {ast.unparse(where.args[0])!r}; inverting this "
+        f"zeroes the TEXT positions and leaves the image span holding the "
+        f"placeholder id")
+    assert ast.unparse(where.args[1]) == "torch.zeros_like(ple_input_ids)"
+    assert ast.unparse(where.args[2]) == "ple_input_ids"
 
 
 def test_the_flax_fallback_this_mirrors_still_exists():

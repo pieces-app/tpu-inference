@@ -162,12 +162,25 @@ def test_quantize_array_fp8_scale_is_f32_and_residual_is_the_bf16_multiply():
     x, xam = _qa_inputs()
     q, s = u.quantize_array(x, xam, jnp.float8_e4m3fn)
     assert s.dtype == jnp.float32, "fp8 scale is not float32 (weak-typed Python float is back)"
-    qref, _ = _f32_ref_kernel_style(x, jnp.float8_e4m3fn)
+    qref, sref = _f32_ref_kernel_style(x, jnp.float8_e4m3fn)
+    # AUDIT 2026-09-03: the dtype assertion above CANNOT detect the pre-#45
+    # code, because that path also ended in `.astype(jnp.float32)` -- it was
+    # the DIVISION that ran at bf16, not the final cast. Compare the scale to
+    # the f32 reference instead, which is what the int8 arm already does.
+    # MEASURED on this input (256x3840 N(0,1) bf16, PRNGKey(7)):
+    #   this code      max rel scale error 1.19e-07,  3.2174% codes differ
+    #   pre-#45 code   max rel scale error 3.33e-03,  3.5394% codes differ
+    np.testing.assert_allclose(
+        np.asarray(s),
+        sref,
+        rtol=1e-6,
+        err_msg=("fp8 scale is bf16-rounded: the weakly-typed Python-float "
+                 "divisor is back (this code 1.19e-07, pre-#45 3.33e-03)"))
     mism = float(
         np.mean(
             np.asarray(q.astype(jnp.float32)) != np.asarray(
                 jnp.asarray(qref).astype(jnp.float32))))
-    assert mism < 0.04, f"{100*mism:.2f}% of fp8 codes differ (bf16-multiply residual is ~3.2%; the weak-scale path was 3.5%)"
+    assert mism < 0.033, f"{100*mism:.2f}% of fp8 codes differ (this code 3.2174%; the weak-scale path 3.5394%)"
 
 
 def test_kernel_and_xla_paths_quantize_int8_alike():

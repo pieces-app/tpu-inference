@@ -324,6 +324,34 @@ def test_take_returns_the_owners_the_drafts_were_proposed_for():
     assert mgr._draft_token_ids is None and mgr._draft_req_ids is None
 
 
+def test_the_returned_rows_line_up_one_to_one_with_the_owners():
+    """The reorder buffer is sized by the OWNERS, not by the padded rows.
+
+    AUDIT 2026-09-03: `reorded_draft_token_ids = [[] for _ in
+    range(len(req_ids))]` used to read `len(draft_token_ids)` -- the
+    max_num_reqs-padded row count from the drafter, not the number of
+    requests the drafts belong to. Measured: restoring that left the whole
+    gate green, because every assertion in this file goes through `_owners`,
+    which `zip`s the two lists and so silently truncates to the shorter one.
+    vLLM's engine core zips them too; the surplus rows are simply dropped, and
+    the mismatch only shows up as a length. Assert the length.
+    """
+    SDM, _, _, _ = _load_under_test()
+    batch = _FakeInputBatch()
+    for req_id in ("A", "B", "C"):
+        batch.add_request(req_id)
+    runner = _fake_runner(batch, num_spec=2, max_num_reqs=4)
+    mgr = SDM(runner)
+    _propose(mgr, runner, {"A": [10, 11], "B": [20, 21], "C": [30, 31]})
+    out = mgr.take_draft_token_ids()
+    assert len(out.req_ids) == 3, out.req_ids
+    assert len(out.draft_token_ids) == len(out.req_ids), (
+        f"take_draft_token_ids returned {len(out.draft_token_ids)} draft rows "
+        f"for {len(out.req_ids)} owners: the reorder buffer is sized by the "
+        f"padded drafter output (max_num_reqs={runner.max_num_reqs}) instead "
+        f"of by the proposal-time owners")
+
+
 def test_take_without_a_batch_change_is_the_live_order():
     SDM, _, _, _ = _load_under_test()
     batch = _FakeInputBatch()

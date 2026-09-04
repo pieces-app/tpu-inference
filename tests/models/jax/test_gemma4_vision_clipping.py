@@ -194,20 +194,138 @@ def test_load_weights_verifies_every_clamp_landed():
     assert "_verify_vision_clamps_loaded" in called
 
 
+def test_verify_vision_clamps_loaded_refuses_a_partial_load():
+    """BEHAVIOURAL: run the real verifier on fake models.
+
+    AUDIT 2026-09-03: the test above only checks that the NAME appears in a
+    call inside load_weights. Measured: changing the helper's `if missing:` to
+    `if False:` -- so a partial clamp load no longer fails at boot, which is
+    the exact silently-unclipped state this module exists to prevent -- left
+    the whole gate green.
+
+    `gemma4_mm.py` imports torch/vllm, so lift the function out of the source
+    and exec it against the leaf's own helpers, the way
+    tests/models/jax/test_audio_hatch_requires_api_limit.py does.
+    """
+    clip = _leaf()
+    src = MODEL.read_text()
+    fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef)
+              and n.name == "_verify_vision_clamps_loaded")
+    ns = {
+        "unloaded_clamps": clip.unloaded_clamps,
+        "CLAMP_SUFFIXES": clip.CLAMP_SUFFIXES,
+    }
+    exec(  # noqa: S102 -- the body comes from the shipped source
+        compile(ast.Module(body=[fn], type_ignores=[]), str(MODEL), "exec"),
+        ns)
+    verify = ns["_verify_vision_clamps_loaded"]
+
+    class _P:
+
+        def __init__(self, loaded):
+            self._m = {"_is_loaded": loaded}
+
+        def get_metadata(self):
+            return self._m
+
+    class _M:
+
+        def __init__(self, params):
+            self._p = params
+
+        def named_parameters(self):
+            return list(self._p.items())
+
+    full = {
+        "a.weight": _P(True),
+        "a.input_min": _P(True),
+        "a.input_max": _P(True),
+        "a.output_min": _P(True),
+        "a.output_max": _P(True),
+    }
+    assert verify(_M(full)) == 4, "a complete load must report its 4 clamps"
+    # a model that declares no clamps at all (E2B/12B) is not an error
+    assert verify(_M({"a.weight": _P(True)})) == 0
+    # one unfilled clamp must REFUSE, not return
+    partial = dict(full, **{"a.output_max": _P(False)})
+    with pytest.raises(ValueError, match="output_max"):
+        verify(_M(partial))
+
+
 def test_the_clipped_einsum_falls_back_to_the_plain_projection():
     """use_clipped_linears=False must not add params or change arithmetic.
 
     E2B/12B variants that do not set the flag must keep byte-identical
     behaviour, so the class has to have a real off switch.
+
+    AUDIT 2026-09-03: this test asserted only the SHAPE of the AST -- that
+    `__call__` starts with some `If` whose first statement is some `Return`,
+    and that `__init__` has some guarded `If` creating four attribute names.
+    `gemma4_mm.py` imports torch/vllm and cannot be imported on this gate, so
+    the AST is the only handle -- but the shape alone was far too loose.
+    EVERY one of these kept the whole 309-test gate green:
+      1. `if True: return JaxEinsum.__call__(self, inputs)` -- clipping
+         entirely disabled, i.e. the pre-#57 behaviour this PR exists to fix;
+      2. `if not self.use_clipped_linears or True: return ...` -- the same,
+         spelled subtly;
+      3. clamping the OUTPUT with `self.input_min/max` instead of the output
+         bounds;
+      4. deleting the input clamp line altogether;
+      5. `if True:` in `__init__`, creating clamp params even when clipping is
+         off -- which breaks the byte-identical promise above AND makes
+         `_verify_vision_clamps_loaded` raise at boot on every non-clipped
+         checkpoint.
+    Pin the guard tests and the bound ORDER so each of the five is caught.
     """
     cls = _classdef(_tree(), "Gemma4VisionClippedEinsum")
     call = _funcdef(cls, "__call__")
+
+    # (1)(2) the off switch must be exactly the flag, not a widened condition
     first = call.body[0]
     assert isinstance(first, ast.If), ast.dump(first)[:80]
-    assert isinstance(first.body[0], ast.Return)
+    assert ast.unparse(first.test) == "not self.use_clipped_linears", (
+        f"the off switch is {ast.unparse(first.test)!r}; anything but the "
+        f"bare flag can disable clipping unconditionally")
+    assert isinstance(first.body[0], ast.Return), ast.dump(first.body[0])[:80]
+    assert "JaxEinsum.__call__" in ast.unparse(first.body[0]), (
+        "the unclipped path must be the plain JaxEinsum projection")
+
+    clamps = [
+        n for n in ast.walk(call)
+        if isinstance(n, ast.Call) and _call_name(n) == "clamp_activation"
+    ]
+    assert len(clamps) == 2, (
+        f"expected exactly two clamp_activation calls (input and output), "
+        f"found {len(clamps)}: {[ast.unparse(c) for c in clamps]}")
+
+    # (4) the INPUT is clamped with the input bounds, before the projection
+    inp = next((n for n in ast.walk(call) if isinstance(n, ast.Assign) and any(
+        getattr(tg, "id", None) == "inputs" for tg in n.targets)), None)
+    assert inp is not None and _call_name(inp.value) == "clamp_activation", (
+        "the input is never clamped: transformers clamps BEFORE the linear")
+    assert [ast.unparse(a) for a in inp.value.args[1:]] == [
+        "self.input_min.get_value()", "self.input_max.get_value()"
+    ], f"input clamp uses the wrong bounds: {ast.unparse(inp.value)}"
+
+    # (3) the OUTPUT is clamped with the OUTPUT bounds, not the input ones
+    ret = call.body[-1]
+    assert isinstance(ret, ast.Return) and _call_name(
+        ret.value) == "clamp_activation", ast.unparse(ret)
+    assert [ast.unparse(a) for a in ret.value.args[1:]] == [
+        "self.output_min.get_value()", "self.output_max.get_value()"
+    ], (f"output clamp uses the wrong bounds: {ast.unparse(ret.value)}. "
+        f"Clamping the output with the INPUT bounds is a silent numerics "
+        f"change, not a crash.")
+
+    # (5) the clamp params exist only when clipping is on
     init = _funcdef(cls, "__init__")
     guarded = [n for n in init.body if isinstance(n, ast.If)]
     assert guarded, "the clamp params must be created only when clipping"
+    assert ast.unparse(guarded[0].test) == "self.use_clipped_linears", (
+        f"the param guard is {ast.unparse(guarded[0].test)!r}; creating the "
+        f"clamps unconditionally breaks the byte-identical promise for "
+        f"E2B/12B and makes the load verifier raise on every non-clipped "
+        f"checkpoint")
     created = {
         t.attr
         for n in ast.walk(guarded[0]) if isinstance(n, ast.Assign)
@@ -241,12 +359,28 @@ def test_clamp_activation_matches_the_reference_clamp():
 
 
 def test_clamp_activation_reads_the_bound_in_the_activation_dtype():
-    """transformers clamps a bf16 activation against bf16 buffers."""
+    """transformers clamps a bf16 activation against bf16 buffers.
+
+    AUDIT 2026-09-03: this passed WEAKLY-TYPED Python floats (-1.3, 1.3),
+    which is exactly the case where the dtype cast is a no-op -- deleting the
+    cast (`return jnp.clip(x, lo, hi)`) left the gate green. Measured:
+        jnp.clip(bf16_x, jnp.asarray(lo, x.dtype), ...) -> bfloat16  (cast)
+        jnp.clip(bf16_x, jnp.asarray(-1.3, f32), ...)   -> float32   (no cast)
+        jnp.clip(bf16_x, -1.3, 1.3)                     -> bfloat16  (old test)
+    In production the bounds are STRONGLY-typed float32 nnx.Param values --
+    `neutral_clamps()` returns `jnp.asarray(..., jnp.float32)`, read back via
+    `.get_value()` -- so without the cast every clipped projection silently
+    promotes bf16 to fp32. Pass the bounds the way production stores them.
+    """
     clip = _leaf()
     import jax.numpy as jnp
     x = jnp.asarray([-4.0, 0.5, 4.0], jnp.bfloat16)
-    out = clip.clamp_activation(x, -1.3, 1.3)
-    assert out.dtype == jnp.bfloat16
+    lo = jnp.asarray(-1.3, jnp.float32)
+    hi = jnp.asarray(1.3, jnp.float32)
+    out = clip.clamp_activation(x, lo, hi)
+    assert out.dtype == jnp.bfloat16, (
+        f"a float32 bound promoted the activation to {out.dtype}: every "
+        f"clipped projection would silently run in fp32")
     # 1.3 is not representable in bf16; both sides round it the same way
     bound = np.asarray(jnp.asarray(1.3, jnp.bfloat16), np.float32)
     np.testing.assert_allclose(np.asarray(out, np.float32),
@@ -509,6 +643,61 @@ def test_honouring_the_clamps_reproduces_the_reference_encoder():
     for i, (r, g) in enumerate(zip(ref, got)):
         assert _rel(g, r, valid) < 2e-4, (i, _rel(g, r, valid))
         assert _cos(g, r, valid) > 1 - 1e-8, (i, _cos(g, r, valid))
+
+
+_CKPT_PROJ = {
+    "q": "self_attn.q_proj",
+    "k": "self_attn.k_proj",
+    "v": "self_attn.v_proj",
+    "o": "self_attn.o_proj",
+    "gate": "mlp.gate_proj",
+    "up": "mlp.up_proj",
+    "down": "mlp.down_proj",
+}
+
+
+def _weights_with_checkpoint_clamps(layers, seed=0):
+    """`_weights`, but with the E4B checkpoint's OWN bounds substituted in."""
+    clamps = json.loads(FIXTURE.read_text())["clamps"]
+    ws = _weights(layers, seed=seed)
+    for i, d in enumerate(ws):
+        for nm, hf in _CKPT_PROJ.items():
+            base = f"model.vision_tower.encoder.layers.{i}.{hf}"
+            d[nm + "_clamp"] = (clamps[base + ".input_min"],
+                                clamps[base + ".input_max"],
+                                clamps[base + ".output_min"],
+                                clamps[base + ".output_max"])
+    return ws
+
+
+def test_the_checkpoints_own_bounds_reproduce_the_reference_and_bite():
+    """Spend the fixture on the differential instead of only counting it.
+
+    AUDIT 2026-09-03: `tests/fixtures/gemma-4-E4B-it.vision-clamps.json` is a
+    real checkpoint dump (448 bf16-exact values, verified), but it was
+    referenced at exactly two places -- a length/finiteness check and this
+    module's docstring. Every numeric test drove the differential with the
+    SYNTHETIC bounds `(-1.25, 1.125, -1.375, 1.25)` from `_weights`, so the
+    checkpoint's real numbers never reached `clamp_activation` and the fixture
+    could not fail for any production change.
+
+    This runs the same differential on the checkpoint's own bounds, and keeps
+    the negative half: with those bounds dropped, the encoder is a different
+    function from layer 0.
+    """
+    pytest.importorskip("jax")
+    ws = _weights_with_checkpoint_clamps(LAYERS)
+    x, pos = _grid(9, 6)
+    valid = pos[..., 0] != -1
+    ref = _stack(_np_layer, x, pos, ws, clipped=True)
+    got = _stack(_jax_layer, x, pos, ws, clipped=True)
+    for i, (r, g) in enumerate(zip(ref, got)):
+        assert _rel(g, r, valid) < 2e-4, (i, _rel(g, r, valid))
+    unclipped = _stack(_jax_layer, x, pos, ws, clipped=False)
+    assert _rel(unclipped[0], ref[0], valid) > 1e-3, (
+        "the checkpoint's own bounds do not bite on this input, so this test "
+        "cannot tell clipping from no clipping: "
+        f"{_rel(unclipped[0], ref[0], valid)}")
 
 
 def test_dropping_the_clamps_diverges_from_layer_zero():

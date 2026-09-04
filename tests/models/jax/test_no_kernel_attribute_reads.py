@@ -50,12 +50,30 @@ def test_the_aliasing_classes_are_known_and_delete_kernel():
         )
 
 
-def test_jax_einsum_really_has_weight_and_not_kernel():
-    """Behavioral: build the real layer. The AST guard below is a cheap net;
-    this is the actual contract."""
+def test_the_alias_lines_this_replays_are_still_the_shipped_ones():
+    """AUDIT 2026-09-03: this was `test_jax_einsum_really_has_weight_and_not_
+    kernel`, whose docstring called it "the actual contract". It was not: it
+    built a VANILLA upstream `nnx.Einsum` and then performed the alias and the
+    delete IN THE TEST BODY, so it asserted that `delattr` deletes an
+    attribute. Measured: removing `delattr(self, 'kernel')` from the repo's
+    real JaxEinsum left it green (the AST test at the bottom of this file
+    caught that). It exercised flax, not this repo.
+
+    Two lines are replayed below, so pin that they are still the lines the
+    wrapper runs -- and in that order, because the alias must precede the
+    delete or `weight` is never bound. Then keep the upstream-premise check,
+    which is the part that genuinely cannot be asserted from source.
+    """
     pytest.importorskip("flax")
     jax = pytest.importorskip("jax")
     from flax import nnx
+    src = (ROOT / "tpu_inference" / "layers" / "jax" / "linear.py").read_text()
+    i = src.find("self.weight = self.kernel")
+    j = src.find("delattr(self, 'kernel')")
+    assert i != -1, "the wrapper no longer aliases self.kernel to self.weight"
+    assert j != -1, "the wrapper no longer deletes self.kernel"
+    assert i < j, "the alias must precede the delete, or `weight` is never bound"
+
     m = nnx.Einsum(einsum_str="bd,dh->bh",
                    kernel_shape=(4, 8),
                    rngs=nnx.Rngs(0))
@@ -66,7 +84,8 @@ def test_jax_einsum_really_has_weight_and_not_kernel():
     m.weight = m.kernel
     delattr(m, "kernel")
     assert hasattr(m, "weight") and not hasattr(m, "kernel")
-    assert m.weight.value.dtype == jax.numpy.float32
+    # `.value` is deprecated in this flax; read the array the supported way.
+    assert m.weight[...].dtype == jax.numpy.float32
 
 
 def _kernel_attribute_reads(path):
@@ -79,12 +98,29 @@ def _kernel_attribute_reads(path):
             for t in n.targets:
                 if isinstance(t, ast.Attribute) and t.attr == "kernel":
                     assigned.add(id(t))
+    # AUDIT 2026-09-03: the `self` exemption used to be unconditional, which
+    # excused EVERY `self.kernel` read in every file under models/jax and
+    # layers/jax -- not just the alias lines it was meant to cover. Measured:
+    # adding `0 * self.kernel.value.mean()` to Gemma4UnifiedVisionEmbedder.
+    # __call__ left the gate green; that is bug ti #40 exactly, spelled with
+    # `self.`. Narrow the exemption to the __init__ of a class that actually
+    # aliases, which is the only place the read is legitimate.
+    aliasing = set()
+    for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        if "self.weight = self.kernel" not in ast.unparse(cls):
+            continue
+        init = next(
+            (f for f in cls.body
+             if isinstance(f, ast.FunctionDef) and f.name == "__init__"), None)
+        if init is not None:
+            aliasing |= {id(n) for n in ast.walk(init)}
     hits = []
     for n in ast.walk(tree):
         if isinstance(n, ast.Attribute) and n.attr == "kernel" and id(
                 n) not in assigned:
             # the wrapper's own `self.weight = self.kernel` read is legitimate
-            if isinstance(n.value, ast.Name) and n.value.id == "self":
+            if (isinstance(n.value, ast.Name) and n.value.id == "self"
+                    and id(n) in aliasing):
                 continue
             hits.append(n.lineno)
     return hits

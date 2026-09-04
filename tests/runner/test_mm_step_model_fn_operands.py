@@ -124,14 +124,24 @@ def test_the_multimodal_branch_returns_the_token_ids():
 
 def test_exactly_one_branch_carries_embeds():
     """The two returns are the two step kinds; a third would be a third
-    signature with no primer behind it."""
+    signature with no primer behind it.
+
+    AUDIT 2026-09-03: `sorted(has_embeds) == [False, True]` is satisfied by
+    BOTH the fixed `(input_ids, inputs_embeds)/(input_ids, None)` and the
+    pre-#61 `(None, inputs_embeds)/(input_ids, None)` -- measured: it survives
+    the exact reverted code, so it read as a second guard on the fix and was
+    not one. Assert the two return SHAPES together, which pins the branch
+    count and the operands at once.
+    """
     _, fn = _fn(RUNNER, "_get_input_ids_embeds")
     returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
-    has_embeds = [
-        not (isinstance(r.value.elts[1], ast.Constant)
-             and r.value.elts[1].value is None) for r in returns
-    ]
-    assert sorted(has_embeds) == [False, True]
+    assert len(returns) == 2, "expected one return per step kind"
+    shapes = {(ast.unparse(r.value.elts[0]), ast.unparse(r.value.elts[1]))
+              for r in returns}
+    assert shapes == {
+        ("input_ids", "inputs_embeds"), ("input_ids", "None")
+    }, (f"_get_input_ids_embeds returns {sorted(shapes)}; the multimodal "
+        f"branch must carry BOTH operands and the text branch the ids alone")
 
 
 def test_the_forward_call_takes_the_model_side_name():
@@ -196,7 +206,6 @@ def test_the_two_primers_build_the_same_ids_operand():
     ):
         sharding_name = build.rstrip(")").split(",")[-1].strip()
         assert sharding_name, name
-        body = ast.get_source_segment(src, fn)
         assigned = [
             n for n in ast.walk(fn) if isinstance(n, ast.Assign) and any(
                 isinstance(t, ast.Name) and t.id == sharding_name
@@ -207,7 +216,10 @@ def test_the_two_primers_build_the_same_ids_operand():
         assert "ShardingAxisName.BATCH" in spec, (
             f"{name} builds its input_ids with {spec!r}; the runtime array is "
             f"BATCH-partitioned, and a sharding mismatch is a jit cache miss")
-        assert body  # the segment resolved
+        # AUDIT 2026-09-03: `assert body  # the segment resolved` stood here.
+        # `body` is a non-empty source string by the time this line runs (the
+        # loop above already indexed into it), so it could never be falsy.
+        # The resolution it meant to guard is asserted where it happens.
 
 
 def test_the_embeds_primer_is_the_only_multimodal_entry_point():

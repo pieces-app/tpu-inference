@@ -147,7 +147,19 @@ def _fields(line):
 
 
 # ------------------------------------------------------------ flag off
-def test_flag_off_jaxpr_and_outputs_are_byte_identical_to_the_old_body():
+def test_a_none_sink_adds_nothing_to_a_jaxpr():
+    """AUDIT 2026-09-03: renamed from
+    `test_flag_off_jaxpr_and_outputs_are_byte_identical_to_the_old_body`,
+    which overstated what it covers. With flag=False `_call_site` sets
+    `debug_sink = None` and never calls `MM.emit_mm_debug_stats`, so this
+    test reaches ZERO production symbols: `_fake_tower`, `_fake_proj` and
+    `_baseline` are all defined in this file. It is a true and useful lemma
+    about jax (a None sink is free), but it is not evidence about the fork --
+    that is carried by `test_every_native_emit_is_guarded_by_the_flag` and
+    `test_gemma4_mm_sink_is_created_only_under_the_flag`, both of which do
+    read the shipped sources and both of which go red when the guard is
+    removed.
+    """
     log = []
     pv, pp = _inputs()
     off = _call_site(False, log.append)

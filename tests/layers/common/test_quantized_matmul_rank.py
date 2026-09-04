@@ -111,7 +111,16 @@ def _mod():
     try:
         spec.loader.exec_module(m)
     except Exception as e:  # noqa: BLE001
-        pytest.skip(f"leaf not loadable even with stubs: {e}")
+        # AUDIT 2026-09-03: this was `pytest.skip(...)`. linear.py is the leaf
+        # UNDER TEST, so a load failure is the loudest possible regression --
+        # and a skip made the whole file exit 0. Measured: adding one
+        # unstubbed `import vllm.x` to linear.py produced "8 skipped", exit 0,
+        # gate GREEN, with both rank-3 regression repros silently retired.
+        # The util leaf eleven lines above already refuses to skip for exactly
+        # this reason; the file under test deserves it at least as much.
+        raise AssertionError(
+            f"linear.py (the leaf under test) failed to load: {e}. Add a stub "
+            f"rather than skipping -- a skip here is a false green.") from e
     return m
 
 
@@ -204,11 +213,23 @@ def test_every_online_quant_dtype_computes_at_rank_3(dtype_name):
     rel = float(
         jnp.max(jnp.abs(out.astype(jnp.float32) - ref)) /
         jnp.max(jnp.abs(ref)))
-    # Loose: this asserts "quantization happened and did not destroy the
-    # signal", not a quality bar. Quality is a hardware measurement.
-    assert rel < 0.35, (
-        f"{dtype_name} relative error {rel:.4f} -- the value is not a "
-        f"quantized version of the reference at all")
+    # AUDIT 2026-09-03: this was a single `rel < 0.35` for every dtype --
+    # 5x to 45x the measured values, wide enough to accept a grossly wrong
+    # result. MEASURED on this exact input (PRNGKey(0)/(1), 2x3x64 @ 64x32):
+    #   float8_e4m3fn 0.03553   float8_e4m3b11fnuz 0.03373
+    #   float8_e5m2   0.06621   int8               0.00754
+    # Bounds are ~1.7x the measured value: still "quantization happened and
+    # did not destroy the signal", not a quality bar, but now per-dtype and
+    # tight enough that a systematically wrong scale cannot pass.
+    bound = {
+        "float8_e4m3fn": 0.06,
+        "float8_e4m3b11fnuz": 0.06,
+        "float8_e5m2": 0.10,
+        "int8": 0.02,
+    }[dtype_name]
+    assert rel < bound, (
+        f"{dtype_name} relative error {rel:.4f} exceeds {bound} -- the value "
+        f"is not a faithfully quantized version of the reference")
 
 
 def test_the_exact_shape_that_died_on_hardware():
@@ -216,10 +237,20 @@ def test_the_exact_shape_that_died_on_hardware():
     import jax
     import jax.numpy as jnp
     m = _mod()
-    x = jnp.zeros((1, 8, 6912), dtype=jnp.bfloat16)  # 1120 -> 8 for CPU speed
+    # AUDIT 2026-09-03: this was `jnp.zeros(...)`. An all-zero activation
+    # makes the per-row amax zero, so the run took the degenerate
+    # scale == 0 -> scale_inv == 0 branch and the ONLY thing that could fail
+    # was the shape. Real data exercises the branch production takes and
+    # keeps the shape assertion.
+    x = jax.random.normal(jax.random.PRNGKey(4),
+                          (1, 8, 6912)).astype(jnp.bfloat16)
     w = jax.random.normal(jax.random.PRNGKey(2), (6912, 64))
     w_q, w_s = _weight_quant(w)
     out = m.xla_quantized_matmul(x, w_q, w_s)
     assert out.shape == (1, 8, 64), (
         "the rank-3 vision-projection shape still collapses -- this is the "
         "exact call that produced 'got (1120,) and (6912,)' on v6e")
+    assert bool(jnp.all(
+        jnp.isfinite(out))), "the rank-3 projection produced non-finite values"
+    assert float(jnp.max(
+        jnp.abs(out))) > 0.0, "the rank-3 projection collapsed to all zeros"

@@ -120,11 +120,23 @@ def test_factorized_posemb_zero_for_fully_padded_patch():
 
 # ------------------------------------------------------------ structure
 def test_registered_in_the_flax_registry():
-    src = LOADER.read_text()
-    assert '_MODEL_REGISTRY[\n        "Gemma4UnifiedForConditionalGeneration"]' in src or \
-           '_MODEL_REGISTRY["Gemma4UnifiedForConditionalGeneration"]' in src, (
-        "Gemma4UnifiedForConditionalGeneration is not registered -- the 12B "
-        "would still fall back to torchax, and MTP would still be impossible")
+    """AUDIT 2026-09-03: this used to hard-code a yapf line break
+    (`'_MODEL_REGISTRY[\n        "Gemma4Unified..."]'`) with a single-line
+    fallback. A reformat -- and #53 was exactly a yapf/isort pass over this
+    tree -- can turn it red with no behaviour change, while a semantically
+    identical `"Gemma4UnifiedForConditional" + "Generation"` key defeats it.
+    Read the registry subscripts out of the AST instead.
+    """
+    keys = {
+        ast.literal_eval(n.slice)
+        for n in ast.walk(ast.parse(LOADER.read_text()))
+        if isinstance(n, ast.Subscript) and getattr(n.value, "id", None) ==
+        "_MODEL_REGISTRY" and isinstance(n.slice, ast.Constant)
+    }
+    assert "Gemma4UnifiedForConditionalGeneration" in keys, (
+        f"Gemma4UnifiedForConditionalGeneration is not registered -- the 12B "
+        f"would still fall back to torchax, and MTP would still be "
+        f"impossible. Registered: {sorted(keys)}")
 
 
 def _load_weights_src():
@@ -192,11 +204,32 @@ def test_multimodal_front_end_is_not_quantized():
 
 
 def test_every_checkpoint_tensor_maps_onto_the_module_tree():
+    """AUDIT 2026-09-03: the prefixes used to be typed into this test as
+    literals, so the whole test compared a committed fixture against constants
+    and touched no production code -- renaming a submodule in
+    Gemma4UnifiedModel could not turn it red. Derive them from the class's own
+    `self.<name> = ...` assignments, which is what "maps onto the module tree"
+    is supposed to mean.
+    """
     h = json.loads(FIXTURE.read_text())
     h.pop("__metadata__", None)
     assert len(h) == 677
-    prefixes = ("model.language_model.", "model.vision_embedder.",
-                "model.embed_vision.", "model.embed_audio.", "lm_head.")
+    model_cls = next(
+        n for n in ast.walk(ast.parse(MODEL.read_text()))
+        if isinstance(n, ast.ClassDef) and n.name == "Gemma4UnifiedModel")
+    submodules = {
+        tg.attr
+        for n in ast.walk(model_cls) if isinstance(n, ast.Assign)
+        for tg in n.targets if isinstance(tg, ast.Attribute)
+        and isinstance(tg.value, ast.Name) and tg.value.id == "self"
+    }
+    assert {
+        "language_model", "vision_embedder", "embed_vision", "embed_audio"
+    } <= submodules, (
+        f"Gemma4UnifiedModel no longer declares the submodules this "
+        f"checkpoint maps onto: {sorted(submodules)}")
+    prefixes = tuple(f"model.{a}."
+                     for a in sorted(submodules)) + ("lm_head.", )
     skip = (".input_max", ".input_min", ".output_max", ".output_min")
     unmapped = [k for k in h if not k.startswith(prefixes)]
     assert not unmapped, f"checkpoint names outside the module tree: {unmapped[:5]}"

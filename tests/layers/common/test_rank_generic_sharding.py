@@ -178,12 +178,35 @@ def test_apply_jax_restores_one_axis_per_contracting_axis(cls):
                if isinstance(f, ast.FunctionDef) and f.name == "apply_jax"),
               None)
     assert fn is not None, f"{cls}.apply_jax not found"
-    body = ast.get_source_segment(src, fn) or ""
-
-    assert "leading = x.shape[:-1]" not in body, (
-        f"{cls}.apply_jax drops exactly one axis. o_proj "
-        f'(JaxEinsum("TNH,NHD->TD")) contracts TWO, so this raises "cannot '
-        f'reshape array of shape (T, D) into (T, N, D)" on the first forward.')
-    assert "len(self.linear_config.in_features)" in body, (
+    # AUDIT 2026-09-03: this used to assert on `ast.get_source_segment(...)`,
+    # which returns text INCLUDING comments. Measured bypass: writing
+    #     # should be len(self.linear_config.in_features) axes
+    #     leading = x.shape[:-2]
+    # -- wrong for every single-contracting-axis Linear in the tree -- passed
+    # both assertions, because the required phrase lived in the comment while
+    # the code was broken. Assert on the AST node instead, so only the code
+    # can satisfy it.
+    assign = next(
+        (n for n in ast.walk(fn) if isinstance(n, ast.Assign) and any(
+            getattr(tg, "id", None) == "leading" for tg in n.targets)), None)
+    assert assign is not None, f"{cls}.apply_jax has no `leading = ...`"
+    sl = getattr(assign.value, "slice", None)
+    assert isinstance(sl, ast.Slice) and sl.lower is None, (
+        f"{cls}.apply_jax: expected `leading = x.shape[:-<n>]`, got "
+        f"{ast.unparse(assign)!r}")
+    assert isinstance(sl.upper, ast.UnaryOp) and isinstance(
+        sl.upper.op,
+        ast.USub), (f"{cls}.apply_jax: expected a negative slice bound, got "
+                    f"{ast.unparse(assign)!r}")
+    operand = sl.upper.operand
+    assert (isinstance(operand, ast.Call)
+            and getattr(operand.func, "id", None) == "len"), (
+                f"{cls}.apply_jax drops a FIXED number of axes "
+                f"({ast.unparse(assign)!r}). o_proj "
+                f'(JaxEinsum("TNH,NHD->TD")) contracts TWO, so a fixed 1 '
+                f'raises "cannot reshape array of shape (T, D) into '
+                f'(T, N, D)" on the first forward.')
+    assert ast.unparse(operand) == "len(self.linear_config.in_features)", (
         f"{cls}.apply_jax must consume one leading axis per CONTRACTING axis, "
-        f"i.e. len(self.linear_config.in_features)")
+        f"i.e. len(self.linear_config.in_features); got "
+        f"{ast.unparse(operand)!r}")

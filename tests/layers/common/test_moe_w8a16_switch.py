@@ -83,6 +83,9 @@ def _dense_gather_reduce_xla(x,
     return (gathered.astype(jnp.float32) * w.astype(jnp.float32)).sum(axis=1)
 
 
+_NOT_FORWARDED = object()
+
+
 def _make_gmm_v2(calls, matmul_operands):
     """Jax-traceable stand-in for tokamax gmm_v2 with the two lhs paths of
     kernels/megablox/gmm_v2.py, recording (at trace time, inside shard_map
@@ -101,10 +104,18 @@ def _make_gmm_v2(calls, matmul_operands):
                zero_initialize,
                fuse_act,
                preferred_element_type,
-               maybe_quantize_lhs=True):
+               maybe_quantize_lhs=_NOT_FORWARDED):
+        # AUDIT 2026-09-03: the default used to be the kernel's own `True`,
+        # which made test_act1_default_quantizes_expert_activations pass
+        # whether gmm_wrapper forwarded the flag or not -- it survived a full
+        # revert of the forwarding. A sentinel separates the two.
+        forwarded = maybe_quantize_lhs is not _NOT_FORWARDED
+        if not forwarded:
+            maybe_quantize_lhs = True  # the kernel's own default
         scale_shape = None if rhs_scale is None else tuple(rhs_scale.shape)
         calls.append({
             "maybe_quantize_lhs": maybe_quantize_lhs,
+            "forwarded": forwarded,
             "lhs_dtype": lhs.dtype,
             "rhs_dtype": rhs.dtype,
             "scale_shape": scale_shape,
@@ -408,6 +419,10 @@ def test_act1_default_quantizes_expert_activations():
     _forward(m, _problem(qm))
     assert len(calls) == 2
     for call in calls:
+        assert call["forwarded"] is True, (
+            "gmm_wrapper did not pass maybe_quantize_lhs at all; the kernel's "
+            "own default is doing the work and the ACT=0 switch never reaches "
+            "the experts (this assertion survived a full revert before)")
         assert call["maybe_quantize_lhs"] is True, call
         assert call["lhs_dtype"] == jnp.bfloat16, call
     assert operands == [(jnp.int8, jnp.int8)] * 2, operands
@@ -426,11 +441,15 @@ def test_act1_call_is_bit_for_bit_the_pre_change_call():
     m_old, qm_old = _mod(True, _old_style(_make_gmm_v2([], [])))
     old = np.asarray(_forward(m_old, _problem(qm_old)).astype(jnp.float32))
     assert np.array_equal(new, old), "ACT=1 output changed bit-for-bit"
-    expected_keys = {
-        "maybe_quantize_lhs", "lhs_dtype", "rhs_dtype", "scale_shape",
-        "has_bias", "fuse_act", "preferred_element_type", "zero_initialize"
-    }
-    assert set(calls[0]) == expected_keys
+    # AUDIT 2026-09-03: `set(calls[0]) == expected_keys` used to sit here.
+    # `calls[0]` is a dict literal this file's own double builds with exactly
+    # those keys, so it could never fail. The load-bearing facts are that the
+    # flag WAS forwarded (not defaulted) and that every other kwarg is the
+    # pre-change one; the double's keyword-only signature raises TypeError on
+    # an unexpected kwarg, which is what actually pins the call shape.
+    assert calls[0]["forwarded"] is True, (
+        "the ACT=1 call did not carry maybe_quantize_lhs; the kernel default "
+        "is doing the work")
     assert calls[0]["zero_initialize"] is False
     assert calls[0]["fuse_act"] == "gelu" and calls[1]["fuse_act"] is None
     assert calls[0]["preferred_element_type"] == jnp.bfloat16

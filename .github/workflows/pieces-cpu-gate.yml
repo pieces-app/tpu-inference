@@ -75,5 +75,12 @@ jobs:
           done
           echo "gate: ${#GATE_FILES[@]} files"
           python -m pytest --noconftest -q "${GATE_FILES[@]}"
-      - name: no function may have statements after a return (the __init__-truncation shape)
-        run: python -m pytest --noconftest -q tests/runner/test_init_not_truncated.py::test_no_function_has_statements_after_a_return
+      # AUDIT 2026-09-03: a second step re-ran
+      # tests/runner/test_init_not_truncated.py::
+      # test_no_function_has_statements_after_a_return here -- the identical
+      # invocation on the identical input, since that file is already in
+      # GATE_FILES above. It read as an independent guard and was not one, and
+      # its step name claimed a fork-wide scope the test did not have (it
+      # walked compilation_manager.py alone). The test now scans all 383 files
+      # under tpu_inference/, so the claim is true where it belongs -- in the
+      # test -- and the duplicate invocation is gone.
