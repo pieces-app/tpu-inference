@@ -74,6 +74,9 @@ RUN set -e; \
     grep -q "return input_ids, inputs_embeds" "$TI_DIR/runner/tpu_runner.py"; \
     ! grep -q "input_ids=None" "$TI_DIR/runner/compilation_manager.py"; \
     test "$(grep -c "input_ids=input_ids" "$TI_DIR/runner/compilation_manager.py")" = 2; \
+    grep -q "_mm_embeds_primer_req_paddings" "$TI_DIR/runner/compilation_manager.py"; \
+    grep -q "for num_reqs in self._mm_embeds_primer_req_paddings()" "$TI_DIR/runner/compilation_manager.py"; \
+    grep -q "MM_EMBEDS_PRIMER_ALL_REQ_PADDINGS" "$TI_DIR/envs.py"; \
     grep -q "maybe_apply_gemma4_unified_patches" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     grep -q "compute_mm_jit_static_args" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     test -f "$TI_DIR/models/vllm/experimental/mm_jit_signature.py"; \

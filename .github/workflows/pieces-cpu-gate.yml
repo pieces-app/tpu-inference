@@ -62,6 +62,7 @@ jobs:
             tests/models/vllm/experimental/test_gemma4_vision_attention.py
             tests/models/vllm/experimental/test_mm_debug_patch.py
             tests/models/vllm/experimental/test_mm_jit_static_args.py
+            tests/runner/test_backbone_primer_padding_grid.py
             tests/runner/test_draft_token_owners_survive_condense.py
             tests/runner/test_init_not_truncated.py
             tests/runner/test_mm_bidi_span_pipeline.py
