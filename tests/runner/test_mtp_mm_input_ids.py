@@ -149,17 +149,21 @@ class TestMtpMmInputIdsPreserved:
         return raw_input_ids, embeds, model_fn
 
     def test_execute_model_preserves_raw_input_ids_for_mm(self):
-        """mm batch: the model forward gets embeds (input ids arg None), but
-        the raw token ids MUST survive into execute_model_state so spec decode
+        """mm batch: the model forward gets the embeds AND the ids, and the
+        raw token ids MUST survive into execute_model_state so spec decode
         can score scheduled draft tokens. On the unfixed tree the state held
         None and the engine died at the assert."""
         raw_input_ids, embeds, model_fn = self._run_execute_model(
             is_multimodal=True)
 
-        # (a) mm forward contract intact: ids arg None, embeds arg non-None.
+        # (a) mm forward contract: both operands. The ids arg was None here
+        # until the PLE id-track fix -- the model needs the token ids to
+        # build the per-layer embedding track on an image step, and the two
+        # operands together are one static jit signature (the "backbone with
+        # embeds" primer builds the same pair).
         model_fn.assert_called_once()
         call_args = model_fn.call_args[0]
-        assert call_args[2] is None  # model_input_ids
+        assert call_args[2] is raw_input_ids  # model_input_ids
         assert call_args[4] is embeds  # inputs_embeds
 
         # (b) the raw token ids are preserved for spec decode. This is the

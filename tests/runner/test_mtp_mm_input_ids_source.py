@@ -116,8 +116,13 @@ def test_get_input_ids_embeds_does_not_clobber_input_ids(execute_model):
 
 
 def test_model_forward_receives_model_input_ids(execute_model):
-    """The forward pass keeps its contract: it sees the (possibly None)
-    model-side ids plus the embeds, never the preserved raw ids."""
+    """The forward pass keeps its contract: it sees the model-side ids plus
+    the embeds through their own names, never a rebound raw-ids buffer.
+
+    (The two names now hold the same array on a multimodal step -- the ids
+    are passed alongside the embeds for the PLE id-track -- but the binding
+    must stay separate: `_get_input_ids_embeds` is free to transform the
+    model-side view, and the spec-decode machinery reads the raw one.)"""
     calls = [
         node for node in ast.walk(execute_model)
         if _is_self_attr_call(node, "model_fn")

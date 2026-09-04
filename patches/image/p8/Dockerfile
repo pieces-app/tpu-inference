@@ -7,6 +7,14 @@
 #   2. fp32 LayerNorm STATISTICS in the Unified vision embedder under
 #      torchax (bf16 mean/var corrupts near-flat patches; p95 per-token
 #      err 438 -> 1.2 at LN2, soft-token cosine 0.9944 -> 1.000000).
+#   3. The multimodal step carries input_ids ALONGSIDE inputs_embeds, so
+#      Gemma-4 E2B/E4B compute the real per-token PLE id-track on an image
+#      prefill instead of looking up embedding slot 0 for the whole prompt.
+#      Both backbone primers build the matching operand; three greps below
+#      verify the runner's return and the primers' arguments survived the
+#      copy. models/jax/gemma4.py is deliberately NOT copied: its change is
+#      comments only, and adding a new whole-file copy would widen the
+#      image's surface for no behavioural gain.
 #
 # Layered FROM the p5 image (= p4 tpu-inference fixes + vllm parser
 # commits); copies whole files over the editable install, mirroring the
@@ -63,6 +71,9 @@ RUN set -e; \
     test -f "$TI_DIR/runner/mm_bidi_ranges.py"; \
     grep -q "build_mm_bidi_ranges" "$TI_DIR/runner/tpu_runner.py"; \
     grep -q "if inputs_embeds is not None:" "$TI_DIR/models/vllm/experimental/gemma4_mm_patcher.py"; \
+    grep -q "return input_ids, inputs_embeds" "$TI_DIR/runner/tpu_runner.py"; \
+    ! grep -q "input_ids=None" "$TI_DIR/runner/compilation_manager.py"; \
+    test "$(grep -c "input_ids=input_ids" "$TI_DIR/runner/compilation_manager.py")" = 2; \
     grep -q "maybe_apply_gemma4_unified_patches" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     grep -q "compute_mm_jit_static_args" "$TI_DIR/models/vllm/experimental/model_patcher.py"; \
     test -f "$TI_DIR/models/vllm/experimental/mm_jit_signature.py"; \

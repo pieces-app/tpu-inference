@@ -101,7 +101,12 @@ class TestTPUJaxRunner:
         input_ids_res, inputs_embeds_res = self.runner._get_input_ids_embeds(
             dummy_input_ids, dummy_mm_embeds, dummy_is_mm_embed)
 
-        assert input_ids_res is None
+        # A multimodal step returns BOTH: the merged embeddings AND the raw
+        # token ids. The ids are what lets Gemma-4 E2B/E4B build the real
+        # per-token PLE id-track on an image step; withholding them made both
+        # model paths fall back to embedding slot 0 for the whole prompt.
+        np.testing.assert_array_equal(np.asarray(input_ids_res),
+                                      np.asarray(dummy_input_ids))
         np.testing.assert_array_equal(np.asarray(inputs_embeds_res),
                                       np.asarray(dummy_final_embeds))
         self.mock_get_input_embed_fn.assert_called_once_with(
