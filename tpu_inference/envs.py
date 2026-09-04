@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     PIECES_MM_DEBUG_LAYERS: bool = False
     PIECES_GEMMA4_VISION_ATTN_FP32: bool = False
     PIECES_GEMMA4_VISION_ATTN_CHUNK: int = 1024
+    MM_EMBEDS_PRIMER_ALL_REQ_PADDINGS: bool = True
 
 
 def env_with_choices(
@@ -559,6 +560,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # blocking and builds the whole (q_len, kv_len) matrix at once.
     "PIECES_GEMMA4_VISION_ATTN_CHUNK":
     lambda: int(os.getenv("PIECES_GEMMA4_VISION_ATTN_CHUNK", "1024")),
+    # The "backbone with embeds" (multimodal) precompile primer walks the
+    # SAME (num_tokens, num_reqs) grid as the text-only primer. Default on.
+    # `padded_num_reqs` is a static jit argument, so an image request landing
+    # on a request padding the primer skipped compiles the backbone inside
+    # the serving loop. Set to 0 to prime only the largest request padding --
+    # the pre-fix coverage. Costs NOTHING by default: `attn_num_reqs_paddings`
+    # is a single entry unless ATTN_BUCKETIZED_NUM_REQS is on, and only then
+    # does the full grid add (len(ladder) - 1) x len(num_tokens_paddings) x
+    # len(hidden_sizes_to_compile) compiles, for multimodal models only.
+    "MM_EMBEDS_PRIMER_ALL_REQ_PADDINGS":
+    env_bool("MM_EMBEDS_PRIMER_ALL_REQ_PADDINGS", default=True),
 }
 
 

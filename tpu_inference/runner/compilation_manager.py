@@ -761,6 +761,40 @@ class CompilationManager:
                         num_reqs=num_reqs,
                         pcp_cache_pages=_cache_pages)
 
+    def _mm_embeds_primer_req_paddings(self) -> List[int]:
+        """The `num_reqs` ladder the "backbone with embeds" primer covers.
+
+        `padded_num_reqs` is a META field of `AttentionMetadata`
+        (`attention_metadata.py`, `meta_fields=["padded_num_reqs", ...]`), so
+        it is a jit STATIC argument: each value is its own compiled program.
+        The text-only primer walks the whole `attn_num_reqs_paddings` ladder,
+        so a text step is primed at every request padding; the multimodal
+        primer must walk the same ladder or an image request that lands on any
+        other padding traces and XLA-compiles the backbone inside the serving
+        loop -- minutes of TTFT on that request, and a persistent-cache write
+        rather than a hit.
+
+        COST. The ladder is ONE entry wide unless request bucketizing is on:
+        `get_attn_req_paddings` returns `[max_num_seqs]` when
+        ATTN_BUCKETIZED_NUM_REQS is false (the default), so the default
+        deployment pays ZERO extra compiles for the full grid. With
+        ATTN_BUCKETIZED_NUM_REQS=1 (or ATTN_CUSTOM_NUM_REQS_BUCKETS=...) the
+        multimodal primer's compile count is multiplied by the ladder length
+        -- exactly the multiplier the text-only primer already pays, on the
+        smaller of the two primers (it runs only for multimodal models, and
+        only over `num_tokens_paddings x hidden_sizes_to_compile`).
+
+        MM_EMBEDS_PRIMER_ALL_REQ_PADDINGS=0 is the escape hatch for an
+        image-free bucketized run that would rather not pay it. It restores
+        the pre-fix coverage EXACTLY -- the last ladder entry, which is what
+        the mis-indented loop left in the loop variable -- and accepts the
+        serve-time recompile on every other padding.
+        """
+        paddings = list(self.runner.attn_num_reqs_paddings)
+        if envs.MM_EMBEDS_PRIMER_ALL_REQ_PADDINGS:
+            return paddings
+        return paddings[-1:]
+
     def _precompile_backbone_with_inputs_embeds(self) -> None:
         hidden_size = self.runner.model_config.get_hidden_size()
         dtype = self.runner.model_config.dtype
@@ -787,16 +821,16 @@ class CompilationManager:
 
         for h_size in hidden_sizes_to_compile:
             for num_tokens in self.runner.num_tokens_paddings:
-                for num_reqs in self.runner.attn_num_reqs_paddings:
-                    sharding = NamedSharding(
-                        self.runner.mesh,
-                        PartitionSpec(ShardingAxisName.ATTN_DATA, None))
-                    input_sharding = NamedSharding(
-                        self.runner.mesh,
-                        PartitionSpec(ShardingAxisName.ATTN_DATA))
+                sharding = NamedSharding(
+                    self.runner.mesh,
+                    PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+                input_sharding = NamedSharding(
+                    self.runner.mesh,
+                    PartitionSpec(ShardingAxisName.ATTN_DATA))
 
-                    inputs_embeds = self._create_dummy_tensor(
-                        (num_tokens, h_size), dtype, sharding=sharding)
+                inputs_embeds = self._create_dummy_tensor((num_tokens, h_size),
+                                                          dtype,
+                                                          sharding=sharding)
                 # The multimodal step carries the token ids ALONGSIDE the
                 # merged embeddings (runner._get_input_ids_embeds), so this
                 # primer must carry them too: `None` and an int32[num_tokens]
@@ -841,15 +875,25 @@ class CompilationManager:
                         })
                 else:
                     intermediate_tensors = None
-                self._precompile_backbone_helper(
-                    f"worker{self.runner.rank} backbone with embeds",
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                    is_first_rank=is_first_rank,
-                    is_last_rank=is_last_rank,
-                    num_reqs=num_reqs)
+                # None of the dummies above depends on `num_reqs`, so they are
+                # built once per (h_size, num_tokens) and the request-padding
+                # ladder wraps the CALL. Before this, the ladder wrapped the
+                # `inputs_embeds` construction instead and the call sat outside
+                # it, so the multimodal primer covered exactly ONE num_reqs per
+                # token bucket (whatever the loop variable was left holding)
+                # while the text-only primer covered the whole ladder. See
+                # `_mm_embeds_primer_req_paddings` for why that recompiles and
+                # what it costs to cover.
+                for num_reqs in self._mm_embeds_primer_req_paddings():
+                    self._precompile_backbone_helper(
+                        f"worker{self.runner.rank} backbone with embeds",
+                        input_ids=input_ids,
+                        positions=positions,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                        is_first_rank=is_first_rank,
+                        is_last_rank=is_last_rank,
+                        num_reqs=num_reqs)
 
     def _precompile_select_from_array_helper(
         self,
